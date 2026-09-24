@@ -1652,6 +1652,16 @@ async function createInboundTurnLifecycle(
 					origin.conversationId,
 					RECENT_HISTORY_MAX,
 					new Date(Date.now() - RECENT_HISTORY_WINDOW_MS).toISOString(),
+					origin.kind === "thread" && origin.parentId
+						? {
+								parentOriginKey: originKey({
+									platform: origin.platform,
+									kind: "channel",
+									conversationId: origin.parentId,
+								}),
+								rootMessageId: origin.conversationId,
+							}
+						: undefined,
 				)
 			: [];
 		const inWindowIds = new Set(prepared.selectedMessageIds);

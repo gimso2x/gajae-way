@@ -1637,6 +1637,118 @@ test("a fresh session's first turn carries recent conversation history, a later 
 	client.close();
 });
 
+test("a fresh thread session sees the channel message that opened the thread and our answer to it", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-thread-root-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		channels: { "slack:C1": { engagement: "mention-open" } },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const turns: string[] = [];
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async (_s, text) => {
+			turns.push(text);
+			return "ok";
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	const rootId = "C1:1700000000.000100";
+	// The channel mention that opened the thread lives under the CHANNEL origin.
+	database.contextRecord({
+		messageId: rootId,
+		originKey: "slack/channel/C1",
+		authorId: "owner",
+		authorName: "bellman",
+		body: "@persona fix the map line; options 1/2/3 please",
+		receivedAt: new Date(Date.now() - 120_000).toISOString(),
+	});
+	database.contextRecord({
+		messageId: "C1:1700000000.000999",
+		originKey: "slack/channel/C1",
+		authorId: "other",
+		authorName: "someone",
+		body: "unrelated channel chatter",
+		receivedAt: new Date(Date.now() - 110_000).toISOString(),
+	});
+	database.contextCommitWindow("slack/channel/C1", [rootId, "C1:1700000000.000999"], 0);
+	// Our answer was delivered from the CHANNEL session into the thread.
+	database.deliveryCreate({
+		id: "d-root-answer",
+		turnId: "root-turn",
+		originKey: "slack/channel/C1",
+		payloadJson: JSON.stringify({
+			origin: { platform: "slack", kind: "channel", conversationId: "C1" },
+			role: "assistant",
+			text: "Pick one: 1) main 2) rebase 3) persona branch",
+			final: true,
+			replyToMessageId: rootId,
+		}),
+	});
+	database.deliveryUpdate("d-root-answer", "confirmed", 1);
+	// An answer to a different channel message must not leak into this thread.
+	database.deliveryCreate({
+		id: "d-other-answer",
+		turnId: "other-turn",
+		originKey: "slack/channel/C1",
+		payloadJson: JSON.stringify({
+			origin: { platform: "slack", kind: "channel", conversationId: "C1" },
+			role: "assistant",
+			text: "answer in another thread",
+			final: true,
+			replyToMessageId: "C1:1700000000.000999",
+		}),
+	});
+	database.deliveryUpdate("d-other-answer", "confirmed", 1);
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	const origin = { platform: "slack", kind: "thread", conversationId: rootId, parentId: "C1" };
+	// The thread is engaged because the channel trigger for the root exists.
+	database.inboundEnqueue({
+		messageId: rootId,
+		originKey: "slack/channel/C1",
+		originRefJson: JSON.stringify({ platform: "slack", kind: "channel", conversationId: "C1" }),
+		body: "@persona fix the map line",
+	});
+	database.inboundBindTurn({
+		messageId: rootId,
+		originKey: "slack/channel/C1",
+		epoch: 0,
+		opRef: "root-op",
+		sessionId: "root-session",
+	});
+	database.inboundTurnAccept("root-op");
+	database.inboundTurnComplete("root-op");
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "pick",
+		verb: "chat.send",
+		params: {
+			origin,
+			text: "1",
+			messageId: "C1:1700000000.000200",
+			engagement: { mentioned: false, group: true, authorId: "owner", authorName: "bellman" },
+		},
+	});
+	for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
+	expect(turns[0]).toContain("[Recent conversation history");
+	expect(turns[0]).toContain("options 1/2/3 please");
+	expect(turns[0]).toContain("Pick one: 1) main 2) rebase 3) persona branch");
+	// Only the thread's own root joins, never the rest of the channel.
+	expect(turns[0]).not.toContain("unrelated channel chatter");
+	expect(turns[0]).not.toContain("answer in another thread");
+	client.close();
+});
+
 test("control tokens never leak: a silence token inside a preamble silences, and [REPLY:id] mid-text is stripped", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {

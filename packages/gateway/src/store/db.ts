@@ -1927,6 +1927,15 @@ export class GatewayDatabase {
 		conversationId: string,
 		limit: number,
 		sinceIso: string,
+		/**
+		 * For a thread origin: the parent channel origin key and the thread root's
+		 * platform message id. A Slack thread opened by a channel mention records
+		 * its root under the CHANNEL origin and the persona's first answer is
+		 * delivered from the channel session, so neither is under the thread key.
+		 * Without this a fresh thread session sees only the newest line ("1") and
+		 * cannot tell what it answers (live, 2026-09-24).
+		 */
+		threadRoot?: { parentOriginKey: string; rootMessageId: string },
 	): Array<{ id?: string; at: string; author: string; body: string }> {
 		// /new sets a floor: nothing from before the reset is ever shown again.
 		const state = this.#database
@@ -1961,7 +1970,41 @@ export class GatewayDatabase {
 				return { at: row.created_at, author: "you", body: typeof text === "string" ? text : "" };
 			})
 			.filter((row) => row.body.length > 0);
-		return [...inbound, ...replies].sort((a, b) => a.at.localeCompare(b.at)).slice(-limit);
+		const rootRows: Array<{ id?: string; at: string; author: string; body: string }> = [];
+		if (threadRoot) {
+			const root = this.#database
+				.query<
+					{
+						message_id: string;
+						received_at: string;
+						author_name: string | null;
+						author_id: string | null;
+						body: string;
+					},
+					[string, string, string]
+				>(
+					"SELECT message_id, received_at, author_name, author_id, body FROM conversation_context WHERE origin_key = ? AND message_id = ? AND received_at >= ? LIMIT 1",
+				)
+				.get(threadRoot.parentOriginKey, threadRoot.rootMessageId, floorAt);
+			if (root)
+				rootRows.push({
+					id: root.message_id,
+					at: root.received_at,
+					author: root.author_name ?? root.author_id ?? "unknown",
+					body: root.body,
+				});
+			const rootReplies = this.#database
+				.query<{ created_at: string; payload_json: string }, [string, string, string, number]>(
+					"SELECT created_at, payload_json FROM deliveries WHERE state = 'confirmed' AND origin_key = ? AND json_extract(payload_json, '$.replyToMessageId') = ? AND json_extract(payload_json, '$.reaction') IS NULL AND created_at >= ? ORDER BY created_at DESC LIMIT ?",
+				)
+				.all(threadRoot.parentOriginKey, threadRoot.rootMessageId, floorAt, limit);
+			for (const row of rootReplies) {
+				const text = (JSON.parse(row.payload_json) as { text?: unknown }).text;
+				if (typeof text === "string" && text.length > 0)
+					rootRows.push({ at: row.created_at, author: "you", body: text });
+			}
+		}
+		return [...rootRows, ...inbound, ...replies].sort((a, b) => a.at.localeCompare(b.at)).slice(-limit);
 	}
 
 	/**
