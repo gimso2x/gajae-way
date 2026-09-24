@@ -127,11 +127,18 @@ export function engagementForMessage(
 						: {}),
 				}
 			: undefined;
-	// A reply to our own message addresses us just like an explicit mention.
+	const authorIsBot = Boolean(message.bot_id) || message.subtype === "bot_message";
+	const textMention = [...(message.text ?? "").matchAll(/<@([^>|]+)(?:\|[^>]*)?>/g)].some(
+		(match) => match[1] === identity.botUserId,
+	);
+	// For a human, a reply to our own message or an open channel addresses us
+	// just like an explicit mention. A bot must name us in its text: sibling
+	// personas reply under each other's messages constantly.
 	const mentioned =
-		[...(message.text ?? "").matchAll(/<@([^>|]+)(?:\|[^>]*)?>/g)].some((match) => match[1] === identity.botUserId) ||
-		replyTo?.fromSelf === true ||
-		(origin.kind !== "dm" && channels?.[origin.parentId ?? origin.conversationId]?.engagement === "open");
+		textMention ||
+		(!authorIsBot &&
+			(replyTo?.fromSelf === true ||
+				(origin.kind !== "dm" && channels?.[origin.parentId ?? origin.conversationId]?.engagement === "open")));
 	const authorName = (message.user ? names.userName(message.user) : undefined) ?? message.username;
 	const authorHandle = message.user ? names.userHandle(message.user) : undefined;
 	const channelName = origin.kind !== "dm" ? names.channelName(message.channel) : undefined;
@@ -139,7 +146,7 @@ export function engagementForMessage(
 		mentioned,
 		group: origin.kind !== "dm",
 		authorId: message.user ?? message.bot_id ?? "",
-		...(message.bot_id || message.subtype === "bot_message" ? { authorIsBot: true } : {}),
+		...(authorIsBot ? { authorIsBot: true } : {}),
 		...(authorName ? { authorName } : {}),
 		...(authorHandle ? { authorHandle } : {}),
 		...(channelName ? { channelLabel: `#${channelName}` } : {}),

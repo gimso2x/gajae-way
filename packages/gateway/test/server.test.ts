@@ -253,6 +253,76 @@ test("a mention-less /new inside an engaged thread is authorised", async () => {
 	client.close();
 });
 
+test("a bot in an engaged thread needs an explicit mention for commands and turns", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-bot-thread-follow-up-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+		channels: { "slack:C1": { engagement: "mention-open", audience: "all" } },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const sessionPort = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	const origin = {
+		platform: "slack" as const,
+		kind: "thread" as const,
+		conversationId: "C1:1700000000.000100",
+		parentId: "C1",
+	};
+	const originKey = "slack/thread/C1:1700000000.000100/parent=C1";
+	database.inboundEnqueue({
+		messageId: "thread-opening",
+		originKey,
+		originRefJson: JSON.stringify(origin),
+		body: "@persona start",
+	});
+	database.inboundBindTurn({
+		messageId: "thread-opening",
+		originKey,
+		epoch: 0,
+		opRef: "thread-opening-op",
+		sessionId: "thread-opening-session",
+	});
+	database.inboundTurnAccept("thread-opening-op");
+	expect(database.inboundTurnComplete("thread-opening-op")).toBe(1);
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	const bot = { mentioned: false, group: true, authorId: "peer-bot", authorIsBot: true };
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "bot-new",
+		verb: "chat.send",
+		params: { origin, text: "/new", engagement: bot },
+	});
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "bot-chat",
+		verb: "chat.send",
+		params: { origin, text: "done", messageId: "C1:1700000000.000200", engagement: bot },
+	});
+	await waitFrame(client.frames, "bot-new");
+	await waitFrame(client.frames, "bot-chat");
+	expect(client.frames.find((frame) => frame.id === "bot-new")).toMatchObject({
+		type: "response",
+		result: { engaged: false },
+	});
+	expect(client.frames.find((frame) => frame.id === "bot-chat")).toMatchObject({
+		type: "response",
+		result: { engaged: false },
+	});
+	expect(database.getSessionRecord(originKey)?.epoch ?? 0).toBe(0);
+	client.close();
+});
+
 test("a mention-less /new at the channel root remains refused", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-command-channel-root-"));
 	const config: GatewayConfig = {

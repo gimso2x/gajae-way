@@ -232,6 +232,8 @@ export function decideEngagement(
 	 * answer was dropped by the closed/mention-open gate (live, Slack,
 	 * 2026-09-17). Authorisation is NOT relaxed: a closed channel still admits
 	 * only owner/allowlist authors, and audience rules still decide bots.
+	 * Bots never use it: two personas sharing a thread would otherwise answer each
+	 * other on every line, so a bot must mention us explicitly.
 	 */
 	threadFollowUp = false,
 ): EngagementDecision {
@@ -243,12 +245,26 @@ export function decideEngagement(
 	if (origin.kind === "dm") return { engaged: dmEngaged(engagement, config), botAudienceAdmission: false };
 	if (!engagement?.group) return { engaged: false, botAudienceAdmission: false };
 	const policy = resolveChannelPolicy(origin, config);
+	const authorIsBot = engagement.authorIsBot === true;
 	return evaluateChannelEngagement({
 		policy,
-		authorIsBot: engagement.authorIsBot === true,
-		addressed: engagement.mentioned || (origin.kind === "thread" && threadFollowUp),
+		authorIsBot,
+		addressed: isAddressed(origin, engagement, threadFollowUp),
 		authorized: closedAuthorAuthorized(engagement.authorId, config),
 	});
+}
+
+/**
+ * Whether the message is aimed at this persona: an explicit mention, or (humans
+ * only) a follow-up in a thread the persona is already answering.
+ */
+export function isAddressed(
+	origin: Pick<OriginRef, "kind">,
+	engagement: Pick<EngagementContext, "mentioned" | "authorIsBot">,
+	threadFollowUp: boolean,
+): boolean {
+	if (engagement.mentioned) return true;
+	return engagement.authorIsBot !== true && origin.kind === "thread" && threadFollowUp;
 }
 
 /** The inbound-ledger surface the follow-up signal needs; narrowed so tests need no database. */

@@ -113,6 +113,26 @@ test("derives engagement from Discord mentions and recognizes DMs as non-group",
 	expect(dm).toEqual({ mentioned: false, group: false, authorId: "author-1" });
 });
 
+test("a bot author is addressed only by an explicit mention in its content", () => {
+	const bot = { id: "bot.1" };
+	const peer = { id: "peer-bot", username: "peer", bot: true };
+	const reply = {
+		id: "3",
+		content: "done",
+		author: peer,
+		channel: { id: "channel" },
+		reference: { messageId: "42" },
+		mentions: { has: () => true, repliedUser: { id: "bot.1", username: "gajaeway" } },
+	};
+	// Reply-to-self and the implicit reply ping are not an address from a bot.
+	expect(engagementForMessage(reply, bot).mentioned).toBe(false);
+	// A literal mention in the content still is.
+	expect(engagementForMessage({ ...reply, content: "<@bot.1> done" }, bot).mentioned).toBe(true);
+	expect(engagementForMessage({ ...reply, content: "<@!bot.1> done" }, bot).mentioned).toBe(true);
+	// A human reply to us keeps addressing us.
+	expect(engagementForMessage({ ...reply, author }, bot).mentioned).toBe(true);
+});
+
 test("reports the author's server tag, which every human in the room can already read", () => {
 	const bot = { id: "bot.1" };
 	const tagged = engagementForMessage(

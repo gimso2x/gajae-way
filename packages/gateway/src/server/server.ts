@@ -38,6 +38,7 @@ import { kevShadowEnabled, recordKevShadow } from "../engagement/kev-shadow";
 import {
 	BotAudienceTurnGuard,
 	decideEngagement,
+	isAddressed,
 	resolveBotAudienceLimits,
 	threadFollowUpEngaged,
 } from "../engagement/policy";
@@ -1357,7 +1358,8 @@ async function sendChat(
 		: undefined;
 	const botAudienceGuardSpent = botAudienceAdmission !== undefined && !botAudienceAdmission.admit;
 	if (botAudienceAdmission !== undefined && !botAudienceAdmission.admit) {
-		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUp);
+		const addressed =
+			authorIsBot && isAddressed(origin, { mentioned: engagement?.mentioned === true, authorIsBot }, threadFollowUp);
 		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
 		if (addressed || botAudienceAdmission.reason === "rate_limited")
 			console.error(
@@ -1550,7 +1552,8 @@ async function editChat(
 		: undefined;
 	const botAudienceGuardSpent = botAudienceAdmission !== undefined && !botAudienceAdmission.admit;
 	if (botAudienceAdmission !== undefined && !botAudienceAdmission.admit) {
-		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUp);
+		const addressed =
+			authorIsBot && isAddressed(origin, { mentioned: engagement?.mentioned === true, authorIsBot }, threadFollowUp);
 		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
 		if (addressed || botAudienceAdmission.reason === "rate_limited")
 			console.error(
