@@ -96,6 +96,10 @@ export const SKIPPED_SUBTYPES: ReadonlySet<string> = new Set([
 	"channel_name",
 	"channel_archive",
 	"channel_unarchive",
+	// Visibility changes post a system notice under the acting user; answering
+	// it in an open channel is noise, and replying under it fails (live, 2026-09-24).
+	"channel_convert_to_private",
+	"channel_convert_to_public",
 	"group_join",
 	"group_leave",
 	"group_topic",
