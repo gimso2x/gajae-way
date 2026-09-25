@@ -71,7 +71,11 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 			// process cwd (which is typically the product source checkout): a session
 			// bound to the app repo reports that repo's git state as its own.
 			const personaWorkspace = join(config.home, "workspace");
-			const startedAt = new Date().toISOString();
+			// Process start, not "boot reached this line": adapters compare their own
+			// process start against it (staleGeneration). Stamping after integrity
+			// checks and broker preflight made an adapter that systemd restarted
+			// together with this gateway (PartOf) read as the previous generation.
+			const startedAt = new Date(Date.now() - process.uptime() * 1000).toISOString();
 			await broker.start();
 			const supervisor = broker;
 			const tailRunner = new TailRunner({

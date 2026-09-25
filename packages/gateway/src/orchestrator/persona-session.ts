@@ -62,6 +62,13 @@ const DISPATCH_FAILURE_RETRY_MAX_MS = 60_000;
 export const BIND_WEDGE_PROBE_STRIKES = 5;
 /** Consecutive recovery sweeps (60s apart) an unknown op on a live idle session is held before release. */
 const HOLD_RELEASE_SWEEPS = 2;
+/**
+ * Consecutive sweeps a recovery hold persists before the owner is told once.
+ * A hold never resends or replaces anything by itself, so without this a turn
+ * the runtime cannot decide sat silent in the log forever (BotFactory PM,
+ * 2026-09-25: 164 holds in 24h, no owner notice).
+ */
+export const HOLD_ESCALATE_SWEEPS = 5;
 
 export type PersonaActorState = "idle" | "turn-running";
 
@@ -143,6 +150,16 @@ export interface PersonaTurnSettledInput extends PersonaTurnIdentity {
 	readonly terminalDeliveryId: string | null;
 }
 
+/** A recovery hold that persisted HOLD_ESCALATE_SWEEPS sweeps; emitted once per op-ref per process. */
+export interface PersonaRecoveryHoldInput {
+	readonly originKey: string;
+	readonly opRef: string;
+	readonly epoch: number;
+	readonly reason: string;
+	readonly sweeps: number;
+	readonly trigger: InboundMessageRow | undefined;
+}
+
 export interface PersonaBindHoldInput {
 	readonly originKey: string;
 	readonly trigger: InboundMessageRow;
@@ -195,6 +212,8 @@ export interface PersonaSessionManagerOptions {
 	readonly brokerLiveness?: BrokerLivenessProbe;
 	/** Emits a cause-bearing hold notice while the inbound trigger remains pending. */
 	readonly onBindHold?: (input: PersonaBindHoldInput) => void | Promise<void>;
+	/** Tells the operator a recovery hold is not clearing; the turn itself stays held. */
+	readonly onRecoveryHold?: (input: PersonaRecoveryHoldInput) => void | Promise<void>;
 	readonly log?: (line: string) => void;
 }
 
@@ -222,6 +241,7 @@ export class PersonaSessionManager {
 	readonly #heldSteerContextMessageId: PersonaSessionManagerOptions["heldSteerContextMessageId"];
 	readonly #brokerLiveness: BrokerLivenessProbe | undefined;
 	readonly #onBindHold: PersonaSessionManagerOptions["onBindHold"];
+	readonly #onRecoveryHold: PersonaSessionManagerOptions["onRecoveryHold"];
 	readonly #log: (line: string) => void;
 	readonly #actors = new Map<string, OriginActor>();
 	#stopped = false;
@@ -246,6 +266,7 @@ export class PersonaSessionManager {
 		this.#heldSteerContextMessageId = options.heldSteerContextMessageId;
 		this.#brokerLiveness = options.brokerLiveness;
 		this.#onBindHold = options.onBindHold;
+		this.#onRecoveryHold = options.onRecoveryHold;
 		this.#log = options.log ?? ((line: string) => console.error(line));
 	}
 
@@ -448,6 +469,17 @@ export class PersonaSessionManager {
 			await this.#onBindHold?.(input);
 		} catch (error) {
 			this.#log(`persona_bind_hold_notice_failed origin=${input.originKey} detail=${safeDiagnostic(error)}`);
+		}
+	}
+
+	async emitRecoveryHold(input: PersonaRecoveryHoldInput): Promise<void> {
+		this.#log(
+			`recovery_hold_escalated origin=${input.originKey} epoch=${input.epoch} opRef=${input.opRef} sweeps=${input.sweeps}`,
+		);
+		try {
+			await this.#onRecoveryHold?.(input);
+		} catch (error) {
+			this.#log(`recovery_hold_notice_failed origin=${input.originKey} detail=${safeDiagnostic(error)}`);
 		}
 	}
 
@@ -846,6 +878,7 @@ class OriginActor {
 				this.#manager.log(
 					`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${decision.reason} sweeps=${count}`,
 				);
+				await this.#escalateHold(turn.opRef, turn.epoch, decision.reason, count);
 				return;
 			}
 		}
@@ -931,6 +964,27 @@ class OriginActor {
 	}
 
 	readonly #holdSweeps = new Map<string, number>();
+	/** Op-refs whose persistent hold was already escalated to the operator in this process. */
+	readonly #holdEscalated = new Set<string>();
+
+	/**
+	 * Tells the operator once that a hold is not clearing on its own. Alert only:
+	 * the turn stays held exactly as before (no resend, resume or replacement).
+	 * The notice id is deterministic per op-ref, so a restart that re-counts the
+	 * sweeps is deduplicated by the delivery ledger rather than re-posting.
+	 */
+	async #escalateHold(opRef: string, epoch: number, reason: string, sweeps: number): Promise<void> {
+		if (sweeps < HOLD_ESCALATE_SWEEPS || this.#holdEscalated.has(opRef)) return;
+		this.#holdEscalated.add(opRef);
+		await this.#manager.emitRecoveryHold({
+			originKey: this.originKey,
+			opRef,
+			epoch,
+			reason,
+			sweeps,
+			trigger: this.#manager.database.inboundTurnRow(opRef),
+		});
+	}
 
 	async #queueIsEmpty(sessionId: string): Promise<boolean> {
 		const port = this.#manager.port;
@@ -1863,6 +1917,7 @@ class OriginActor {
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=operation_state_unknown sweeps=${count}`,
 			);
+			await this.#escalateHold(bound.turn.opRef, bound.epoch, "operation_state_unknown", count);
 			return;
 		}
 		this.#holdSweeps.delete(bound.turn.opRef);

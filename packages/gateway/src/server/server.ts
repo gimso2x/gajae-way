@@ -59,6 +59,7 @@ import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
 	type PersonaBindHoldInput,
 	type PersonaFailureInput,
+	type PersonaRecoveryHoldInput,
 	PersonaSessionManager,
 	type PersonaSteerInput,
 	type PersonaTailFrameInput,
@@ -511,6 +512,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			);
 			if (payload) broadcastDelivery(runtime, payload);
 		},
+		onRecoveryHold: (input) => reportRecoveryHold(runtime, input),
 		onTurnStart: async (input) => await createInboundTurnLifecycle(input, options, runtime),
 		// A steer whose acceptance was learnt after its turn's lifecycle is gone
 		// (resolved at terminal or after a restart) is finalized exactly like a
@@ -2249,7 +2251,7 @@ export function spokenReply(parts: readonly string[], voiceTurn: boolean): strin
 }
 
 /** Marks a prepared delivery in flight and fans it out to every negotiated adapter. */
-function broadcastDelivery(runtime: Runtime, payload: ChatMessagePayload): void {
+function broadcastDelivery(runtime: Pick<Runtime, "delivery" | "connections">, payload: ChatMessagePayload): void {
 	runtime.delivery.markInflight(payload.deliveryId as string);
 	for (const recipient of runtime.connections)
 		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
@@ -2271,6 +2273,21 @@ function reportDeliveryExpired(
 	if (!ownerTarget) return;
 	const noticeId = deterministicDeliveryExpiredNoticeId(expired.deliveryId);
 	const notice = `[delivery lost] ${sanitizeDiagnostic(expired.originKey).slice(0, 160)} 응답 전달이 ${attempts}회 실패해 만료됐습니다 (사유: ${safeDiagnosticField(reason)}). 재전송: gajaeway ops redeliver ${deliveryId}`;
+	const payload = runtime.delivery.prepare(noticeId, ownerTarget, notice, undefined, noticeId);
+	if (payload) broadcastDelivery(runtime, payload);
+}
+
+/** One owner DM per persistent recovery hold; the ledger dedupes it across restarts by op-ref. */
+export function reportRecoveryHold(
+	runtime: Pick<Runtime, "config" | "delivery" | "connections">,
+	input: PersonaRecoveryHoldInput,
+): void {
+	const ownerTarget = runtime.config.ownerTarget?.origin;
+	if (!ownerTarget) return;
+	const noticeId = `gw-x-${createHash("sha256").update(`recovery-hold:${input.opRef}`).digest("hex").slice(0, 32)}`;
+	const minutes = input.sweeps;
+	const excerpt = input.trigger ? sanitizeDiagnostic(input.trigger.body).replace(/\s+/g, " ").slice(0, 80) : "";
+	const notice = `[recovery hold] ${sanitizeDiagnostic(input.originKey).slice(0, 160)} 메시지 처리가 약 ${minutes}분째 보류 중입니다 (사유: ${safeDiagnosticField(input.reason)}). 자동 재전송은 하지 않습니다.${excerpt ? ` 메시지: "${excerpt}"` : ""} 확인: journalctl --user -u <bot>-gateway | grep ${safeDiagnosticField(input.opRef)} — 새로 시작하려면 해당 대화에서 /new.`;
 	const payload = runtime.delivery.prepare(noticeId, ownerTarget, notice, undefined, noticeId);
 	if (payload) broadcastDelivery(runtime, payload);
 }

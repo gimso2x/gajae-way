@@ -4,7 +4,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GjcCliError } from "@gajae-gateway/subsession";
-import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
+import {
+	HOLD_ESCALATE_SWEEPS,
+	type PersonaRecoveryHoldInput,
+	PersonaSessionManager,
+	personaTurnOpRef,
+} from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
 import type { TailAttachInput } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";
@@ -1219,6 +1224,80 @@ test("startup recovery keeps holding a bound turn with undecidable status while 
 	expect(stale.sends).toEqual([]);
 	expect(database?.inboundTurnRow(opRef)).toMatchObject({ turn_state: "bound" });
 	expect(database?.getSessionRecord(KEY)?.epoch).toBe(0);
+});
+
+async function persistentHoldHarness(onRecoveryHold: (input: PersonaRecoveryHoldInput) => void) {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	enqueue("m-1", "held indefinitely");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const running = port.sends[0]!;
+	const opRef = latestOpRef;
+	await manager?.stop();
+	database?.inboundTurnRequeue(opRef);
+	database?.inboundBindTurn({ messageId: "m-1", originKey: KEY, epoch: 0, opRef, sessionId: running.sessionId });
+	class StaleEndpointPort extends ScriptedSessionPort {
+		override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+			if (input.sessionId === running.sessionId)
+				throw new GjcCliError("gjc sdk session status reported failure", 1, "", { code: "endpoint_stale" });
+			return await super.status(input);
+		}
+	}
+	const stale = new StaleEndpointPort({ onBind: (input) => `fresh-e${input.epoch}` });
+	registerFixtureBindings(stale);
+	// Live, so nothing proves the send was lost: the hold must stay a hold.
+	stale.setSessionState(running.sessionId, { repo: join(home, "workspace"), live: true, deleted: false });
+	const logs: string[] = [];
+	const build = () =>
+		new PersonaSessionManager({
+			database: database!,
+			port: stale,
+			instanceId: "instance-test",
+			repo: join(home, "workspace"),
+			log: (line) => logs.push(line),
+			onRecoveryHold,
+			onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+		});
+	manager = build();
+	return { opRef, stale, logs, build };
+}
+
+test("a recovery hold that persists escalates to the operator exactly once, and the turn stays held", async () => {
+	const escalations: PersonaRecoveryHoldInput[] = [];
+	const { opRef, stale, logs } = await persistentHoldHarness((input) => {
+		escalations.push(input);
+	});
+	for (let sweep = 1; sweep < HOLD_ESCALATE_SWEEPS; sweep++) await manager!.recover();
+	expect(escalations).toEqual([]);
+
+	await manager!.recover();
+	expect(escalations).toHaveLength(1);
+	expect(escalations[0]).toMatchObject({ originKey: KEY, opRef, epoch: 0, sweeps: HOLD_ESCALATE_SWEEPS });
+	expect(escalations[0]!.reason).toContain("not decidable");
+	expect(escalations[0]!.trigger?.body).toBe("held indefinitely");
+	expect(logs.some((line) => line.startsWith(`recovery_hold_escalated origin=${KEY} epoch=0 opRef=${opRef}`))).toBe(
+		true,
+	);
+
+	for (let sweep = 0; sweep < 3; sweep++) await manager!.recover();
+	expect(escalations).toHaveLength(1);
+	// Alert only: nothing was resent, rebound or released.
+	expect(stale.sends).toEqual([]);
+	expect(database?.inboundTurnRow(opRef)).toMatchObject({ turn_state: "bound" });
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(0);
+});
+
+test("a failing escalation hook is logged and never breaks the hold", async () => {
+	const { opRef, logs } = await persistentHoldHarness(() => {
+		throw new Error("owner unreachable");
+	});
+	for (let sweep = 0; sweep < HOLD_ESCALATE_SWEEPS + 1; sweep++) await manager!.recover();
+	expect(logs.some((line) => line.startsWith(`recovery_hold_notice_failed origin=${KEY}`))).toBe(true);
+	expect(logs.filter((line) => line.startsWith("recovery_hold ") && line.includes(`opRef=${opRef}`))).toHaveLength(
+		HOLD_ESCALATE_SWEEPS + 1,
+	);
+	expect(database?.inboundTurnRow(opRef)).toMatchObject({ turn_state: "bound" });
 });
 
 test("startup recovery releases a retired bound turn the broker disowns instead of holding it forever", async () => {
