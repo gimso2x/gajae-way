@@ -247,8 +247,11 @@ export function engagementForMessage(message: DiscordInboundMessage, botUser: un
 	const displayName = resolveAuthorDisplayName(message);
 	const serverTag = resolveServerTag(message.author);
 	const replyTo = resolveReplyContext(message, botId);
+	// A bot must name us in its content; the reply ping and reply-to-self that
+	// address us for a human are how sibling personas answer each other.
+	const implicitMention = !message.author.bot && Boolean(message.mentions?.has(botUser) || replyTo?.fromSelf);
 	return {
-		mentioned: Boolean(message.mentions?.has(botUser) || contentMention || replyTo?.fromSelf),
+		mentioned: contentMention || implicitMention,
 		group: origin.kind !== "dm",
 		authorId: message.author.id,
 		...(message.author.bot ? { authorIsBot: true } : {}),

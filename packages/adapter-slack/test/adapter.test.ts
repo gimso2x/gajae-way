@@ -260,6 +260,29 @@ test("Slack rejects self, service, hidden, authorless and empty messages and ign
 	}
 });
 
+test("a bot author is addressed only by an explicit mention in its text", () => {
+	const botReply = (extra: Partial<SlackInboundMessage>) => inbound({ user: "UPEER", bot_id: "B2", ...extra });
+	// A sibling bot replying under our message is not addressing us.
+	const reply = botReply({ thread_ts: "1.000", parent_user_id: "UBOT" });
+	expect(engagementForMessage(reply, slackMessageOrigin(reply), identity, names, undefined).mentioned).toBe(false);
+	// An open-channel map never manufactures a bot mention.
+	expect(engagementForMessage(botReply({}), origin, identity, names, { C1: { engagement: "open" } }).mentioned).toBe(
+		false,
+	);
+	// Mentioning some other bot is not a mention of us.
+	expect(engagementForMessage(botReply({ text: "<@UOTHER> go" }), origin, identity, names, undefined).mentioned).toBe(
+		false,
+	);
+	// An explicit mention of us in the text still addresses us.
+	const addressed = botReply({ text: "<@UBOT> done", thread_ts: "1.000", parent_user_id: "UBOT" });
+	expect(engagementForMessage(addressed, slackMessageOrigin(addressed), identity, names, undefined).mentioned).toBe(
+		true,
+	);
+	// The native reply shape of a human is unchanged.
+	const human = inbound({ thread_ts: "1.000", parent_user_id: "UBOT" });
+	expect(engagementForMessage(human, slackMessageOrigin(human), identity, names, undefined).mentioned).toBe(true);
+});
+
 test("Slack mention, open-channel and parent-bot promotion; bot authors remain metadata", () => {
 	for (const extra of [
 		{ text: "<@UBOT> hi" },

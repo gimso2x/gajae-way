@@ -374,10 +374,13 @@ describe("C5 turn header shape", () => {
 describe("C6 engagement policy is untouched", () => {
 	test("Discord: mentioned is computed without any reply input", () => {
 		const source = readSource("packages/adapter-discord/src/main.ts");
-		const mentionedLine = source.split("\n").find((line) => line.includes("mentioned: Boolean(")) ?? "";
-		expect(mentionedLine).toContain("message.mentions?.has(botUser) || contentMention");
-		expect(mentionedLine).toContain("replyTo?.fromSelf");
-		expect(mentionedLine).not.toContain("replyToMessageId");
+		const implicitLine = source.split("\n").find((line) => line.includes("const implicitMention =")) ?? "";
+		// The implicit address (reply ping, reply-to-self) is a human-only signal.
+		expect(implicitLine).toContain(
+			"!message.author.bot && Boolean(message.mentions?.has(botUser) || replyTo?.fromSelf)",
+		);
+		expect(implicitLine).not.toContain("replyToMessageId");
+		expect(source).toContain("mentioned: contentMention || implicitMention,");
 		// `replyTo` is only ever spread into the payload, never into `mentioned`.
 		expect(source.includes("...(replyTo ? { replyTo } : {})")).toBe(true);
 	});
@@ -695,18 +698,18 @@ describe("G2 C6 source-text guarantees and full divergence enumeration", () => {
 			// must not leak into `mentioned` through any other field.
 			expect(line.replace(/\|\| replyTo\?\.fromSelf\)?,?$/, "")).not.toContain("replyTo");
 		}
-		// The mentioned expression is the mention check plus the addressed-signal reply.
-		expect(source).toContain(
-			"mentioned: Boolean(message.mentions?.has(botUser) || contentMention || replyTo?.fromSelf)",
-		);
+		// The mentioned expression is the content mention plus the human-only implicit address.
+		expect(source).toContain("mentioned: contentMention || implicitMention,");
 		// resolveReplyContext's result is only ever spread into the payload.
 		expect(source).toContain("...(replyTo ? { replyTo } : {})");
 		const replyUses = source
 			.split("\n")
-			.filter((line) => line.includes("replyTo") && !line.includes("replyToMessageId"));
+			.filter(
+				(line) => line.includes("replyTo") && !line.includes("replyToMessageId") && !line.trimStart().startsWith("//"),
+			);
 		expect(replyUses).toEqual([
 			"\tconst replyTo = resolveReplyContext(message, botId);",
-			"\t\tmentioned: Boolean(message.mentions?.has(botUser) || contentMention || replyTo?.fromSelf),",
+			"\tconst implicitMention = !message.author.bot && Boolean(message.mentions?.has(botUser) || replyTo?.fromSelf);",
 			"\t\t...(replyTo ? { replyTo } : {}),",
 		]);
 	});

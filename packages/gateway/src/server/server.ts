@@ -38,6 +38,7 @@ import { type KevShadowInput, kevShadowEnabled, recordKevShadow } from "../engag
 import {
 	BotAudienceTurnGuard,
 	decideEngagement,
+	isAddressed,
 	resolveBotAudienceLimits,
 	threadFollowUpEngaged,
 } from "../engagement/policy";
@@ -1405,7 +1406,8 @@ async function sendChat(
 		: undefined;
 	const botAudienceGuardSpent = botAudienceAdmission !== undefined && !botAudienceAdmission.admit;
 	if (botAudienceAdmission !== undefined && !botAudienceAdmission.admit) {
-		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUp);
+		const addressed =
+			authorIsBot && isAddressed(origin, { mentioned: engagement?.mentioned === true, authorIsBot }, threadFollowUp);
 		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
 		if (addressed || botAudienceAdmission.reason === "rate_limited")
 			console.error(
@@ -1625,7 +1627,8 @@ async function editChat(
 		: undefined;
 	const botAudienceGuardSpent = botAudienceAdmission !== undefined && !botAudienceAdmission.admit;
 	if (botAudienceAdmission !== undefined && !botAudienceAdmission.admit) {
-		const addressed = authorIsBot && (engagement?.mentioned === true || threadFollowUp);
+		const addressed =
+			authorIsBot && isAddressed(origin, { mentioned: engagement?.mentioned === true, authorIsBot }, threadFollowUp);
 		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
 		if (addressed || botAudienceAdmission.reason === "rate_limited")
 			console.error(
@@ -1726,6 +1729,16 @@ async function createInboundTurnLifecycle(
 					origin.conversationId,
 					RECENT_HISTORY_MAX,
 					new Date(Date.now() - RECENT_HISTORY_WINDOW_MS).toISOString(),
+					origin.kind === "thread" && origin.parentId
+						? {
+								parentOriginKey: originKey({
+									platform: origin.platform,
+									kind: "channel",
+									conversationId: origin.parentId,
+								}),
+								rootMessageId: origin.conversationId,
+							}
+						: undefined,
 				)
 			: [];
 		const inWindowIds = new Set(prepared.selectedMessageIds);

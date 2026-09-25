@@ -38,11 +38,11 @@ test("a real mention addresses the bot for human and bot authors", () => {
 	}
 });
 
-test("a native reply to our message is addressed, including for a bot author", () => {
-	for (const author of [
-		{ id: "human-1", bot: false },
-		{ id: "other-bot", bot: true },
-	]) {
+test("a native reply to our message addresses us from a human, never from a bot", () => {
+	for (const [author, addressed] of [
+		[{ id: "human-1", bot: false }, true],
+		[{ id: "other-bot", bot: true }, false],
+	] as const) {
 		const decision = decideInbound(
 			message({
 				author,
@@ -52,7 +52,8 @@ test("a native reply to our message is addressed, including for a bot author", (
 			SELF,
 			CHANNELS,
 		);
-		expect(decision?.mentioned).toBe(true);
+		expect(decision?.mentioned).toBe(addressed);
+		// The reply context still travels as metadata either way.
 		expect(decision?.replyTo).toMatchObject({ messageId: "outbound-1", fromSelf: true });
 	}
 });

@@ -49,12 +49,43 @@ test("a closed channel still authorises the author on every follow-up", () => {
 
 test("audience rules still decide bots in a followed-up thread", () => {
 	const humanOnly = config({ channels: { "slack:C1": { engagement: "mention-open", audience: "human-only" } } });
-	expect(decideEngagement(THREAD, { ...speaker("U-bot"), authorIsBot: true }, humanOnly, true).engaged).toBe(false);
+	expect(decideEngagement(THREAD, { ...speaker("U-bot", true), authorIsBot: true }, humanOnly, true).engaged).toBe(
+		false,
+	);
 	const all = config({ channels: { "slack:C1": { engagement: "mention-open", audience: "all" } } });
-	expect(decideEngagement(THREAD, { ...speaker("U-bot"), authorIsBot: true }, all, true)).toEqual({
+	expect(decideEngagement(THREAD, { ...speaker("U-bot", true), authorIsBot: true }, all, true)).toEqual({
 		engaged: true,
 		botAudienceAdmission: true,
 	});
+});
+
+test("a bot never earns a turn from thread follow-up alone in a mention-gated channel", () => {
+	// Two personas sharing a thread would otherwise answer each other forever:
+	// the follow-up signal is a human convenience, a bot must address us.
+	const all = config({ channels: { "slack:C1": { engagement: "mention-open", audience: "all" } } });
+	expect(decideEngagement(THREAD, { ...speaker("U-bot"), authorIsBot: true }, all, true)).toEqual({
+		engaged: false,
+		botAudienceAdmission: false,
+	});
+	const botOnly = config({ channels: { "slack:C1": { engagement: "mention-open", audience: "bot-only" } } });
+	expect(decideEngagement(THREAD, { ...speaker("U-bot"), authorIsBot: true }, botOnly, true).engaged).toBe(false);
+	const closed = config({ mentionAllowlist: [OWNER, "U-bot"] });
+	expect(decideEngagement(THREAD, { ...speaker("U-bot"), authorIsBot: true }, closed, true).engaged).toBe(false);
+	// An explicit mention still addresses us.
+	expect(decideEngagement(THREAD, { ...speaker("U-bot", true), authorIsBot: true }, closed, true).engaged).toBe(true);
+});
+
+test("a human follow-up keeps working for every mention-gated audience", () => {
+	const all = config({ channels: { "slack:C1": { engagement: "mention-open", audience: "all" } } });
+	expect(decideEngagement(THREAD, speaker("U-stranger"), all, true).engaged).toBe(true);
+	const humanOnly = config({ channels: { "slack:C1": { engagement: "mention-open", audience: "human-only" } } });
+	expect(decideEngagement(THREAD, speaker("U-stranger"), humanOnly, true).engaged).toBe(true);
+});
+
+test("an open channel keeps admitting bots without a mention", () => {
+	// open + all is an explicit operator choice: the evaluator admits regardless of addressing.
+	const open = config({ channels: { "slack:C1": { engagement: "open", audience: "all" } } });
+	expect(decideEngagement(THREAD, { ...speaker("U-bot"), authorIsBot: true }, open, true).engaged).toBe(true);
 });
 
 const THREAD_KEY = "slack/thread/C1:1700000000.000100/parent=C1";
