@@ -816,6 +816,23 @@ class OriginActor {
 				// proof the send was lost, and re-firing it double-posts
 				// (layofflabs-2, 2026-09-02).
 				const liveIdle = status.status.status === "unknown" && raw?.live === true && !retired && turn.state === "bound";
+				// A BOUND turn on a session the broker reports not live has no host that
+				// could be running it: the startup counterpart of the live path's
+				// unknown_op_on_dead_session release. Without it a gateway restart that
+				// outlived the session host held the trigger every sweep, forever
+				// (BotFactory PM, 2026-09-25: sweeps=56 on two origins). A retired turn
+				// re-enters the queue under the current epoch; a current one rotates it.
+				const deadUnlanded = status.status.status === "unknown" && turn.state === "bound" && sessionDead;
+				if (deadUnlanded && count >= HOLD_RELEASE_SWEEPS) {
+					this.#holdSweeps.delete(turn.opRef);
+					const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
+					const nextEpoch = retired ? currentEpoch : this.#manager.database.rebindEpoch(this.originKey);
+					this.#manager.log(
+						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} attempt=${attempt} reason=${retired ? "retired_unknown_op_on_dead_session" : "unknown_op_on_dead_session"} sweeps=${count}`,
+					);
+					await this.#dispatchNext();
+					return;
+				}
 				if (liveIdle && count >= HOLD_RELEASE_SWEEPS && (await this.#queueIsEmpty(sessionId))) {
 					this.#holdSweeps.delete(turn.opRef);
 					const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);

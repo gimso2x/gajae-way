@@ -1116,6 +1116,111 @@ test("startup recovery releases a bound turn whose tail attach is disowned inste
 	expect(manager.state(KEY)).toBe("turn-running");
 });
 
+/**
+ * Live 2026-09-25 (BotFactory PM): a gateway restart outlived the session
+ * hosts. The broker still indexed both ids (inspect: live=false, not deleted)
+ * while `session status` answered `endpoint_stale`, so recovery logged
+ * `recovery_hold … reason=operation state terminal_uncertain is not decidable`
+ * every sweep (sweeps=56) and the two triggers were never answered.
+ */
+test("startup recovery releases a bound turn on a not-live session after the hold persists, instead of holding it forever", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	enqueue("m-1", "stranded by restart");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const stranded = port.sends[0]!;
+	const opRef = latestOpRef;
+	await manager?.stop();
+	database?.inboundTurnRequeue(opRef);
+	database?.inboundBindTurn({ messageId: "m-1", originKey: KEY, epoch: 0, opRef, sessionId: stranded.sessionId });
+	expect(database?.inboundTurnRow(opRef)).toMatchObject({ turn_state: "bound" });
+
+	class StaleEndpointPort extends ScriptedSessionPort {
+		override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+			if (input.sessionId === stranded.sessionId)
+				throw new GjcCliError("gjc sdk session status reported failure", 1, "", {
+					code: "endpoint_stale",
+					message: "The SDK endpoint is stale or unavailable.",
+				});
+			return await super.status(input);
+		}
+	}
+	const stale = new StaleEndpointPort({ onBind: (input) => `fresh-e${input.epoch}` });
+	registerFixtureBindings(stale);
+	stale.setSessionState(stranded.sessionId, { repo: join(home, "workspace"), live: false, deleted: false });
+	const logs: string[] = [];
+	manager = new PersonaSessionManager({
+		database: database!,
+		port: stale,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		log: (line) => logs.push(line),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+	});
+	// First sweep: a single undecidable read is held, never released.
+	await manager.recover();
+	expect(
+		logs.some((line) => line.includes(`opRef=${opRef}`) && line.includes("not decidable") && line.includes("sweeps=1")),
+	).toBe(true);
+	expect(stale.sends).toEqual([]);
+	expect(database?.inboundTurnRow(opRef)).toMatchObject({ turn_state: "bound" });
+
+	// Second sweep: still not live, so nothing can be running it.
+	await manager.recover();
+	expect(
+		logs.some(
+			(line) =>
+				line.startsWith("recovery_requeue_unaccepted") &&
+				line.includes(`opRef=${opRef}`) &&
+				line.includes("reason=unknown_op_on_dead_session sweeps=2"),
+		),
+	).toBe(true);
+	await eventually(() => stale.sends.length === 1, "released trigger was not re-dispatched");
+	expect(stale.sends[0]!.text).toBe("stranded by restart");
+	expect(stale.sends[0]!.opRef).not.toBe(opRef);
+	expect(stale.sends[0]!.sessionId).not.toBe(stranded.sessionId);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
+});
+
+test("startup recovery keeps holding a bound turn with undecidable status while its session is still live", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	enqueue("m-1", "maybe running");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const running = port.sends[0]!;
+	const opRef = latestOpRef;
+	await manager?.stop();
+	database?.inboundTurnRequeue(opRef);
+	database?.inboundBindTurn({ messageId: "m-1", originKey: KEY, epoch: 0, opRef, sessionId: running.sessionId });
+
+	class StaleEndpointPort extends ScriptedSessionPort {
+		override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+			if (input.sessionId === running.sessionId)
+				throw new GjcCliError("gjc sdk session status reported failure", 1, "", { code: "endpoint_stale" });
+			return await super.status(input);
+		}
+	}
+	const stale = new StaleEndpointPort({ onBind: (input) => `fresh-e${input.epoch}` });
+	registerFixtureBindings(stale);
+	stale.setSessionState(running.sessionId, { repo: join(home, "workspace"), live: true, deleted: false });
+	const logs: string[] = [];
+	manager = new PersonaSessionManager({
+		database: database!,
+		port: stale,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		log: (line) => logs.push(line),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+	});
+	for (let sweep = 0; sweep < 3; sweep++) await manager.recover();
+	expect(logs.some((line) => line.includes("unknown_op_on_dead_session"))).toBe(false);
+	expect(stale.sends).toEqual([]);
+	expect(database?.inboundTurnRow(opRef)).toMatchObject({ turn_state: "bound" });
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(0);
+});
+
 test("startup recovery releases a retired bound turn the broker disowns instead of holding it forever", async () => {
 	const port = new GhostSendPort();
 	await harness(port);
