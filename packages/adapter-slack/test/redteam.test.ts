@@ -115,6 +115,9 @@ class Api extends SlackWebApi {
 	): Promise<SlackHistoryPage> {
 		return { messages: this.replyMessages, has_more: false };
 	}
+	override async postEphemeral(_channel: string, _user: string, text: string) {
+		this.responses.push({ response_type: "ephemeral", text });
+	}
 	override async respond(_url: string, payload: Record<string, unknown>) {
 		this.responses.push(payload);
 	}

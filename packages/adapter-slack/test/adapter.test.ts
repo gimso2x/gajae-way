@@ -77,6 +77,7 @@ class Api extends SlackWebApi {
 	readonly posts: unknown[][] = [];
 	readonly reactions: unknown[][] = [];
 	readonly responses: unknown[][] = [];
+	readonly ephemerals: unknown[][] = [];
 	readonly users: string[] = [];
 	readonly conversations: string[] = [];
 	failure?: Error;
@@ -119,6 +120,10 @@ class Api extends SlackWebApi {
 	}
 	override async conversationsReplies(_channel: string, _ts: string): Promise<SlackHistoryPage> {
 		return { messages: [], has_more: false };
+	}
+	override async postEphemeral(channel: string, user: string, text: string) {
+		this.ephemerals.push([channel, user, text]);
+		if (this.failure) throw this.failure;
 	}
 	override async respond(url: string, payload: Record<string, unknown>) {
 		this.responses.push([url, payload]);
@@ -731,21 +736,18 @@ for (const command of ["/new", "/reset", "/restart", "/model", "/unknown"])
 					trigger_id: String(engaged),
 					response_url: "https://hooks.slack.test/response",
 				});
-				expect(f.api.responses.at(-1)).toEqual([
-					"https://hooks.slack.test/response",
-					{
-						response_type: "ephemeral",
-						text:
-							command === "/unknown"
-								? "unknown command"
-								: engaged
-									? command === "/restart"
-										? "🦞 restarting the gateway"
-										: command === "/model"
-											? "🦞 model command accepted"
-											: "🦞 session reset"
-									: "not authorized for session commands here",
-					},
+				expect(f.api.ephemerals.at(-1)).toEqual([
+					"D1",
+					"U1",
+					command === "/unknown"
+						? "unknown command"
+						: engaged
+							? command === "/restart"
+								? "🦞 restarting the gateway"
+								: command === "/model"
+									? "🦞 model command accepted"
+									: "🦞 session reset"
+							: "not authorized for session commands here",
 				]);
 			}
 			expect(f.client.requests).toEqual(
@@ -816,10 +818,7 @@ test("Slack suffixed per-app slash commands normalize onto the canonical verb", 
 			});
 			const request = f.client.requests.at(-1);
 			expect((request?.params as { text: string }).text).toBe(canonical);
-			expect(f.api.responses.at(-1)).toEqual([
-				"https://hooks.slack.test/response",
-				{ response_type: "ephemeral", text: ack },
-			]);
+			expect(f.api.ephemerals.at(-1)).toEqual(["C1", "U1", ack]);
 		}
 		// Near-miss names stay unknown: a bare suffix, an unregistered verb, or an
 		// over-long tail must not reach the gateway.
@@ -833,10 +832,7 @@ test("Slack suffixed per-app slash commands normalize onto the canonical verb", 
 				trigger_id: bad,
 				response_url: "https://hooks.slack.test/response",
 			});
-			expect(f.api.responses.at(-1)).toEqual([
-				"https://hooks.slack.test/response",
-				{ response_type: "ephemeral", text: "unknown command" },
-			]);
+			expect(f.api.ephemerals.at(-1)).toEqual(["C1", "U1", "unknown command"]);
 		}
 		expect(f.client.requests).toHaveLength(4);
 	} finally {

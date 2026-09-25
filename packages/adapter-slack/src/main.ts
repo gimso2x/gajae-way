@@ -832,8 +832,21 @@ export async function startSlackAdapter(
 			// Suffixed per-app commands (`/new-pm` on the PM app) normalize onto the
 			// canonical verb; see canonicalSlashCommand for why the suffix exists.
 			const canonical = canonicalSlashCommand(command.command);
+			// Receipts post as the bot user so they carry the bot's real avatar; the
+			// response_url surface renders the app-icon identity, whose placeholder
+			// made the owner read an ack as coming from a deleted bot.
+			const ackEphemeral = async (text: string) => {
+				try {
+					await api.postEphemeral(command.channel_id, command.user_id, text);
+				} catch (ackError) {
+					log.error(
+						`Slack ephemeral ack failed (${ackError instanceof Error ? ackError.message : String(ackError)}); falling back to response_url`,
+					);
+					await api.respond(command.response_url, { response_type: "ephemeral", text });
+				}
+			};
 			if (!canonical) {
-				await api.respond(command.response_url, { response_type: "ephemeral", text: "unknown command" });
+				await ackEphemeral("unknown command");
 				return;
 			}
 			const origin = slackMessageOrigin({ channel: command.channel_id, user: command.user_id });
@@ -850,10 +863,7 @@ export async function startSlackAdapter(
 			});
 			// Honest ack: the gateway owns command authorization, not the adapter, and
 			// "we could not ask" is a different answer from "it said no".
-			await api.respond(command.response_url, {
-				response_type: "ephemeral",
-				text: slashCommandAck(canonical, sent),
-			});
+			await ackEphemeral(slashCommandAck(canonical, sent));
 		} catch (error) {
 			log.error(`Slack slash command failed: ${errorText(error)}`);
 		}

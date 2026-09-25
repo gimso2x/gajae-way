@@ -338,6 +338,16 @@ export class SlackWebApi {
 		return this.call("apps.connections.open", {}, appToken);
 	}
 
+	/**
+	 * Slash-command receipts post as the bot user so they render with the bot's
+	 * real avatar; the response_url surface renders under the app-icon identity,
+	 * which shows Slack's generic placeholder unless an app icon is configured.
+	 */
+	async postEphemeral(channel: string, user: string, text: string): Promise<void> {
+		await this.limiter?.acquire(channel, "cosmetic");
+		await this.call("chat.postEphemeral", { channel, user, text });
+	}
+
 	respond(responseUrl: string, payload: Record<string, unknown>): Promise<void> {
 		if (!responseUrl.startsWith("https://"))
 			return Promise.reject(new SlackApiError(0, "invalid_response", "Slack response URL must use HTTPS"));
