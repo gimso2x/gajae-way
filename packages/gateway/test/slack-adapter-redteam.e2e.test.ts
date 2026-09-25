@@ -193,6 +193,18 @@ test("RT-SLACK-34 plain channel reply threads under the triggering message; an e
 	expect(explicit.posts).toEqual([["C1", "elsewhere", "9.0"]]);
 });
 
+test("RT-SLACK-35 a garbled or foreign [REPLY:] target falls back to the trigger thread instead of losing the answer", async () => {
+	// Live 2026-09-25: the persona copied `C0C4C4HKW6ZMF:\u2026` for `C0C4HKW6ZMF:\u2026`;
+	// the adapter refused the foreign channel five times and the answer expired.
+	for (const target of ["C1C1:9.0", "C2:9.0", "not-a-slack-id"]) {
+		const f = await fixture({ "slack:C1": { engagement: "mention-open" } }, `[REPLY:${target}] still delivered`);
+		await f.adapter.requestInbound("C1:4.0", origin, "plain", engagement);
+		await settle();
+		expect(f.posts).toEqual([["C1", "still delivered", "4.0"]]);
+		expect(f.database.deliveryRows().every((row) => row.state === "confirmed")).toBe(true);
+	}
+});
+
 test("RT-SLACK-33 discord stale lock has exactly one winner under 20 concurrent reclaims", async () => {
 	const lockHome = await mkdtemp(join(tmpdir(), "slack-discord-lock-redteam-"));
 	try {

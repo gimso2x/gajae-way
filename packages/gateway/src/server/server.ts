@@ -1886,7 +1886,7 @@ async function createInboundTurnLifecycle(
 				.replace(/\s*\[BREAK\]\s*/g, " ")
 				.trim();
 			if (!body) continue;
-			const replyTo = replyMatch?.[1] || inboundThreadRoot;
+			const replyTo = slackReplyTargetInChannel(origin, replyMatch?.[1]) ?? inboundThreadRoot;
 			planned.push({ body, ...(replyTo ? { replyTo } : {}) });
 		}
 		const spoken = spokenReply(
@@ -2331,9 +2331,24 @@ export function currentConversationNotice(origin: OriginRef): string {
 			: []),
 	].join("\n");
 }
-/** A Slack platform message id is `channel:ts`; synthetic trigger ids (`slash-…`, `edit:…`) never thread. */
+/** A Slack platform message id is `channel:ts`; synthetic trigger ids (`slash-\u2026`, `edit:\u2026`) never thread. */
 function isSlackMessageId(value: string): boolean {
 	return /^[A-Z][A-Z0-9]+:\d+\.\d+$/.test(value);
+}
+
+/**
+ * The persona's explicit `[REPLY:<id>]` target, or undefined when it cannot be
+ * delivered here. The model copies ids from message headers and sometimes
+ * garbles them (`C0C4C4HKW6ZMF:\u2026` for `C0C4HKW6ZMF:\u2026`, live 2026-09-25): the
+ * Slack adapter correctly refuses a reply into a foreign channel, the delivery
+ * retries until it expires, and the whole answer is lost. On Slack a target
+ * that is not a `channel:ts` id in this conversation's channel therefore falls
+ * back to the default thread root instead of poisoning the delivery.
+ */
+function slackReplyTargetInChannel(origin: OriginRef, target: string | undefined): string | undefined {
+	if (!target || origin.platform !== "slack") return target;
+	const channel = origin.kind === "thread" ? (origin.parentId ?? origin.conversationId) : origin.conversationId;
+	return isSlackMessageId(target) && target.startsWith(`${channel}:`) ? target : undefined;
 }
 
 function diagnostic(error: unknown): string {
