@@ -792,6 +792,58 @@ test("Slack slash arguments reach the gateway as one command line", async () => 
 	}
 });
 
+test("Slack suffixed per-app slash commands normalize onto the canonical verb", async () => {
+	const f = await fixture();
+	try {
+		// The BotFactory deployment suffixes each app's commands (/new-pm, /new-pa,
+		// /new-dev) because Slack same-named commands collide; this app only ever
+		// receives its own, so the suffix must not leak into the gateway line.
+		for (const [suffixed, canonical, ack] of [
+			["/new-pm", "/new", "🦞 session reset"],
+			["/reset-pa", "/reset", "🦞 session reset"],
+			["/model-dev", "/model", "🦞 model command accepted"],
+			["/new", "/new", "🦞 session reset"],
+		] as const) {
+			f.client.engaged = true;
+			await f.handleSlashCommand({
+				command: suffixed,
+				text: "",
+				user_id: "U1",
+				user_name: "alice",
+				channel_id: "C1",
+				trigger_id: suffixed,
+				response_url: "https://hooks.slack.test/response",
+			});
+			const request = f.client.requests.at(-1);
+			expect((request?.params as { text: string }).text).toBe(canonical);
+			expect(f.api.responses.at(-1)).toEqual([
+				"https://hooks.slack.test/response",
+				{ response_type: "ephemeral", text: ack },
+			]);
+		}
+		// Near-miss names stay unknown: a bare suffix, an unregistered verb, or an
+		// over-long tail must not reach the gateway.
+		for (const bad of ["/new-", "/unknown-pm", "/new-pm-extra", "/modelish"]) {
+			await f.handleSlashCommand({
+				command: bad,
+				text: "",
+				user_id: "U1",
+				user_name: "alice",
+				channel_id: "C1",
+				trigger_id: bad,
+				response_url: "https://hooks.slack.test/response",
+			});
+			expect(f.api.responses.at(-1)).toEqual([
+				"https://hooks.slack.test/response",
+				{ response_type: "ephemeral", text: "unknown command" },
+			]);
+		}
+		expect(f.client.requests).toHaveLength(4);
+	} finally {
+		f.socket.stop();
+	}
+});
+
 test("Slack startup awaits Socket Mode start and slow name lookup cannot reorder a conversation", async () => {
 	const api = new Api();
 	let releaseUser!: () => void;

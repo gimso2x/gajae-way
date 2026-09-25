@@ -829,7 +829,10 @@ export async function startSlackAdapter(
 	};
 	const handleSlashCommand = async (command: SlackSlashCommand): Promise<void> => {
 		try {
-			if (!SLASH_COMMANDS.has(command.command)) {
+			// Suffixed per-app commands (`/new-pm` on the PM app) normalize onto the
+			// canonical verb; see canonicalSlashCommand for why the suffix exists.
+			const canonical = canonicalSlashCommand(command.command);
+			if (!canonical) {
 				await api.respond(command.response_url, { response_type: "ephemeral", text: "unknown command" });
 				return;
 			}
@@ -838,7 +841,7 @@ export async function startSlackAdapter(
 			// line. Dropping the argument silently turned `/model <id>` into a bare
 			// `/model` read, so a rebind looked like it was accepted and changed nothing.
 			const argument = (command.text ?? "").trim();
-			const commandLine = argument ? `${command.command} ${argument}` : command.command;
+			const commandLine = argument ? `${canonical} ${argument}` : canonical;
 			const sent = await gateway.requestRecovered(`slash-${command.trigger_id}`, origin, commandLine, {
 				mentioned: true,
 				group: origin.kind !== "dm",
@@ -849,7 +852,7 @@ export async function startSlackAdapter(
 			// "we could not ask" is a different answer from "it said no".
 			await api.respond(command.response_url, {
 				response_type: "ephemeral",
-				text: slashCommandAck(command.command, sent),
+				text: slashCommandAck(canonical, sent),
 			});
 		} catch (error) {
 			log.error(`Slack slash command failed: ${errorText(error)}`);
@@ -1173,6 +1176,23 @@ export const SLACK_USAGE = [
 export const USAGE_EXIT_CODE = 2;
 /** Every command the gateway implements as a chat command; anything else is refused here. */
 const SLASH_COMMANDS: ReadonlySet<string> = new Set(["/new", "/reset", "/restart", "/model"]);
+/**
+ * Slack slash commands are not namespaced: same-named commands across apps
+ * collide and only the most recently installed app's command is invocable
+ * (docs.slack.dev/interactivity/implementing-slash-commands). A multi-bot
+ * deployment therefore suffixes each app's commands (`/new-pm`, `/new-pa`,
+ * `/new-dev`, …). Slack delivers a command only to the app that owns it, so by
+ * the time it reaches this adapter the suffix is transport noise — strip it
+ * back to the canonical verb the gateway parses.
+ */
+const SLASH_COMMAND_PATTERN = new RegExp(
+	`^\\/(${[...SLASH_COMMANDS].map((verb) => verb.slice(1)).join("|")})(?:-[a-z0-9]+)?$`,
+);
+
+export function canonicalSlashCommand(command: string): string | undefined {
+	const match = SLASH_COMMAND_PATTERN.exec(command);
+	return match ? `/${match[1]}` : undefined;
+}
 /** A clean recovery pass younger than this is not repeated for a short blip. */
 export const RECOVERY_RECENT_PASS_MS = 60_000;
 /** An outage at least this long always earns a fresh recovery pass. */
