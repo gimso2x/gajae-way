@@ -2270,7 +2270,7 @@ function reportDeliveryExpired(
 	const ownerTarget = runtime.config.ownerTarget?.origin;
 	if (!ownerTarget) return;
 	const noticeId = deterministicDeliveryExpiredNoticeId(expired.deliveryId);
-	const notice = `[delivery lost] ${sanitizeDiagnostic(expired.originKey).slice(0, 160)} 응답 전달이 ${attempts}회 실패해 만료됐습니다. 재전송: gajaeway ops redeliver ${deliveryId}`;
+	const notice = `[delivery lost] ${sanitizeDiagnostic(expired.originKey).slice(0, 160)} 응답 전달이 ${attempts}회 실패해 만료됐습니다 (사유: ${safeDiagnosticField(reason)}). 재전송: gajaeway ops redeliver ${deliveryId}`;
 	const payload = runtime.delivery.prepare(noticeId, ownerTarget, notice, undefined, noticeId);
 	if (payload) broadcastDelivery(runtime, payload);
 }

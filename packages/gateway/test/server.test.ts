@@ -290,6 +290,7 @@ test("expiry logs and notifies the owner once, while status exposes metadata wit
 		);
 		expect(notice?.payload).toMatchObject({ origin: ownerTarget.origin });
 		expect(notice.payload.text).toContain(`gajaeway ops redeliver ${deliveryId}`);
+		expect(notice.payload.text).toContain(`사유: adapter_failure`);
 		const logLine = logs.find((line) => line.startsWith(`delivery_expired deliveryId=${deliveryId}`));
 		expect(logLine).toContain("origin=discord/dm/delivery-test/peer=owner attempts=5 reason=adapter_failure");
 		expect(logLine).not.toContain("the single reply body");
