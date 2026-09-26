@@ -72,6 +72,50 @@ describe("/model show", () => {
 	});
 });
 
+describe("/model list", () => {
+	const catalog = {
+		source: "gjc models.db",
+		includesPresets: false,
+		models: [
+			{ selector: "openai/gpt-5.2", label: "GPT-5.2" },
+			{ selector: "zai/glm-5.3", label: "GLM-5.3" },
+		],
+	};
+
+	test("returns the catalog from the configured source and states preset coverage", () => {
+		const s = store({ preset: "base" });
+		const out = applyModelCommand("/model list", "k", CHANNEL, s, undefined, undefined, catalog);
+		expect(s.writes).toHaveLength(0);
+		expect(out.rebind).toBeUndefined();
+		expect(out.text).toContain("2 from gjc models.db");
+		expect(out.text).toContain("presets excluded");
+		expect(out.text).toContain("openai/gpt-5.2");
+		expect(out.text).toContain("zai/glm-5.3");
+		expect(out.text).toContain("preset base");
+	});
+
+	test("without a catalog it reports unavailability instead of a hardcoded list", () => {
+		const s = store();
+		const out = applyModelCommand("/model list", "k", CHANNEL, s, undefined);
+		expect(s.current).toBeUndefined();
+		expect(out.rebind).toBeUndefined();
+		expect(out.text).toContain("unavailable");
+	});
+
+	test("a catalog error names the reason and keeps the current model", () => {
+		const out = applyModelCommand("/model list", "k", CHANNEL, store(), undefined, undefined, {
+			error: "models.db missing",
+		});
+		expect(out.text).toContain("models.db missing");
+	});
+
+	test("`list` is never read as a preset selection", () => {
+		const s = store();
+		applyModelCommand("/model list", "k", CHANNEL, s, undefined);
+		expect(s.current).toBeUndefined();
+	});
+});
+
 describe("/model set", () => {
 	test("stores the selection and returns a same-session rebind intent", () => {
 		const s = store();

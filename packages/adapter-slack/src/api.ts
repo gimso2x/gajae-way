@@ -393,9 +393,9 @@ export class SlackWebApi {
 	 * real avatar; the response_url surface renders under the app-icon identity,
 	 * which shows Slack's generic placeholder unless an app icon is configured.
 	 */
-	async postEphemeral(channel: string, user: string, text: string): Promise<void> {
+	async postEphemeral(channel: string, user: string, text: string, blocks?: readonly unknown[]): Promise<void> {
 		await this.limiter?.acquire(channel, "cosmetic");
-		await this.call("chat.postEphemeral", { channel, user, text });
+		await this.call("chat.postEphemeral", { channel, user, text, ...(blocks ? { blocks } : {}) });
 	}
 
 	respond(responseUrl: string, payload: Record<string, unknown>): Promise<void> {

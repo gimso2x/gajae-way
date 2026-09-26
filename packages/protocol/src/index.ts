@@ -4,6 +4,8 @@ export {
 	type ChatDeliverParams,
 	type ChatDeliverResult,
 	type ChatMessagePayload,
+	type ChatModelList,
+	type ChatModelListEntry,
 	type ChatProgressActivity,
 	type ChatProgressPayload,
 	type ChatReactParams,

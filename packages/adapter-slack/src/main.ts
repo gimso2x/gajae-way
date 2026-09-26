@@ -3,6 +3,7 @@ import { installStructuredLogging } from "@gajae-gateway/log";
 import type {
 	ChannelEngagementPolicy,
 	ChatMessagePayload,
+	ChatModelList,
 	ChatProgressPayload,
 	EngagementContext,
 	OriginRef,
@@ -50,7 +51,12 @@ import {
 	rememberParticipatedThread,
 	saveRecoveryCursors,
 } from "./recovery";
-import { type SlackSlashCommand, SlackSocketMode, type SocketModeOptions } from "./socket";
+import {
+	type SlackInteractivePayload,
+	type SlackSlashCommand,
+	SlackSocketMode,
+	type SocketModeOptions,
+} from "./socket";
 import { isPresenceReaction, WorkingStatus } from "./status";
 import { mentionedUserIds, normalizeSlackText } from "./text";
 
@@ -59,6 +65,11 @@ export interface GatewayClientLike {
 	onChatMessage(handler: (message: ChatMessagePayload) => void): () => void;
 	onChatProgress?(handler: (progress: ChatProgressPayload) => void): () => void;
 	close?(): Promise<void>;
+	/**
+	 * When set, returns true for a delivery the adapter answered itself and that
+	 * must be settled without posting; the caller confirms or fails it.
+	 */
+	deliveryIntercept?(message: ChatMessagePayload): boolean;
 }
 
 export interface SlackInboundMessage extends SlackMessageOriginShape, SlackFileCarrier {
@@ -320,8 +331,12 @@ export async function settleSlackDelivery(
 	status?: Pick<WorkingStatus, "clear" | "reassert">,
 	mentions?: MentionDirectory,
 	live?: LiveReplyTracker,
+	intercept?: (message: ChatMessagePayload) => boolean,
 ): Promise<void> {
 	if (message.origin.platform !== "slack" || !message.deliveryId) return;
+	// The model picker answers its own turn ephemerally; the matching channel
+	// delivery would be redundant noise and is settled without posting.
+	if (intercept?.(message)) return;
 	if (message.reaction) {
 		try {
 			await settleSlackReaction(gateway, api, message);
@@ -459,9 +474,10 @@ export function subscribeSlackDeliveries(
 	status?: Pick<WorkingStatus, "clear" | "reassert">,
 	mentions?: MentionDirectory,
 	live?: LiveReplyTracker,
+	intercept?: (message: ChatMessagePayload) => boolean,
 ): () => void {
 	return gateway.onChatMessage((message) => {
-		void settleSlackDelivery(gateway, api, message, log, status, mentions, live).catch((error) =>
+		void settleSlackDelivery(gateway, api, message, log, status, mentions, live, intercept).catch((error) =>
 			log.error(`Slack delivery settlement request failed: ${errorText(error)}`),
 		);
 	});
@@ -522,6 +538,8 @@ export class ReconnectingGateway implements GatewayClientLike {
 	/** Runs when the link is lost, so the outage length can gate the next recovery pass. */
 	onDisconnected: (() => void) | undefined;
 
+	/** Set by the adapter: answers a model-picker turn ephemerally and settles its channel delivery silently. */
+	deliveryIntercept?: (message: ChatMessagePayload) => boolean;
 	constructor(
 		readonly socketPath: string,
 		readonly api: DeliveryApi,
@@ -548,7 +566,15 @@ export class ReconnectingGateway implements GatewayClientLike {
 		this.#client = client;
 		this.#attempt = 0;
 		this.#deliveryOff?.();
-		const off = subscribeSlackDeliveries(client, this.api, console, this.status, this.mentions, this.live);
+		const off = subscribeSlackDeliveries(
+			client,
+			this.api,
+			console,
+			this.status,
+			this.mentions,
+			this.live,
+			this.deliveryIntercept,
+		);
 		const progressOff =
 			this.status || this.live ? subscribeSlackProgress(client, this.status, console, this.live) : undefined;
 		const handlersOff = client.onChatMessage((message) => {
@@ -625,7 +651,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		text: string,
 		engagement: EngagementContext,
 		receivedAt?: string,
-	): Promise<{ engaged?: boolean } | undefined> {
+	): Promise<GatewaySendResult | undefined> {
 		const sent = await this.requestRecovered(messageId, origin, text, engagement, receivedAt);
 		return sent.verdict === "acked" ? sent.result : undefined;
 	}
@@ -655,7 +681,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 		if (this.#inbound.has(messageId)) return { verdict: "duplicate" };
 		const attempt = (async (): Promise<RecoveredSend> => {
 			try {
-				const result = await this.request<{ engaged?: boolean } | undefined>("chat.send", {
+				const result = await this.request<GatewaySendResult | undefined>("chat.send", {
 					origin,
 					text,
 					messageId,
@@ -814,6 +840,7 @@ export async function startSlackAdapter(
 	readonly ingress: OrderedIngress;
 	readonly handleEvent: (event: Record<string, unknown>) => Promise<void>;
 	readonly handleSlashCommand: (command: SlackSlashCommand) => Promise<void>;
+	readonly handleInteractive: (payload: SlackInteractivePayload) => Promise<void>;
 	/** One bounded catch-up pass over configured channels and known DMs; true when it finished cleanly. */
 	readonly recoverMissedMessages: () => Promise<boolean>;
 	/** Resets quarantine strike counts so the next pass probes unreadable channels again. */
@@ -848,6 +875,50 @@ export async function startSlackAdapter(
 	);
 	const ingress = new OrderedIngress();
 	const now = ports.now ?? Date.now;
+
+	// The model picker turns a /model list request into an ephemeral selection UI.
+	// The gateway still delivers that turn's text as a channel message; requests
+	// armed here have their delivery confirmed without posting because the picker
+	// already showed the same answer. Arming uses the OUTGOING message id, which
+	// the gateway stamps onto the delivery: the response and the delivery can
+	// arrive in one socket read, so a correlation learned from the response would
+	// race the delivery handler. Only exact picker turns match — never ordinary
+	// deliveries.
+	//
+	// An arm survives until its delivery is CONFIRMED or the TTL passes: a failed
+	// delivery.confirm makes the ledger redeliver the same payload (still stamped
+	// with the source id), and disarming on first sight would post the catalog
+	// text the ephemeral picker already showed. The one window this cannot cover
+	// is an adapter crash before the confirm lands: after a restart the arm is
+	// gone, the redelivery posts once under the ordinary duplicate label, and the
+	// user re-runs /model if they still want the picker.
+	const modelPickerArmed = new Map<string, number>();
+	const armModelPickerDelivery = (messageId: string): void => {
+		const nowMs = now();
+		for (const [key, armedAt] of modelPickerArmed)
+			if (nowMs - armedAt >= MODEL_PICKER_ARM_TTL_MS) modelPickerArmed.delete(key);
+		while (modelPickerArmed.size >= MODEL_PICKER_ARM_LIMIT) {
+			const oldest = [...modelPickerArmed.entries()].sort((a, b) => a[1] - b[1])[0];
+			if (!oldest) break;
+			modelPickerArmed.delete(oldest[0]);
+		}
+		modelPickerArmed.set(messageId, nowMs);
+	};
+	gateway.deliveryIntercept = (message) => {
+		const armedAt = message.sourceMessageId !== undefined ? modelPickerArmed.get(message.sourceMessageId) : undefined;
+		if (armedAt === undefined || now() - armedAt >= MODEL_PICKER_ARM_TTL_MS) return false;
+		if (message.deliveryId)
+			void gateway
+				.request("delivery.confirm", { deliveryId: message.deliveryId })
+				.then(() => {
+					// Confirm success is what disarms: until then the arm keeps
+					// suppressing the ledger's retries of the same delivery.
+					if (modelPickerArmed.get(message.sourceMessageId as string) === armedAt)
+						modelPickerArmed.delete(message.sourceMessageId as string);
+				})
+				.catch((error: unknown) => log.error(`Slack model picker delivery confirm failed: ${errorText(error)}`));
+		return true;
+	};
 	const cursorPath = ports.recoveryCursorPath ?? recoveryCursorPath();
 	let cursors: RecoveryCursorState | undefined;
 	// Single-flight load: two first-contact DMs arriving together must not each
@@ -958,14 +1029,17 @@ export async function startSlackAdapter(
 			// Receipts post as the bot user so they carry the bot's real avatar; the
 			// response_url surface renders the app-icon identity, whose placeholder
 			// made the owner read an ack as coming from a deleted bot.
-			const ackEphemeral = async (text: string) => {
+			const ackEphemeral = async (text: string, blocks?: readonly Record<string, unknown>[]) => {
 				try {
-					await api.postEphemeral(command.channel_id, command.user_id, text);
+					await api.postEphemeral(command.channel_id, command.user_id, text, blocks);
 				} catch (ackError) {
 					log.error(
 						`Slack ephemeral ack failed (${ackError instanceof Error ? ackError.message : String(ackError)}); falling back to response_url`,
 					);
-					await api.respond(command.response_url, { response_type: "ephemeral", text });
+					await api.respond(
+						command.response_url,
+						blocks ? { response_type: "ephemeral", text, blocks } : { response_type: "ephemeral", text },
+					);
 				}
 			};
 			if (!canonical) {
@@ -977,18 +1051,85 @@ export async function startSlackAdapter(
 			// line. Dropping the argument silently turned `/model <id>` into a bare
 			// `/model` read, so a rebind looked like it was accepted and changed nothing.
 			const argument = (command.text ?? "").trim();
-			const commandLine = argument ? `${canonical} ${argument}` : canonical;
+			// A bare model command is the picker entry point: the gateway's structured
+			// catalog answers with a selection UI instead of making the owner type a name.
+			const wantsPicker = canonical === "/model" && argument === "";
+			const commandLine = argument ? `${canonical} ${argument}` : wantsPicker ? "/model list" : canonical;
+			// Armed before the send: the gateway stamps the outgoing message id onto
+			// its channel delivery, so the ephemeral picker and the duplicate text
+			// delivery are correlated without racing the response frame.
+			if (wantsPicker) armModelPickerDelivery(`slash-${command.trigger_id}`);
 			const sent = await gateway.requestRecovered(`slash-${command.trigger_id}`, origin, commandLine, {
 				mentioned: true,
 				group: origin.kind !== "dm",
 				authorId: command.user_id,
 				...(command.user_name ? { authorHandle: command.user_name } : {}),
 			});
+			const picker = wantsPicker && sent.verdict === "acked" ? sent.result?.modelList : undefined;
+			if (picker) {
+				// The picker already shows this turn's answer; the matching channel
+				// delivery of the same text is settled without posting.
+				await ackEphemeral(modelPickerSummary(picker), modelPickerBlocks(picker, command.user_id));
+				return;
+			}
 			// Honest ack: the gateway owns command authorization, not the adapter, and
 			// "we could not ask" is a different answer from "it said no".
 			await ackEphemeral(slashCommandAck(canonical, sent));
 		} catch (error) {
 			log.error(`Slack slash command failed: ${errorText(error)}`);
+		}
+	};
+	const handleInteractive = async (payload: SlackInteractivePayload): Promise<void> => {
+		try {
+			if (payload.type !== "block_actions") return;
+			const action = (payload.actions ?? []).find((candidate) =>
+				candidate.action_id?.startsWith(MODEL_PICK_ACTION_PREFIX),
+			);
+			if (!action) return; // Not a control this adapter issued; other blocks stay ignored.
+			const responseUrl = payload.response_url;
+			const userId = payload.user?.id;
+			const channelId = payload.channel?.id;
+			if (!responseUrl || !userId || !channelId) return; // Unattributable or unanswerable: refuse by silence.
+			const answer = async (text: string): Promise<void> => {
+				await api.respond(responseUrl, { replace_original: true, response_type: "ephemeral", text });
+			};
+			// The picker is ephemeral, but a forged or replayed payload can carry any
+			// user: the action id names the requester and only they may act on it.
+			const requesterId = (action.action_id ?? "").slice(MODEL_PICK_ACTION_PREFIX.length);
+			if (userId !== requesterId) {
+				await answer("only the person who opened this picker can change its model");
+				return;
+			}
+			const selection = action.selected_option?.value ?? "";
+			const origin = slackMessageOrigin({ channel: channelId, user: userId });
+			const engagement = { mentioned: true, group: origin.kind !== "dm", authorId: userId };
+			// Per-interaction message ids: a reusable id could correlate a later,
+			// unrelated delivery with a stale arm.
+			const refreshMessageId = `interaction-${payload.trigger_id ?? crypto.randomUUID()}-list`;
+			const setMessageId = `interaction-${payload.trigger_id ?? crypto.randomUUID()}-set`;
+			// Membership is judged against the catalog as the gateway sees it now, so a
+			// forged or stale value can never reach `/model set`. The refresh is armed
+			// before the send so its catalog-text delivery is settled without posting;
+			// the picker is the only place that text belongs.
+			armModelPickerDelivery(refreshMessageId);
+			const refreshed = await gateway.requestRecovered(refreshMessageId, origin, "/model list", engagement);
+			const catalog = refreshed.verdict === "acked" ? refreshed.result?.modelList : undefined;
+			if (!catalog?.models.some((entry) => entry.selector === selection)) {
+				await answer(`\`${selection}\` is not in the current model list; nothing changed`);
+				return;
+			}
+			// The set flows through the same gateway path as a typed `/model set`, so the
+			// engaged/authorized decision (and its refusal) is the gateway's, not ours.
+			// `applied` is the gateway's own receipt that a rebind really happened —
+			// engaged alone can accompany an informational answer.
+			const sent = await gateway.requestRecovered(setMessageId, origin, `/model set ${selection}`, engagement);
+			await answer(
+				sent.verdict === "acked" && sent.result?.engaged === true && sent.result.applied === true
+					? `🦞 model set to \`${selection}\`. It applies from the next turn on this conversation.`
+					: "not authorized for session commands here; nothing changed",
+			);
+		} catch (error) {
+			log.error(`Slack interactive handling failed: ${errorText(error)}`);
 		}
 	};
 	/**
@@ -1265,6 +1406,7 @@ export async function startSlackAdapter(
 		{
 			onEvent: handleEvent,
 			onSlashCommand: handleSlashCommand,
+			onInteractive: handleInteractive,
 			onConnected: () => {
 				log.log("Slack adapter connected.");
 				reconnected("socket");
@@ -1286,6 +1428,7 @@ export async function startSlackAdapter(
 		ingress,
 		handleEvent,
 		handleSlashCommand,
+		handleInteractive,
 		recoverMissedMessages,
 		reprobeQuarantined,
 		recovery,
@@ -1326,6 +1469,68 @@ export function canonicalSlashCommand(command: string): string | undefined {
 	const match = SLASH_COMMAND_PATTERN.exec(command);
 	return match ? `/${match[1]}` : undefined;
 }
+/** Prefix of the block action the model picker issues; the requester id rides in the action id. */
+const MODEL_PICK_ACTION_PREFIX = "model-pick:";
+/** Slack hard-caps a static_select at 100 options; the picker shows the sorted prefix. */
+const SLACK_MODEL_PICK_MAX_OPTIONS = 100;
+const SLACK_OPTION_TEXT_MAX = 75;
+const SLACK_OPTION_VALUE_MAX = 150;
+
+/** How long an armed picker correlation waits for its channel delivery before expiring. */
+const MODEL_PICKER_ARM_TTL_MS = 5 * 60_000;
+/** Bound on concurrently armed picker correlations; the oldest is evicted first. */
+const MODEL_PICKER_ARM_LIMIT = 16;
+
+/** The one-line summary above the picker: effective model, source, and the bound applied. */
+export function modelPickerSummary(list: ChatModelList): string {
+	const lines = [
+		`🦞 model: *${list.current}*`,
+		`${list.models.length} selectable models from ${list.source}${
+			list.includesPresets ? "" : " (presets excluded — set one with `/model set preset:<name>`)"
+		}`,
+	];
+	const hidden = list.models.length - SLACK_MODEL_PICK_MAX_OPTIONS;
+	if (hidden > 0)
+		lines.push(`showing the first ${SLACK_MODEL_PICK_MAX_OPTIONS}; for the rest use \`/model set <provider/model>\``);
+	return lines.join("\n");
+}
+
+/**
+ * The ephemeral block layout of the picker: a summary section plus a
+ * static_select whose action id carries the requesting user, so a block_actions
+ * payload from anyone else is refused before it can reach the gateway.
+ */
+export function modelPickerBlocks(list: ChatModelList, requesterId: string): readonly Record<string, unknown>[] {
+	const options: Record<string, unknown>[] = [];
+	for (const entry of list.models) {
+		if (options.length >= SLACK_MODEL_PICK_MAX_OPTIONS) break;
+		if (entry.selector === "" || entry.selector.length > SLACK_OPTION_VALUE_MAX || /\s/.test(entry.selector)) continue;
+		// The fallback is capped too: Slack rejects an option text over 75 chars
+		// outright, and a long selector would make the whole picker unpostable.
+		const label =
+			entry.label.replace(/\s+/g, " ").trim().slice(0, SLACK_OPTION_TEXT_MAX) ||
+			entry.selector.slice(0, SLACK_OPTION_TEXT_MAX);
+		options.push({
+			text: { type: "plain_text", text: label, emoji: false },
+			value: entry.selector,
+		});
+	}
+	if (options.length === 0) return [{ type: "section", text: { type: "mrkdwn", text: modelPickerSummary(list) } }];
+	return [
+		{ type: "section", text: { type: "mrkdwn", text: modelPickerSummary(list) } },
+		{
+			type: "actions",
+			elements: [
+				{
+					type: "static_select",
+					action_id: `${MODEL_PICK_ACTION_PREFIX}${requesterId}`,
+					placeholder: { type: "plain_text", text: "pick a model", emoji: false },
+					options,
+				},
+			],
+		},
+	];
+}
 /** A clean recovery pass younger than this is not repeated for a short blip. */
 export const RECOVERY_RECENT_PASS_MS = 60_000;
 /** An outage at least this long always earns a fresh recovery pass. */
@@ -1347,10 +1552,21 @@ export function slashCommandAck(command: string, sent: Pick<RecoveredSend, "verd
 	return "🦞 session reset";
 }
 
+/** What a `chat.send` response carries; `/model` control commands add text and a model catalog. */
+export type GatewaySendResult = {
+	readonly engaged?: boolean;
+	readonly turnId?: string | null;
+	/** The synchronous answer of a `/model` control command (see the protocol catalog). */
+	readonly text?: string;
+	/** The gateway's own receipt that this control command mutated the conversation model. */
+	readonly applied?: boolean;
+	readonly modelList?: ChatModelList;
+};
+
 /** Outcome of one gateway send, classified for recovery; `failure` carries the raw error for classification. */
 export interface RecoveredSend {
 	readonly verdict: RecoveryDelivery;
-	readonly result?: { engaged?: boolean };
+	readonly result?: GatewaySendResult;
 	readonly failure?: unknown;
 }
 

@@ -247,6 +247,39 @@ export interface ChatSendResult {
 	 */
 	readonly turnId: string | null;
 	readonly engaged: boolean;
+	/**
+	 * The synchronous answer of a control command (`/model ...`), present only
+	 * on such commands. Ordinary turns deliver assistant text exclusively
+	 * through chat.message; interactive consumers may render this text in
+	 * place of the channel delivery for the same turn.
+	 */
+	readonly text?: string;
+	/** True when this control command actually mutated the conversation model (a `/model set`/`clear` rebind). */
+	readonly applied?: boolean;
+	/** Structured selectable-model catalog answering `/model list`. */
+	readonly modelList?: ChatModelList;
+}
+
+/** One selectable model in a `/model list` answer. */
+export interface ChatModelListEntry {
+	/** Explicit `provider/model` selector, exactly what `/model set <selector>` accepts. */
+	readonly selector: string;
+	/** Human model name from the gjc catalog; falls back to the selector when unnamed. */
+	readonly label: string;
+}
+
+/**
+ * The selectable-model catalog as read from the gateway's configured gjc
+ * source. `models` is the full list; user interfaces bound what they render.
+ */
+export interface ChatModelList {
+	/** Configured source the catalog was read from, cited so answers name their origin. */
+	readonly source: string;
+	/** Whether model-profile presets are part of `models`. */
+	readonly includesPresets: boolean;
+	/** The effective model of this conversation, rendered the way `/model` names it. */
+	readonly current: string;
+	readonly models: readonly ChatModelListEntry[];
 }
 
 /** Direct platform delivery, independent of an inbound turn. */
@@ -288,6 +321,15 @@ export interface ChatMessagePayload {
 	readonly direct?: boolean;
 	/** A local file the adapter must upload; text is its caption or an empty string. */
 	readonly file?: { readonly path: string; readonly caption?: string };
+	/**
+	 * The platform message id that triggered this delivery, stamped only on
+	 * synchronous control commands (`/model ...`). An interactive consumer that
+	 * answers such a command ephemerally correlates its armed request with the
+	 * channel delivery through this id — it is known before the send, so the
+	 * correlation never races the gateway writing response and delivery back
+	 * to back.
+	 */
+	readonly sourceMessageId?: string;
 	/** Platform message id this message replies to (reply-threading), when the persona chose one. */
 	readonly replyToMessageId?: string;
 	/** True when re-emitted from the ledger after a restart. */

@@ -284,3 +284,56 @@ test("Slack start is idempotent and can restart after stop", async () => {
 	expect(f.mode.connections).toBe(2);
 	f.mode.stop();
 });
+
+test("Slack block_actions envelopes are acked and dispatched to onInteractive", async () => {
+	const interactions: unknown[] = [];
+	const f = fixture({
+		onInteractive(payload) {
+			interactions.push(payload);
+		},
+	});
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as FakeSocket;
+		socket.message({ type: "hello" });
+		const payload = {
+			type: "block_actions",
+			user: { id: "U1" },
+			channel: { id: "C1" },
+			trigger_id: "t1",
+			response_url: "https://hooks.slack.com/r",
+			actions: [{ action_id: "model-pick:U1", selected_option: { value: "zai/glm-5.3" } }],
+		};
+		socket.message({ envelope_id: "i1", type: "interactive", payload });
+		await flush();
+		// The transport ack goes out first, before any application work.
+		expect(socket.sent.map((s) => JSON.parse(s))).toEqual([{ envelope_id: "i1" }]);
+		expect(interactions).toEqual([payload]);
+		// A retried interactive envelope is deduplicated like any other.
+		socket.message({ envelope_id: "i1", type: "interactive", payload, retry_attempt: 1 });
+		await flush();
+		expect(interactions).toHaveLength(1);
+	} finally {
+		f.mode.stop();
+	}
+});
+
+test("Slack interactive envelopes without a handler stay logged and ignored", async () => {
+	const f = fixture();
+	try {
+		await f.boot();
+		const socket = f.sockets[0] as FakeSocket;
+		socket.message({ type: "hello" });
+		const before = f.logs.length;
+		socket.message({
+			envelope_id: "i2",
+			type: "interactive",
+			payload: { type: "block_actions", actions: [{ action_id: "model-pick:U1" }] },
+		});
+		await flush();
+		expect(f.logs.slice(before)).toContainEqual([`Slack socket ignored envelope type interactive`]);
+		expect(socket.sent.map((s) => JSON.parse(s))).toEqual([{ envelope_id: "i2" }]);
+	} finally {
+		f.mode.stop();
+	}
+});

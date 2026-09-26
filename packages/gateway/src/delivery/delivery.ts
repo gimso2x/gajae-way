@@ -32,6 +32,7 @@ export function buildDeliveryPayload(
 	deliveryId: string,
 	replyToMessageId?: string,
 	final = true,
+	sourceMessageId?: string,
 ): ChatMessagePayload | undefined {
 	if (isSilentOutput(text)) return undefined;
 	originKey(origin);
@@ -43,6 +44,7 @@ export function buildDeliveryPayload(
 		final,
 		deliveryId,
 		...(replyToMessageId ? { replyToMessageId } : {}),
+		...(sourceMessageId ? { sourceMessageId } : {}),
 	};
 }
 
@@ -58,8 +60,9 @@ export class DeliveryService {
 		replyToMessageId?: string,
 		deliveryId: string = crypto.randomUUID(),
 		final = true,
+		sourceMessageId?: string,
 	): ChatMessagePayload | undefined {
-		const payload = buildDeliveryPayload(turnId, origin, text, deliveryId, replyToMessageId, final);
+		const payload = buildDeliveryPayload(turnId, origin, text, deliveryId, replyToMessageId, final, sourceMessageId);
 		if (!payload) return undefined;
 		if (
 			!this.#ledger.createPending({

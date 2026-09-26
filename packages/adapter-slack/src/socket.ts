@@ -25,6 +25,25 @@ export interface SlackSlashCommand {
 	readonly response_url: string;
 }
 
+/**
+ * One element inside a block_actions payload. Only the fields the model picker
+ * reads are typed; everything else stays opaque.
+ */
+export interface SlackInteractiveAction {
+	readonly action_id?: string;
+	readonly selected_option?: { readonly value?: string };
+}
+
+/** `interactive` envelope payload (block_actions and the types this adapter does not act on). */
+export interface SlackInteractivePayload {
+	readonly type: string;
+	readonly user?: { readonly id?: string };
+	readonly channel?: { readonly id?: string };
+	readonly trigger_id?: string;
+	readonly response_url?: string;
+	readonly actions?: readonly SlackInteractiveAction[];
+}
+
 export interface WebSocketLike {
 	send(data: string): void;
 	close(code?: number, reason?: string): void;
@@ -37,6 +56,8 @@ export interface WebSocketLike {
 export interface SocketModeHandlers {
 	onEvent(event: Record<string, unknown>, envelope: SlackEnvelope): void | Promise<void>;
 	onSlashCommand(command: SlackSlashCommand, envelope: SlackEnvelope): void | Promise<void>;
+	/** Block_actions and other interactive payloads; the envelope itself is always acked first. */
+	onInteractive?(payload: SlackInteractivePayload, envelope: SlackEnvelope): void | Promise<void>;
 	onConnected?(): void;
 	onDisconnected?(reason: string): void;
 }
@@ -232,6 +253,8 @@ export class SlackSocketMode {
 				await this.handlers.onEvent(payload.event, envelope);
 			} else if (frame.type === "slash_commands" && payload) {
 				await this.handlers.onSlashCommand(payload as unknown as SlackSlashCommand, envelope);
+			} else if (frame.type === "interactive" && isObject(payload) && this.handlers.onInteractive) {
+				await this.handlers.onInteractive(payload as unknown as SlackInteractivePayload, envelope);
 			} else {
 				this.log.log(`Slack socket ignored envelope type ${String(frame.type)}`);
 			}

@@ -9,6 +9,8 @@ import {
 	engagementForMessage,
 	type GatewayClientLike,
 	LruSet,
+	modelPickerBlocks,
+	modelPickerSummary,
 	monitorFailureDecision,
 	OrderedIngress,
 	ReconnectingGateway,
@@ -62,11 +64,23 @@ class Gateway implements GatewayClientLike {
 	readonly requests: { verb: string; params: unknown }[] = [];
 	readonly handlers = new Set<(message: ChatMessagePayload) => void>();
 	engaged = true;
+	/** Optional per-request extra payload fields (turnId, modelList, ...) keyed by the command text. */
+	resultFor?: (verb: string, params: { readonly text?: string }) => Record<string, unknown> | undefined;
 	failure?: Error;
+	/** When set, every request waits on it first — emulates a response that arrives after a coalesced event. */
+	holdRequest?: Promise<void>;
+	/** Delivery confirms still to fail, emulating a ledger redelivery of the same payload. */
+	confirmFailures = 0;
 	async request<T = unknown>(verb: string, params?: unknown): Promise<T> {
 		this.requests.push({ verb, params });
+		if (this.holdRequest) await this.holdRequest;
+		if (verb === "delivery.confirm" && this.confirmFailures > 0) {
+			this.confirmFailures -= 1;
+			throw new Error("delivery.confirm failed");
+		}
 		if (this.failure) throw this.failure;
-		return { engaged: this.engaged } as T;
+		const extra = this.resultFor?.(verb, (params ?? {}) as { readonly text?: string }) ?? {};
+		return { engaged: this.engaged, ...extra } as T;
 	}
 	onChatMessage(handler: (message: ChatMessagePayload) => void) {
 		this.handlers.add(handler);
@@ -123,8 +137,8 @@ class Api extends SlackWebApi {
 	override async conversationsReplies(_channel: string, _ts: string): Promise<SlackHistoryPage> {
 		return { messages: [], has_more: false };
 	}
-	override async postEphemeral(channel: string, user: string, text: string) {
-		this.ephemerals.push([channel, user, text]);
+	override async postEphemeral(channel: string, user: string, text: string, blocks?: readonly unknown[]) {
+		this.ephemerals.push(blocks ? [channel, user, text, blocks] : [channel, user, text]);
 		if (this.failure) throw this.failure;
 	}
 	override async respond(url: string, payload: Record<string, unknown>) {
@@ -872,7 +886,8 @@ for (const command of ["/new", "/reset", "/restart", "/model", "/unknown"])
 							params: {
 								messageId: `slash-${engaged}`,
 								origin: { platform: "slack", kind: "dm", conversationId: "D1", peerId: "U1" },
-								text: command,
+								// The bare model command requests the structured picker catalog.
+								text: command === "/model" ? "/model list" : command,
 								engagement: { mentioned: true, group: false, authorId: "U1", authorHandle: "alice" },
 							},
 						})),
@@ -895,13 +910,14 @@ test("Slack slash arguments reach the gateway as one command line", async () => 
 				trigger_id: trigger,
 				response_url: "https://hooks.slack.test/response",
 			});
-		// An argument must survive: a bare `/model` only READS the selection, so a
-		// dropped argument silently turns a rebind into a no-op that acks success.
+		// An argument must survive: a dropped argument silently turns a rebind into a
+		// no-op that acks success. A bare `/model` asks the gateway for the structured
+		// catalog so the adapter can serve the selection picker.
 		await send("  preset frontier-default  ", "with-argument");
 		await send("", "bare");
 		expect(f.client.requests.map((request) => (request.params as { text: string }).text)).toEqual([
 			"/model preset frontier-default",
-			"/model",
+			"/model list",
 		]);
 	} finally {
 		f.socket.stop();
@@ -917,7 +933,7 @@ test("Slack suffixed per-app slash commands normalize onto the canonical verb", 
 		for (const [suffixed, canonical, ack] of [
 			["/new-pm", "/new", "🦞 session reset"],
 			["/reset-pa", "/reset", "🦞 session reset"],
-			["/model-dev", "/model", "🦞 model command accepted"],
+			["/model-dev", "/model list", "🦞 model command accepted"],
 			["/new", "/new", "🦞 session reset"],
 		] as const) {
 			f.client.engaged = true;
@@ -949,6 +965,406 @@ test("Slack suffixed per-app slash commands normalize onto the canonical verb", 
 			expect(f.api.ephemerals.at(-1)).toEqual(["C1", "U1", "unknown command"]);
 		}
 		expect(f.client.requests).toHaveLength(4);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("a bare model slash serves an ephemeral picker and settles the duplicate text delivery", async () => {
+	const f = await fixture();
+	try {
+		const catalog = {
+			source: "gjc models.db",
+			includesPresets: false,
+			current: "preset base",
+			models: [
+				{ selector: "openai/gpt-5.2", label: "GPT-5.2" },
+				{ selector: "zai/glm-5.3", label: "GLM-5.3" },
+			],
+		};
+		f.client.resultFor = (_verb, params) =>
+			(params as { text?: string }).text === "/model list"
+				? { engaged: true, turnId: "turn-picker", modelList: catalog }
+				: { engaged: true };
+		await f.handleSlashCommand({
+			command: "/model-dev",
+			text: "",
+			user_id: "U1",
+			user_name: "alice",
+			channel_id: "C1",
+			trigger_id: "t1",
+			response_url: "https://hooks.slack.test/response",
+		});
+		expect((f.client.requests.at(-1)?.params as { text: string }).text).toBe("/model list");
+		const [channel, user, , blocks] = f.api.ephemerals.at(-1) as [string, string, string, Record<string, unknown>[]];
+		expect(channel).toBe("C1");
+		expect(user).toBe("U1");
+		expect(blocks).toHaveLength(2);
+		expect((blocks[0] as { type: string }).type).toBe("section");
+		const actions = blocks[1] as {
+			type: string;
+			elements: { type: string; action_id: string; options: { text: { text: string }; value: string }[] }[];
+		};
+		expect(actions.type).toBe("actions");
+		expect(actions.elements[0]?.type).toBe("static_select");
+		expect(actions.elements[0]?.action_id).toBe("model-pick:U1");
+		expect(actions.elements[0]?.options.map((option) => option.value)).toEqual(["openai/gpt-5.2", "zai/glm-5.3"]);
+		expect(
+			actions.elements[0]?.options.every((option) => option.text.text.length <= 75 && option.value.length <= 150),
+		).toBe(true);
+
+		// The gateway's own text delivery for the picker turn is settled without posting.
+		for (const handler of f.client.handlers)
+			handler({ ...delivery(), sourceMessageId: "slash-t1", deliveryId: "d-picker" });
+		await flush();
+		expect(f.api.posts).toHaveLength(0);
+		expect(f.client.requests.some((r) => r.verb === "delivery.confirm")).toBe(true);
+
+		// An ordinary delivery — no armed source id — is untouched.
+		for (const handler of f.client.handlers) handler({ ...delivery(), turnId: "normal", deliveryId: "d-normal" });
+		await flush();
+		expect(f.api.posts).toHaveLength(1);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("the picker suppresses its text delivery even when it arrives before the response resolves", async () => {
+	const f = await fixture();
+	try {
+		const catalog = {
+			source: "gjc models.db",
+			includesPresets: false,
+			current: "preset base",
+			models: [{ selector: "zai/glm-5.3", label: "GLM-5.3" }],
+		};
+		f.client.resultFor = (_verb, params) =>
+			(params as { text?: string }).text === "/model list"
+				? { engaged: true, turnId: "turn-picker", modelList: catalog }
+				: { engaged: true };
+		// One socket read can carry the response and the chat.message delivery back
+		// to back; the event handlers run before the awaiting slash handler resumes.
+		let release!: () => void;
+		f.client.holdRequest = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const picker = f.handleSlashCommand({
+			command: "/model",
+			text: "",
+			user_id: "U1",
+			user_name: "alice",
+			channel_id: "C1",
+			trigger_id: "t1",
+			response_url: "https://hooks.slack.test/response",
+		});
+		await flush();
+		for (const handler of f.client.handlers)
+			handler({ ...delivery(), sourceMessageId: "slash-t1", deliveryId: "d-coalesced" });
+		await flush();
+		release();
+		await picker;
+		await flush();
+		expect(f.api.posts).toHaveLength(0);
+		expect(f.api.ephemerals.at(-1)?.[0]).toBe("C1");
+		expect(f.client.requests.some((r) => r.verb === "delivery.confirm")).toBe(true);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("a failed delivery.confirm keeps the arm so the ledger redelivery stays suppressed", async () => {
+	const f = await fixture();
+	try {
+		const catalog = {
+			source: "gjc models.db",
+			includesPresets: false,
+			current: "preset base",
+			models: [{ selector: "zai/glm-5.3", label: "GLM-5.3" }],
+		};
+		f.client.resultFor = (_verb, params) =>
+			(params as { text?: string }).text === "/model list"
+				? { engaged: true, turnId: "turn-picker", modelList: catalog }
+				: { engaged: true };
+		f.client.confirmFailures = 1;
+		await f.handleSlashCommand({
+			command: "/model",
+			text: "",
+			user_id: "U1",
+			user_name: "alice",
+			channel_id: "C1",
+			trigger_id: "t1",
+			response_url: "https://hooks.slack.test/response",
+		});
+		// First delivery: intercepted, but the confirm fails.
+		for (const handler of f.client.handlers)
+			handler({ ...delivery(), sourceMessageId: "slash-t1", deliveryId: "d-first" });
+		await flush();
+		expect(f.api.posts).toHaveLength(0);
+		// The confirm failure scheduled a reconnect, as any gateway failure does;
+		// the redelivery arrives over the re-attached link.
+		f.gateway.adoptClient(f.client);
+		// The ledger redelivers the same stamped payload; the surviving arm
+		// suppresses it again and the retried confirm now succeeds.
+		for (const handler of f.client.handlers)
+			handler({
+				...delivery(),
+				sourceMessageId: "slash-t1",
+				deliveryId: "d-redelivered",
+				redelivered: true,
+				duplicateWarning: true,
+			});
+		await flush();
+		expect(f.api.posts).toHaveLength(0);
+		// The successful confirm disarmed the correlation: a later delivery with
+		// the same source id is ordinary traffic and posts.
+		for (const handler of f.client.handlers)
+			handler({ ...delivery(), sourceMessageId: "slash-t1", deliveryId: "d-later" });
+		await flush();
+		expect(f.api.posts).toHaveLength(1);
+		// The third confirm is the ordinary settlement of d-later.
+		const confirms = f.client.requests.filter((r) => r.verb === "delivery.confirm");
+		expect(confirms.map((r) => (r.params as { deliveryId: string }).deliveryId)).toEqual([
+			"d-first",
+			"d-redelivered",
+			"d-later",
+		]);
+	} finally {
+		f.socket.stop();
+	}
+});
+test("a picker never offers more options than Slack accepts", () => {
+	const models = Array.from({ length: 250 }, (_, index) => ({ selector: `prov/model-${index}`, label: `M${index}` }));
+	const blocks = modelPickerBlocks(
+		{ source: "gjc models.db", includesPresets: false, current: "preset base", models },
+		"U1",
+	);
+	const actions = blocks[1] as { elements: { options: { value: string }[] }[] };
+	expect(actions.elements[0]?.options).toHaveLength(100);
+	expect(
+		modelPickerSummary({ source: "gjc models.db", includesPresets: false, current: "preset base", models }),
+	).toContain("250 selectable models");
+	// A whitespace-only label falls back to the selector, and that fallback is
+	// also capped: Slack rejects any option text over 75 characters outright.
+	const fallbackBlocks = modelPickerBlocks(
+		{
+			source: "gjc models.db",
+			includesPresets: false,
+			current: "preset base",
+			models: [
+				{
+					selector: "openrouter/anthropic/a-very-long-model-identifier-without-a-name-0123456789-abcdef",
+					label: "   ",
+				},
+			],
+		},
+		"U1",
+	);
+	const fallbackSelect = fallbackBlocks[1] as {
+		elements: { options: { text: { text: string } }[] }[];
+	};
+	for (const option of fallbackSelect.elements[0]?.options ?? []) {
+		// 89-char selector: the cap, not the input length, decides the label size.
+		expect(option.text.text.length).toBe(75);
+	}
+	expect(
+		modelPickerSummary({ source: "gjc models.db", includesPresets: false, current: "preset base", models }),
+	).toContain("for the rest");
+});
+
+test("a block_actions selection rebinds through the same /model set gateway path and reports the result", async () => {
+	const f = await fixture();
+	try {
+		const catalog = {
+			source: "gjc models.db",
+			includesPresets: false,
+			current: "preset base",
+			models: [{ selector: "zai/glm-5.3", label: "GLM-5.3" }],
+		};
+		f.client.resultFor = (_verb, params) =>
+			((params as { text?: string }).text ?? "").startsWith("/model list")
+				? { engaged: true, turnId: "turn-refresh", modelList: catalog }
+				: { engaged: true, turnId: "turn-set", applied: true };
+		await f.handleInteractive({
+			type: "block_actions",
+			user: { id: "U1" },
+			channel: { id: "C1" },
+			trigger_id: "tr1",
+			response_url: "https://hooks.slack.test/response",
+			actions: [{ action_id: "model-pick:U1", selected_option: { value: "zai/glm-5.3" } }],
+		});
+		const texts = f.client.requests
+			.filter((request) => request.verb === "chat.send")
+			.map((request) => (request.params as { text: string }).text);
+		expect(texts).toEqual(["/model list", "/model set zai/glm-5.3"]);
+		const setRequest = f.client.requests.filter((request) => request.verb === "chat.send").at(-1)?.params as {
+			engagement: { authorId: string };
+			origin: { platform: string; kind: string };
+		};
+		expect(setRequest.engagement.authorId).toBe("U1");
+		expect(setRequest.origin).toMatchObject({ platform: "slack", kind: "channel", conversationId: "C1" });
+		expect(f.api.responses.at(-1)).toEqual([
+			"https://hooks.slack.test/response",
+			{ replace_original: true, response_type: "ephemeral", text: expect.stringContaining("`zai/glm-5.3`") },
+		]);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("a picker action from anyone but its requester changes nothing", async () => {
+	const f = await fixture();
+	try {
+		await f.handleInteractive({
+			type: "block_actions",
+			user: { id: "U2" },
+			channel: { id: "C1" },
+			trigger_id: "tr",
+			response_url: "https://hooks.slack.test/response",
+			actions: [{ action_id: "model-pick:U1", selected_option: { value: "zai/glm-5.3" } }],
+		});
+		expect(f.client.requests).toHaveLength(0);
+		expect(f.api.responses.at(-1)?.[1]).toMatchObject({
+			text: "only the person who opened this picker can change its model",
+		});
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("a value outside the gateway catalog is refused before /model set is issued", async () => {
+	const f = await fixture();
+	try {
+		const catalog = {
+			source: "gjc models.db",
+			includesPresets: false,
+			current: "preset base",
+			models: [{ selector: "zai/glm-5.3", label: "GLM-5.3" }],
+		};
+		f.client.resultFor = (_verb, params) =>
+			((params as { text?: string }).text ?? "").startsWith("/model list")
+				? { engaged: true, turnId: "turn-refresh", modelList: catalog }
+				: { engaged: true };
+		await f.handleInteractive({
+			type: "block_actions",
+			user: { id: "U1" },
+			channel: { id: "C1" },
+			trigger_id: "tr",
+			response_url: "https://hooks.slack.test/response",
+			actions: [{ action_id: "model-pick:U1", selected_option: { value: "openai/forged-model" } }],
+		});
+		const texts = f.client.requests
+			.filter((request) => request.verb === "chat.send")
+			.map((request) => (request.params as { text: string }).text);
+		// Only the catalog refresh ran; the forged set never reached the gateway.
+		expect(texts).toEqual(["/model list"]);
+		expect(f.api.responses.at(-1)?.[1]).toMatchObject({
+			text: expect.stringContaining("not in the current model list"),
+		});
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("an unauthorized picker set reports the gateway refusal without claiming success", async () => {
+	const f = await fixture();
+	try {
+		const catalog = {
+			source: "gjc models.db",
+			includesPresets: false,
+			current: "preset base",
+			models: [{ selector: "zai/glm-5.3", label: "GLM-5.3" }],
+		};
+		f.client.engaged = false;
+		f.client.resultFor = (_verb, params) =>
+			((params as { text?: string }).text ?? "").startsWith("/model list")
+				? { engaged: true, turnId: "turn-refresh", modelList: catalog }
+				: { engaged: false };
+		await f.handleInteractive({
+			type: "block_actions",
+			user: { id: "U1" },
+			channel: { id: "C1" },
+			trigger_id: "tr",
+			response_url: "https://hooks.slack.test/response",
+			actions: [{ action_id: "model-pick:U1", selected_option: { value: "zai/glm-5.3" } }],
+		});
+		const setRequests = f.client.requests.filter(
+			(request) => request.verb === "chat.send" && (request.params as { text: string }).text.startsWith("/model set"),
+		);
+		expect(setRequests).toHaveLength(1);
+		expect(f.api.responses.at(-1)?.[1]).toMatchObject({
+			text: "not authorized for session commands here; nothing changed",
+		});
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("an engaged answer without a rebind receipt is not reported as success", async () => {
+	const f = await fixture();
+	try {
+		const catalog = {
+			source: "gjc models.db",
+			includesPresets: false,
+			current: "preset base",
+			models: [{ selector: "zai/glm-5.3", label: "GLM-5.3" }],
+		};
+		f.client.engaged = true;
+		f.client.resultFor = (_verb, params) =>
+			((params as { text?: string }).text ?? "").startsWith("/model list")
+				? { engaged: true, turnId: "turn-refresh", modelList: catalog }
+				: // engaged with applied:false: the gateway answered but changed nothing.
+					{ engaged: true, applied: false };
+		await f.handleInteractive({
+			type: "block_actions",
+			user: { id: "U1" },
+			channel: { id: "C1" },
+			trigger_id: "tr",
+			response_url: "https://hooks.slack.test/response",
+			actions: [{ action_id: "model-pick:U1", selected_option: { value: "zai/glm-5.3" } }],
+		});
+		expect(f.api.responses.at(-1)?.[1]).toMatchObject({
+			text: "not authorized for session commands here; nothing changed",
+		});
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("an explicit model list argument and suffixed clear keep their text behavior", async () => {
+	const f = await fixture();
+	try {
+		f.client.engaged = true;
+		await f.handleSlashCommand({
+			command: "/model",
+			text: "list",
+			user_id: "U1",
+			user_name: "alice",
+			channel_id: "C1",
+			trigger_id: "t-list",
+			response_url: "https://hooks.slack.test/response",
+		});
+		expect((f.client.requests.at(-1)?.params as { text: string }).text).toBe("/model list");
+		expect(f.api.ephemerals.at(-1)).toEqual(["C1", "U1", "🦞 model command accepted"]);
+		await f.handleSlashCommand({
+			command: "/model-dev",
+			text: "claude-opus",
+			user_id: "U1",
+			user_name: "alice",
+			channel_id: "C1",
+			trigger_id: "t-arg",
+			response_url: "https://hooks.slack.test/response",
+		});
+		expect((f.client.requests.at(-1)?.params as { text: string }).text).toBe("/model claude-opus");
+		await f.handleSlashCommand({
+			command: "/model-dev",
+			text: "clear",
+			user_id: "U1",
+			user_name: "alice",
+			channel_id: "C1",
+			trigger_id: "t-clear",
+			response_url: "https://hooks.slack.test/response",
+		});
+		expect((f.client.requests.at(-1)?.params as { text: string }).text).toBe("/model clear");
 	} finally {
 		f.socket.stop();
 	}

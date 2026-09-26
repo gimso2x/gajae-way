@@ -108,7 +108,8 @@ import {
 	resolveHandoffTarget,
 } from "./handoff";
 import { InterimSpeechGate } from "./interim-speech";
-import { applyModelCommand, listModelChoices } from "./model-command";
+import { applyModelCommand, describeSelection, listModelChoices, type ModelCatalog } from "./model-command";
+import { readModelCatalog } from "./model-list";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
@@ -255,6 +256,8 @@ export interface GatewayServerOptions {
 	readonly interimSpeech?: { readonly maxPerTurn?: number; readonly minGapMs?: number };
 	/** Maximum wait for an adapter to settle a direct delivery. */
 	readonly deliverSettlementTimeoutMs?: number;
+	/** Test seam for the selectable-model catalog behind `/model list`; production reads gjc models.db. */
+	readonly modelCatalog?: () => ModelCatalog;
 }
 interface InboundContext {
 	readonly turnId: string;
@@ -1618,29 +1621,80 @@ async function sendChat(
 			});
 			return;
 		}
-		const outcome = applyModelCommand(userText, key, origin, options.database, runtime.config.model);
+		const wantsModelList = /^\/model\s+list$/.test(userText);
+		const catalogProvider = options.modelCatalog ?? (() => readModelCatalog(options.broker?.agentDir));
+		const catalog = wantsModelList ? catalogProvider() : undefined;
+		const outcome = applyModelCommand(
+			userText,
+			key,
+			origin,
+			options.database,
+			runtime.config.model,
+			undefined,
+			catalog,
+		);
 		if (outcome.rebind) {
 			const selection = outcome.rebind.kind === "set" ? outcome.rebind.selection : runtime.config.model;
 			if (!selection) throw new Error("/model clear produced a rebind without a configured gateway default");
 			await runtime.personaSessions.rebindModel(key, selection);
 		}
+		const sourceMessageId = typeof params.messageId === "string" ? params.messageId : undefined;
 		const payload = {
 			turnId: crypto.randomUUID(),
 			origin,
 			role: "assistant" as const,
 			text: outcome.text,
 			final: true,
+			...(sourceMessageId ? { sourceMessageId } : {}),
 		};
+		// A control command answers synchronously: the response carries its text (and,
+		// for /model list, the structured catalog) so an interactive consumer can show
+		// it without waiting for the channel delivery of the same turn. `applied`
+		// separates a real model mutation from an informational answer.
+		const result: {
+			turnId: string;
+			engaged: true;
+			text?: string;
+			applied?: boolean;
+			modelList?: {
+				source: string;
+				includesPresets: boolean;
+				current: string;
+				models: readonly { selector: string; label: string }[];
+			};
+		} = {
+			turnId: payload.turnId,
+			engaged: true,
+			text: outcome.text,
+			applied: outcome.rebind !== undefined,
+		};
+		if (wantsModelList && catalog && !("error" in catalog)) {
+			const effective = options.database.conversationModelGet(key)?.selection ?? runtime.config.model;
+			result.modelList = {
+				source: catalog.source,
+				includesPresets: catalog.includesPresets,
+				current: effective ? describeSelection(effective) : "gjc default",
+				models: catalog.models,
+			};
+		}
 		connection.write({
 			v: PROFILE_VERSION,
 			type: "response",
 			id: request.id,
-			result: { turnId: payload.turnId, engaged: true },
+			result,
 		});
 		if (origin.platform === "loopback")
 			connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", id: request.id, payload });
 		else {
-			const delivery = runtime.delivery.prepare(payload.turnId, origin, payload.text);
+			const delivery = runtime.delivery.prepare(
+				payload.turnId,
+				origin,
+				payload.text,
+				undefined,
+				undefined,
+				true,
+				sourceMessageId,
+			);
 			if (delivery) {
 				runtime.delivery.markInflight(delivery.deliveryId as string);
 				for (const recipient of runtime.connections)

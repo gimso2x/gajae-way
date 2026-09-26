@@ -12,6 +12,28 @@ export type ModelRebindIntent =
 	| { readonly kind: "set"; readonly selection: GjcModelSelection }
 	| { readonly kind: "clear" };
 
+/**
+ * The selectable-model catalog `/model list` renders. The gateway reads it
+ * from the configured gjc source; `error` reports why no list is available.
+ */
+export type ModelCatalog =
+	| {
+			readonly source: string;
+			readonly includesPresets: boolean;
+			readonly models: readonly ModelListEntry[];
+	  }
+	| { readonly error: string };
+
+export interface ModelListEntry {
+	/** Explicit `provider/model` selector, exactly what `/model set <selector>` accepts. */
+	readonly selector: string;
+	/** Human model name from the gjc catalog; falls back to the selector when unnamed. */
+	readonly label: string;
+}
+
+/** How many selectors the human-readable `/model list` text previews before "+N more". */
+const LIST_PREVIEW_COUNT = 15;
+
 export interface ModelCommandOutcome {
 	readonly text: string;
 	/** A same-session control transition the per-origin actor must serialize. */
@@ -67,9 +89,10 @@ export function parseModelArgument(argument: string): GjcModelSelection | { read
 }
 
 /**
- * Executes `/model`, `/model <choice>`, `/model set <choice>` or
- * `/model clear`. A change returns a same-session rebind intent; the actor
+ * Executes `/model`, `/model list`, `/model <choice>`, `/model set <choice>`
+ * or `/model clear`. A change returns a same-session rebind intent; the actor
  * applies it through `model.set` without changing the conversation epoch.
+ * `catalog` is consulted only by `/model list`.
  */
 export function applyModelCommand(
 	text: string,
@@ -78,6 +101,7 @@ export function applyModelCommand(
 	store: ModelOverrideStore,
 	configModel: GjcModelSelection | undefined,
 	setBy?: string,
+	catalog?: ModelCatalog,
 ): ModelCommandOutcome {
 	const rest = text.slice("/model".length).trim();
 	const [head = "", ...tail] = rest.split(/\s+/).filter((part) => part !== "");
@@ -89,6 +113,25 @@ export function applyModelCommand(
 	};
 
 	if (rest === "" || head === "show") return { text: showEffective() };
+
+	if (head === "list") {
+		if (!catalog || "error" in catalog)
+			return {
+				text: `🦞 the selectable model list is unavailable${catalog && "error" in catalog ? ` (${catalog.error})` : ""}. ${showEffective()}`,
+			};
+		const preview = catalog.models
+			.slice(0, LIST_PREVIEW_COUNT)
+			.map((entry) => entry.selector)
+			.join(", ");
+		const more =
+			catalog.models.length > LIST_PREVIEW_COUNT ? ` … +${catalog.models.length - LIST_PREVIEW_COUNT} more` : "";
+		const presets = catalog.includesPresets
+			? "presets included"
+			: "presets excluded (gjc model profiles are not enumerable here; force one with `/model set preset:<name>`)";
+		return {
+			text: `🦞 selectable models — ${catalog.models.length} from ${catalog.source}; ${presets}: ${preview}${more}. ${showEffective()}`,
+		};
+	}
 
 	if (head === "clear" || head === "reset" || head === "default") {
 		const existing = store.conversationModelGet(originKey)?.selection;
@@ -108,7 +151,7 @@ export function applyModelCommand(
 	const parsed = parseModelArgument(argument);
 	if (typeof parsed !== "string" && "error" in parsed)
 		return {
-			text: `could not read that selection (${parsed.error}). usage: \`/model\`, \`/model set <preset-or-selector>\`, \`/model clear\``,
+			text: `could not read that selection (${parsed.error}). usage: \`/model\`, \`/model list\`, \`/model set <preset-or-selector>\`, \`/model clear\``,
 		};
 	store.conversationModelSet(originKey, parsed, setBy);
 	const scope = origin.platform === "loopback" ? "this session" : "this conversation";
