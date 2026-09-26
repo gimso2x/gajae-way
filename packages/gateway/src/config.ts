@@ -140,6 +140,8 @@ export interface ChannelPolicy extends ChannelEngagementPolicy {
 	 * `mentionAllowlist` happened to be populated.
 	 *
 	 * - `open`: matching-audience messages are turns without addressing
+	 * - `lead`: top-level matching-audience messages are turns unless they mention
+	 *   only someone else; thread messages require addressing like `mention-open`
 	 * - `mention-open`: matching-audience messages require a mention or native reply
 	 * - `closed`: every author requires addressing and allowlist authorization
 	 */

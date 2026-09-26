@@ -20,6 +20,7 @@ export interface ConfigCheckOk {
 	readonly path: string;
 	readonly channels: readonly string[];
 	readonly openChannels: readonly string[];
+	readonly leadChannels: readonly string[];
 	readonly mentionOpenChannels: readonly string[];
 }
 
@@ -59,6 +60,7 @@ export async function checkConfigFile(path: string): Promise<ConfigCheckResult> 
 			path,
 			channels,
 			openChannels: channels.filter((id) => config.channels?.[id]?.engagement === "open"),
+			leadChannels: channels.filter((id) => config.channels?.[id]?.engagement === "lead"),
 			mentionOpenChannels: channels.filter((id) => config.channels?.[id]?.engagement === "mention-open"),
 		};
 	} catch (error) {
@@ -73,10 +75,14 @@ export async function checkConfigFile(path: string): Promise<ConfigCheckResult> 
 
 export function renderConfigCheck(result: ConfigCheckResult): string[] {
 	if (!result.ok) return [`FAIL ${result.path}`, `  ${result.code}: ${result.message}`];
-	const closed = result.channels.length - result.openChannels.length - result.mentionOpenChannels.length;
+	const closed =
+		result.channels.length -
+		result.openChannels.length -
+		result.leadChannels.length -
+		result.mentionOpenChannels.length;
 	return [
 		`OK ${result.path}`,
-		`  channels: ${result.channels.length} (open ${result.openChannels.length}, mention-open ${result.mentionOpenChannels.length}, closed/default ${closed})`,
+		`  channels: ${result.channels.length} (open ${result.openChannels.length}, lead ${result.leadChannels.length}, mention-open ${result.mentionOpenChannels.length}, closed/default ${closed})`,
 		"  channel policy applies at gateway start only: restart, then confirm the new pid started after this file's mtime.",
 	];
 }

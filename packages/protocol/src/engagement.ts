@@ -1,4 +1,4 @@
-export const ENGAGEMENT_MODES = ["open", "mention-open", "closed"] as const;
+export const ENGAGEMENT_MODES = ["open", "lead", "mention-open", "closed"] as const;
 export type EngagementMode = (typeof ENGAGEMENT_MODES)[number];
 
 export const ENGAGEMENT_AUDIENCES = ["all", "human-only", "bot-only"] as const;
@@ -17,6 +17,10 @@ export interface ChannelEngagementInput {
 	readonly authorIsBot: boolean;
 	/** A real platform mention or a native reply addressed to this bot/session. */
 	readonly addressed: boolean;
+	/** The message sits at the top level of the channel, not inside a thread. Only `lead` reads it. */
+	readonly topLevel?: boolean;
+	/** The text mentions some other account and not this one. Only `lead` reads it. */
+	readonly mentionsOthers?: boolean;
 	/** Existing owner/allowlist authorization used by the closed gate. */
 	readonly authorized: boolean;
 }
@@ -35,6 +39,12 @@ export interface ChannelEngagementDecision {
  * An omitted audience preserves legacy behavior: humans use the mode while
  * bots fall back to the closed mention-and-allowlist gate. `closed` always
  * ignores audience and uses the closed gate for every author.
+ *
+ * `lead` is for the default responder of a room shared with other personas:
+ * top-level messages are turns without addressing unless they mention some
+ * other account and not this one, while threads need addressing (a mention, a
+ * native reply, or a thread this persona is already answering) exactly like
+ * `mention-open`. A thread it has no part in belongs to whoever is answering it.
  */
 export function evaluateChannelEngagement(input: ChannelEngagementInput): ChannelEngagementDecision {
 	const mode = input.policy?.engagement ?? "closed";
@@ -42,19 +52,21 @@ export function evaluateChannelEngagement(input: ChannelEngagementInput): Channe
 	if (mode === "closed") {
 		return { engaged: input.addressed && input.authorized, botAudienceAdmission: false };
 	}
+	const unaddressedTurn =
+		mode === "open" || (mode === "lead" && input.topLevel === true && input.mentionsOthers !== true);
 	if (audience === "bot-only" || audience === "human-only") {
 		const audienceMatches = audience === "bot-only" ? input.authorIsBot : !input.authorIsBot;
 		if (!audienceMatches) return { engaged: false, botAudienceAdmission: false };
-		const engaged = mode === "open" || input.addressed;
+		const engaged = unaddressedTurn || input.addressed;
 		return { engaged, botAudienceAdmission: engaged && input.authorIsBot };
 	}
 	if (audience === "all") {
-		const engaged = mode === "open" || input.addressed;
+		const engaged = unaddressedTurn || input.addressed;
 		return { engaged, botAudienceAdmission: engaged && input.authorIsBot };
 	}
 	// No explicit audience: humans use the mode, bots use the closed gate.
 	if (input.authorIsBot) {
 		return { engaged: input.addressed && input.authorized, botAudienceAdmission: false };
 	}
-	return { engaged: mode === "open" || input.addressed, botAudienceAdmission: false };
+	return { engaged: unaddressedTurn || input.addressed, botAudienceAdmission: false };
 }

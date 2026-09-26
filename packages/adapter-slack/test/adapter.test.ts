@@ -288,6 +288,21 @@ test("a bot author is addressed only by an explicit mention in its text", () => 
 	expect(engagementForMessage(human, slackMessageOrigin(human), identity, names, undefined).mentioned).toBe(true);
 });
 
+test("Slack flags a message that names someone else and not us; lead channels are not promoted", () => {
+	const lead = { C1: { engagement: "lead" as const } };
+	const other = engagementForMessage(inbound({ text: "<@UDEV> 해줘" }), origin, identity, names, lead);
+	expect(other.mentioned).toBe(false);
+	expect(other.mentionsOthers).toBe(true);
+	// Naming us alongside others is a mention of us, not someone else's message.
+	const both = engagementForMessage(inbound({ text: "<@UDEV> <@UBOT> 봐줘" }), origin, identity, names, lead);
+	expect(both.mentioned).toBe(true);
+	expect(both.mentionsOthers).toBeUndefined();
+	// No mention at all: the gateway's lead mode decides; the adapter does not promote.
+	const plain = engagementForMessage(inbound(), origin, identity, names, lead);
+	expect(plain.mentioned).toBe(false);
+	expect(plain.mentionsOthers).toBeUndefined();
+});
+
 test("Slack mention, open-channel and parent-bot promotion; bot authors remain metadata", () => {
 	for (const extra of [
 		{ text: "<@UBOT> hi" },

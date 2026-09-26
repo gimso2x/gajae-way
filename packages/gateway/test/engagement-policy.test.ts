@@ -119,3 +119,27 @@ test("bot authors never get the open-channel free pass; a bot mention still enga
 		true,
 	);
 });
+
+test("lead: top-level human turns unless another account is named; threads need addressing", () => {
+	const lead = {
+		...config,
+		channels: { "slack:C1": { engagement: "lead" as const, audience: "human-only" as const } },
+	};
+	const top = { platform: "slack" as const, kind: "channel" as const, conversationId: "C1" };
+	const thread = { platform: "slack" as const, kind: "thread" as const, conversationId: "C1:1.000", parentId: "C1" };
+	const human = { mentioned: false, group: true, authorId: "owner" };
+	// Top level: unmentioned is ours, naming only a sibling is theirs, naming us wins.
+	expect(decideEngagement(top, human, lead).engaged).toBe(true);
+	expect(decideEngagement(top, { ...human, mentionsOthers: true }, lead).engaged).toBe(false);
+	expect(decideEngagement(top, { ...human, mentioned: true }, lead).engaged).toBe(true);
+	// Thread: someone else's thread stays theirs; ours (follow-up) or a mention engages.
+	expect(decideEngagement(thread, human, lead).engaged).toBe(false);
+	expect(decideEngagement(thread, human, lead, true).engaged).toBe(true);
+	expect(decideEngagement(thread, { ...human, mentioned: true }, lead).engaged).toBe(true);
+	// human-only audience: a bot never opens a turn, even by mentioning us.
+	expect(decideEngagement(top, { ...human, authorIsBot: true, mentioned: true }, lead).engaged).toBe(false);
+	// Plain open is unchanged: a thread and a sibling-only mention are still turns.
+	const open = { ...config, channels: { "slack:C1": { engagement: "open" as const } } };
+	expect(decideEngagement(thread, human, open).engaged).toBe(true);
+	expect(decideEngagement(top, { ...human, mentionsOthers: true }, open).engaged).toBe(true);
+});

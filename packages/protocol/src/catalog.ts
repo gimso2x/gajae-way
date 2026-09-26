@@ -92,6 +92,11 @@ export interface EngagementContext {
 	/** True when the agent account was explicitly mentioned/addressed. */
 	readonly mentioned: boolean;
 	/**
+	 * True when the text mentions at least one other account and not this one.
+	 * Absent otherwise. A `lead` channel leaves such a message to whoever it names.
+	 */
+	readonly mentionsOthers?: boolean;
+	/**
 	 * The message must be recorded but must never open a turn. Set by an adapter
 	 * that backfills a message it knows the room has already moved past - e.g. a
 	 * catch-up after an outage where the message is old and the persona has since

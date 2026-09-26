@@ -17,18 +17,20 @@ const VALID = JSON.stringify({
 	channels: {
 		"1469222606497648690": { engagement: "open" },
 		"1508664765415690340": {},
+		"slack:C0LEAD": { engagement: "lead" },
 	},
 });
 
-test("a bootable config reports open, mention-open, and closed/default channel counts", async () => {
+test("a bootable config reports open, lead, mention-open, and closed/default channel counts", async () => {
 	const result = await checkConfigFile(await configFile(VALID));
 	expect(result.ok).toBe(true);
 	if (!result.ok) return;
-	expect(result.channels).toHaveLength(2);
+	expect(result.channels).toHaveLength(3);
 	expect(result.openChannels).toEqual(["1469222606497648690"]);
+	expect(result.leadChannels).toEqual(["slack:C0LEAD"]);
 	expect(result.mentionOpenChannels).toEqual([]);
 	expect(configCheckExitCode(result)).toBe(0);
-	expect(renderConfigCheck(result)[1]).toContain("open 1, mention-open 0, closed/default 1");
+	expect(renderConfigCheck(result)[1]).toContain("open 1, lead 1, mention-open 0, closed/default 1");
 });
 
 test("an unknown engagement gate is rejected before a restart can strand the host", async () => {

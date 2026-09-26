@@ -132,9 +132,10 @@ export function engagementForMessage(
 				}
 			: undefined;
 	const authorIsBot = Boolean(message.bot_id) || message.subtype === "bot_message";
-	const textMention = [...(message.text ?? "").matchAll(/<@([^>|]+)(?:\|[^>]*)?>/g)].some(
-		(match) => match[1] === identity.botUserId,
-	);
+	const mentionedIds = [...(message.text ?? "").matchAll(/<@([^>|]+)(?:\|[^>]*)?>/g)].map((match) => match[1]);
+	const textMention = mentionedIds.includes(identity.botUserId);
+	// Naming somebody else and not us: a `lead` channel leaves it to them.
+	const mentionsOthers = !textMention && mentionedIds.length > 0;
 	// For a human, a reply to our own message or an open channel addresses us
 	// just like an explicit mention. A bot must name us in its text: sibling
 	// personas reply under each other's messages constantly.
@@ -148,6 +149,7 @@ export function engagementForMessage(
 	const channelName = origin.kind !== "dm" ? names.channelName(message.channel) : undefined;
 	return {
 		mentioned,
+		...(mentionsOthers && origin.kind !== "dm" ? { mentionsOthers: true } : {}),
 		group: origin.kind !== "dm",
 		authorId: message.user ?? message.bot_id ?? "",
 		...(authorIsBot ? { authorIsBot: true } : {}),

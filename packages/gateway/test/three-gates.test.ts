@@ -261,7 +261,7 @@ describe("config validation", () => {
 	test("an unknown gate is rejected rather than treated as unset", async () => {
 		const { parseConfigFile } = await import("../src/config");
 		expect(() => parseConfigFile({ schemaVersion: SCHEMA, channels: { c1: { engagement: "kinda-open" } } })).toThrow(
-			/must be one of open, mention-open, closed/,
+			/must be one of open, lead, mention-open, closed/,
 		);
 	});
 
@@ -269,7 +269,7 @@ describe("config validation", () => {
 		const { parseConfigFile } = await import("../src/config");
 		expect(() =>
 			parseConfigFile({ schemaVersion: SCHEMA, channels: { c1: { engagement: "open-mention-only" } } }),
-		).toThrow(/must be one of open, mention-open, closed/);
+		).toThrow(/must be one of open, lead, mention-open, closed/);
 	});
 
 	test("each valid audience parses and unknown values fail", async () => {

@@ -250,6 +250,8 @@ export function decideEngagement(
 		policy,
 		authorIsBot,
 		addressed: isAddressed(origin, engagement, threadFollowUp),
+		topLevel: origin.kind === "channel",
+		mentionsOthers: engagement.mentionsOthers === true,
 		authorized: closedAuthorAuthorized(engagement.authorId, config),
 	});
 }
