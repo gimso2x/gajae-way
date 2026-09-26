@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
-import { SlackApiError, type SlackHistoryPage, SlackWebApi } from "../src/api";
+import { type FetchLike, SlackApiError, type SlackHistoryPage, SlackWebApi } from "../src/api";
 import {
 	decideInbound,
 	describeMessageEdit,
@@ -141,7 +141,7 @@ class Socket implements WebSocketLike {
 }
 async function fixture(
 	channels?: Record<string, { engagement: "open" | "mention-open" | "closed" }>,
-	options: { readonly autoRecover?: boolean } = {},
+	options: { readonly autoRecover?: boolean; readonly fileFetcher?: FetchLike } = {},
 ) {
 	const api = new Api();
 	const gateway = new Gateway();
@@ -162,6 +162,7 @@ async function fixture(
 		},
 		{
 			api,
+			...(options.fileFetcher ? { fileFetcher: options.fileFetcher } : {}),
 			recoveryCursorPath,
 			now: () => 1_700_000_100_000,
 			log: { log() {}, error() {} },
@@ -267,6 +268,40 @@ test("Slack rejects self, service, hidden, authorless and empty messages and ign
 		}
 		await f.event({ ...inbound(), type: "app_mention", text: "<@UBOT>" });
 		expect(f.client.requests).toEqual([]);
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("an inbound image message is ingested at receive time into the turn body", async () => {
+	const urls: string[] = [];
+	const authorizations: (string | null)[] = [];
+	const f = await fixture(undefined, {
+		fileFetcher: async (input, init) => {
+			urls.push(String(input));
+			authorizations.push(new Headers(init?.headers).get("Authorization"));
+			return new Response("png-bytes");
+		},
+	});
+	try {
+		await f.event({
+			...inbound({
+				text: "",
+				files: [
+					{
+						name: "photo.png",
+						mimetype: "image/png",
+						size: 9,
+						url_private: "https://files.slack.com/files-pri/T1/F1/photo.png",
+					},
+				],
+			}),
+		});
+		expect(urls).toEqual(["https://files.slack.com/files-pri/T1/F1/photo.png"]);
+		expect(authorizations[0]).toBe("Bearer xoxb-test");
+		expect(f.client.requests).toHaveLength(1);
+		const text = (f.client.requests[0]?.params as { text: string }).text;
+		expect(text).toMatch(/^\[image · photo\.png · 9 B · \/.+\/inbound-images\/slack-\d+-[0-9a-f]{8}-photo\.png\]$/);
 	} finally {
 		f.socket.stop();
 	}
@@ -407,6 +442,38 @@ test("Slack edits use nested identity, edited timestamp and rendered body equali
 				undefined,
 			),
 		).toBeUndefined();
+	} finally {
+		f.socket.stop();
+	}
+});
+
+test("an edited message's attachment fields are scrubbed before the edit body is rendered", async () => {
+	const f = await fixture();
+	try {
+		await f.event({
+			type: "message",
+			subtype: "message_changed",
+			channel: "C1",
+			ts: "1700000002.000000",
+			message: {
+				ts: "1700000000.123456",
+				user: "U1",
+				text: "updated",
+				edited: { ts: "1700000001.500000" },
+				files: [
+					{
+						name: "photo.png",
+						mimetype: "image/png",
+						url_private: "https://files.slack.com/files-pri/T1/F1/photo.png",
+						localPath: "/tmp/hostile/leak.png",
+					},
+				],
+			},
+			previous_message: { text: "hello" },
+		});
+		expect(f.client.requests).toHaveLength(1);
+		expect(f.client.requests[0]?.verb).toBe("chat.edit");
+		expect(JSON.stringify(f.client.requests[0])).not.toContain("leak.png");
 	} finally {
 		f.socket.stop();
 	}

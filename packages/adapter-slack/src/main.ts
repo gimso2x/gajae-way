@@ -9,10 +9,12 @@ import type {
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
+import type { FetchLike } from "./api";
 import { deliveryFailureIsAmbiguous, OutboundLimiter, SLACK_FILE_MAX_BYTES, SlackApiError, SlackWebApi } from "./api";
 import { describeInboundBody, type SlackFileCarrier } from "./attachments";
 import { SlackDirectory } from "./author";
 import { adapterHome, type LoadedSlackAdapterConfig, loadSlackAdapterConfig } from "./config";
+import { ingestInboundImages, scrubbedFiles } from "./ingest";
 import { LiveReplyTracker } from "./live-reply";
 import { AdapterAlreadyRunningError, AdapterLock } from "./lock";
 import { type MentionDirectory, repairMentions } from "./mentions";
@@ -133,7 +135,9 @@ export function engagementForMessage(
 				}
 			: undefined;
 	const authorIsBot = Boolean(message.bot_id) || message.subtype === "bot_message";
-	const mentionedIds = [...(message.text ?? "").matchAll(/<@([^>|]+)(?:\|[^>]*)?>/g)].map((match) => match[1]);
+	// Inbound text is attacker-controlled: never let a hostile type throw here.
+	const text = typeof message.text === "string" ? message.text : "";
+	const mentionedIds = [...text.matchAll(/<@([^>|]+)(?:\|[^>]*)?>/g)].map((match) => match[1]);
 	const textMention = mentionedIds.includes(identity.botUserId);
 	// Naming somebody else and not us: a `lead` channel leaves it to them.
 	const mentionsOthers = !textMention && mentionedIds.length > 0;
@@ -184,8 +188,15 @@ export function decideInbound(
 	return { origin, engagement: engagementForMessage(message, origin, identity, names, channels) };
 }
 
-export function renderInboundText(message: SlackInboundMessage, names: SlackNames): string {
-	return describeInboundBody({ text: normalizeSlackText(message.text ?? "", names), files: message.files });
+export function renderInboundText(message: SlackInboundMessage, names: SlackNames, scrubToken?: string): string {
+	// Inbound text is attacker-controlled: never let a hostile type throw here.
+	const text = typeof message.text === "string" ? message.text : "";
+	// Scrubbing runs again after normalization: a display name inserted by
+	// normalizeSlackText could itself carry the token.
+	const normalized = normalizeSlackText(text, names);
+	const safe =
+		scrubToken && normalized.includes(scrubToken) ? normalized.replaceAll(scrubToken, "[redacted]") : normalized;
+	return describeInboundBody({ text: safe, files: message.files });
 }
 
 export interface PendingEdit {
@@ -204,20 +215,39 @@ export function describeMessageEdit(
 	identity: SlackIdentity,
 	names: SlackNames,
 	channels: Channels,
+	scrubToken?: string,
 ): DescribedMessageEdit | undefined {
 	if (event.subtype !== "message_changed" || !event.message) return undefined;
 	const message = { ...event.message, channel: event.channel };
 	const admitted = decideInbound(message, identity, names, channels);
 	if (!admitted) return undefined;
-	const text = renderInboundText(message, names);
+	const text = renderInboundText(message, names, scrubToken);
 	// Link previews and other metadata changes are not edits of what the user said.
-	if (text === "" || (event.previous_message && renderInboundText(event.previous_message, names) === text))
+	if (text === "" || (event.previous_message && renderInboundText(event.previous_message, names, scrubToken) === text))
 		return undefined;
 	return {
 		...admitted,
 		messageId: slackMessageId(message.channel, message.ts),
 		text,
 		receivedAt: timestamp(message.edited?.ts ?? event.ts),
+	};
+}
+
+/** Edits bypass ingest, so their attachment metadata is scrubbed before rendering. */
+function scrubbedEdit(envelope: SlackInboundMessage, token: string): SlackInboundMessage {
+	return {
+		...envelope,
+		...(envelope.message
+			? { message: { ...envelope.message, files: scrubbedFiles(envelope.message.files, token) } }
+			: {}),
+		...(envelope.previous_message
+			? {
+					previous_message: {
+						...envelope.previous_message,
+						files: scrubbedFiles(envelope.previous_message.files, token),
+					},
+				}
+			: {}),
 	};
 }
 
@@ -801,6 +831,7 @@ export async function startSlackAdapter(
 	config: LoadedSlackAdapterConfig,
 	ports: {
 		api?: SlackWebApi;
+		fileFetcher?: FetchLike;
 		socketFactory?: SocketModeOptions["factory"];
 		log?: Pick<Console, "log" | "error">;
 		recoveryCursorPath?: string;
@@ -848,6 +879,15 @@ export async function startSlackAdapter(
 	);
 	const ingress = new OrderedIngress();
 	const now = ports.now ?? Date.now;
+	// Receive-time image ingest: failures keep the url_private line and never drop the message.
+	const ingestMessage = (message: SlackInboundMessage): Promise<SlackInboundMessage> =>
+		ingestInboundImages(message, {
+			botToken: config.botToken,
+			home: adapterHome(),
+			fetcher: ports.fileFetcher ?? fetch,
+			now,
+			log,
+		});
 	const cursorPath = ports.recoveryCursorPath ?? recoveryCursorPath();
 	let cursors: RecoveryCursorState | undefined;
 	// Single-flight load: two first-contact DMs arriving together must not each
@@ -904,7 +944,7 @@ export async function startSlackAdapter(
 		await Promise.all([
 			...(message.user ? [directory.user(message.user)] : []),
 			...(!isSlackDmChannel(message.channel, message.channel_type) ? [directory.conversation(message.channel)] : []),
-			...mentionedUserIds(message.text ?? "")
+			...(typeof message.text === "string" ? mentionedUserIds(message.text) : [])
 				.slice(0, 10)
 				.map((id) => directory.user(id)),
 		]);
@@ -925,11 +965,19 @@ export async function startSlackAdapter(
 				// id, so live traffic records the bounded set recovery will revisit.
 				await rememberDm(message);
 				if (envelope.subtype === "message_changed") {
-					const edit = describeMessageEdit(envelope, identity, directory, config.channels);
+					// Edits bypass ingest, so their attachment metadata is scrubbed here:
+					// an edited image named after the bot token must not reach the body.
+					const edit = describeMessageEdit(
+						scrubbedEdit(envelope, config.botToken),
+						identity,
+						directory,
+						config.channels,
+						config.botToken,
+					);
 					if (edit) gateway.sendEdit(edit.messageId, edit.origin, edit.text, edit.engagement, edit.receivedAt);
 					return;
 				}
-				const text = renderInboundText(message, directory);
+				const text = renderInboundText(await ingestMessage(message), directory, config.botToken);
 				if (text === "") return;
 				const engagement = engagementForMessage(message, admitted.origin, identity, directory, config.channels);
 				const result = await gateway.requestInbound(
@@ -1025,7 +1073,7 @@ export async function startSlackAdapter(
 			const admitted = decideInbound(message, identity, directory, config.channels);
 			if (!admitted) return "skip";
 			await prime(message);
-			const text = renderInboundText(message, directory);
+			const text = renderInboundText(await ingestMessage(message), directory, config.botToken);
 			if (text === "") return "skip";
 			const messageId = slackMessageId(message.channel, message.ts);
 			const engagement = engagementForMessage(message, admitted.origin, identity, directory, config.channels);

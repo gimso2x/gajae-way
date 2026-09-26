@@ -1,6 +1,18 @@
 import { expect, test } from "bun:test";
 import { describeInboundBody, describeSlackFile } from "../src/attachments";
 
+test("a saved local path replaces the url in the attachment line", () => {
+	expect(
+		describeSlackFile({
+			mimetype: "image/png",
+			name: "photo.png",
+			size: 12,
+			url_private: "https://files.slack.com/photo",
+			localPath: "/home/u/.gajaeway/inbound-images/slack-1700000000000-1a2b3c4d-photo.png",
+		}),
+	).toBe("[image · photo.png · 12 B · /home/u/.gajaeway/inbound-images/slack-1700000000000-1a2b3c4d-photo.png]");
+});
+
 test("Slack files use MIME kind, preferred name/url, and readable sizes", () => {
 	expect(
 		describeSlackFile({

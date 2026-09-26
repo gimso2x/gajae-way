@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload, ReactionRef } from "@gajae-gateway/protocol";
 import { platformSupportsReaction, REACTION_ALLOWLIST, reactionAllowlistFor } from "@gajae-gateway/protocol";
+import { TelegramImageIngest } from "../src/ingest";
 import {
 	describeTelegramReaction,
 	type GatewayClientLike,
@@ -238,7 +239,22 @@ test("handleUpdate reports an inbound reaction as engagement and never as a turn
 	const home = await temporaryHome();
 	try {
 		const state = await TelegramAdapterState.load(home);
-		const adapter = new TelegramAdapter(state, "agent", "900", { chats: { "-100123": { engagement: "open" } } });
+		const adapter = new TelegramAdapter(
+			state,
+			"agent",
+			"900",
+			{ chats: { "-100123": { engagement: "open" } } },
+			new TelegramImageIngest(
+				{
+					token: "stub-token",
+					fetcher: async () => {
+						throw new Error("test must not fetch files");
+					},
+					getFile: async () => ({}),
+				},
+				"/tmp/gajaeway-telegram-stub",
+			),
+		);
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const accepted = await adapter.handleUpdate(mockGateway(requests), {
 			update_id: 5,

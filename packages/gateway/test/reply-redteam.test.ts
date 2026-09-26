@@ -719,11 +719,14 @@ describe("G2 C6 source-text guarantees and full divergence enumeration", () => {
 		const expression = source.slice(source.indexOf("const mentioned =")).split(";")[0]?.replace(/\s+/g, " ").trim();
 		expect(expression).toBe(
 			// biome-ignore lint/suspicious/noTemplateCurlyInString: asserts the adapter's source text verbatim
-			"const mentioned = message.text?.toLocaleLowerCase().includes(`@${botUsername.toLocaleLowerCase()}`) === true || replyTo?.fromSelf === true",
+			"const mentioned = body.toLocaleLowerCase().includes(`@${botUsername.toLocaleLowerCase()}`) || replyTo?.fromSelf === true",
 		);
 		// Same identity value feeds both halves (C4): one botUserId, one resolve call.
 		expect(source).toContain("const replyTo = resolveTelegramReplyContext(message.reply_to_message, botUserId);");
 		expect((source.match(/resolveTelegramReplyContext\(/g) ?? []).length).toBe(1);
+		// The caption-aware input to the mention check is pinned too: the chain
+		// "mentioned = body match || replyTo.fromSelf" is only as good as `body`.
+		expect(source).toContain("const body = asText(message.text ?? message.caption);");
 	});
 
 	test("Telegram: the refactor never promotes mentioned where the old expression did not", () => {

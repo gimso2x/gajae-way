@@ -1,6 +1,7 @@
 import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import { type LoadedTelegramAdapterConfig, loadTelegramAdapterConfig } from "./config";
+import { asText, inboundImage, type TelegramDocument, TelegramImageIngest, type TelegramPhotoSize } from "./ingest";
 import { type TelegramMessageOriginShape, telegramMessageOrigin } from "./origin";
 import { telegramReactionFor } from "./reactions";
 import { resolveTelegramReplyContext, type TelegramReplyMessageShape } from "./reply";
@@ -17,6 +18,9 @@ export interface GatewayClientLike {
 export interface TelegramMessage extends TelegramMessageOriginShape {
 	readonly message_id: number;
 	readonly text?: string;
+	readonly caption?: string;
+	readonly photo?: readonly TelegramPhotoSize[];
+	readonly document?: TelegramDocument;
 	readonly reply_to_message?: TelegramReplyMessageShape;
 }
 
@@ -99,6 +103,11 @@ export class TelegramBotApi {
 			allowed_updates: ["message", "message_reaction"],
 			...(offset === undefined ? {} : { offset }),
 		});
+	}
+
+	/** Resolves a file's download path; the bytes themselves need the bot token in the file URL. */
+	getFile(fileId: string): Promise<{ file_path?: string }> {
+		return this.call("getFile", { file_id: fileId });
 	}
 
 	sendMessage(chatId: string, text: string, messageThreadId?: number): Promise<unknown> {
@@ -220,6 +229,7 @@ export class TelegramAdapter {
 		readonly botUsername: string,
 		readonly botUserId: string,
 		readonly config: Pick<LoadedTelegramAdapterConfig, "chats">,
+		readonly ingest: TelegramImageIngest,
 	) {}
 
 	async handleUpdate(gateway: Pick<GatewayClientLike, "request">, update: TelegramUpdate): Promise<boolean> {
@@ -232,7 +242,9 @@ export class TelegramAdapter {
 			return true;
 		}
 		const message = update.message;
-		if (!message?.from || !message.text) return true;
+		// A photo or image document is a turn even without any text; only senderless
+		// updates and truly contentless messages are dropped.
+		if (!message?.from || (!message.text && !message.caption && !inboundImage(message))) return true;
 		const origin = telegramMessageOrigin(message);
 		await this.state.rememberOrigin(origin, origin.kind === "topic" ? message.message_thread_id : undefined);
 		const baseEngagement = engagementForMessage(message, origin, this.botUsername, this.botUserId);
@@ -242,7 +254,7 @@ export class TelegramAdapter {
 				: baseEngagement;
 		await gateway.request("chat.send", {
 			origin,
-			text: message.text,
+			text: await this.ingest.bodyFor(message),
 			engagement,
 		});
 		return true;
@@ -313,9 +325,11 @@ export function engagementForMessage(
 	const replyTo = resolveTelegramReplyContext(message.reply_to_message, botUserId);
 	// A reply to our own message is the same "addressed to us" signal as an @mention,
 	// so it keeps reading as one — derived from replyTo instead of a second identity check.
+	// Caption counts as the message text here: a photo captioned "@agent …" addresses us.
+	// text/caption are inbound data and may be any JSON value: coerce before matching.
+	const body = asText(message.text ?? message.caption);
 	const mentioned =
-		message.text?.toLocaleLowerCase().includes(`@${botUsername.toLocaleLowerCase()}`) === true ||
-		replyTo?.fromSelf === true;
+		body.toLocaleLowerCase().includes(`@${botUsername.toLocaleLowerCase()}`) || replyTo?.fromSelf === true;
 	const authorName = message.from?.username ?? message.from?.first_name;
 	return {
 		mentioned,
@@ -333,7 +347,13 @@ export async function startTelegramAdapter(config: LoadedTelegramAdapterConfig):
 	const bot = new TelegramBotApi(config.token);
 	const identity = await bot.call<{ id: number | string; username?: string }>("getMe");
 	if (!identity.username) throw new Error("Telegram bot account has no username");
-	const adapter = new TelegramAdapter(state, identity.username, String(identity.id), config);
+	const adapter = new TelegramAdapter(
+		state,
+		identity.username,
+		String(identity.id),
+		config,
+		new TelegramImageIngest(bot, adapterHome()),
+	);
 	const gateway = new ReconnectingGateway(config.gatewaySocket ?? defaultGatewaySocket(), bot, state);
 	await gateway.connect();
 	for (;;) {

@@ -6,6 +6,12 @@ export interface SlackFileLike {
 	readonly size?: number | null;
 	readonly url_private?: string | null;
 	readonly permalink?: string | null;
+	/**
+	 * Set by the receive-time ingest step (./ingest) when the file was downloaded
+	 * with the bot token and saved under the gateway home. Rendered in place of
+	 * url_private so the agent can read the bytes directly; never set to a token.
+	 */
+	readonly localPath?: string | null;
 }
 
 export type SlackFileCarrier = { readonly text?: string | null; readonly files?: readonly SlackFileLike[] | null };
@@ -17,7 +23,7 @@ export function describeSlackFile(file: SlackFileLike): string {
 		kind,
 		nonBlank(file.name) ?? nonBlank(file.title),
 		formatSize(file.size),
-		nonBlank(file.url_private) ?? nonBlank(file.permalink),
+		nonBlank(file.localPath) ?? nonBlank(file.url_private) ?? nonBlank(file.permalink),
 	];
 	return `[${parts.filter((part) => part !== undefined).join(" · ")}]`;
 }

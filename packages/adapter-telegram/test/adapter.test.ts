@@ -2,10 +2,12 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ChatMessagePayload } from "@gajae-gateway/protocol";
+import type { ChatMessagePayload, OriginRef } from "@gajae-gateway/protocol";
 import { loadTelegramAdapterConfig, TelegramAdapterStartupError } from "../src/config";
+import { TelegramImageIngest } from "../src/ingest";
 import {
 	chunkTelegramMessage,
+	engagementForMessage,
 	type GatewayClientLike,
 	settleTelegramDelivery,
 	subscribeTelegramDeliveries,
@@ -91,14 +93,20 @@ test("deduplicates update ids durably before sending an inbound turn", async () 
 	const home = await temporaryHome();
 	try {
 		const state = await TelegramAdapterState.load(home);
-		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} });
+		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, stubIngest());
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const gateway = mockGateway(requests);
 		const update: TelegramUpdate = { update_id: 81, message: topicMessage };
 		expect(await adapter.handleUpdate(gateway, update)).toBe(true);
 		expect(await adapter.handleUpdate(gateway, update)).toBe(false);
 		expect(requests).toHaveLength(1);
-		const restarted = new TelegramAdapter(await TelegramAdapterState.load(home), "agent", "900", { chats: {} });
+		const restarted = new TelegramAdapter(
+			await TelegramAdapterState.load(home),
+			"agent",
+			"900",
+			{ chats: {} },
+			stubIngest(),
+		);
 		expect(await restarted.handleUpdate(gateway, update)).toBe(false);
 		expect(requests).toHaveLength(1);
 		expect(requests[0]?.params).toEqual({
@@ -106,6 +114,75 @@ test("deduplicates update ids durably before sending an inbound turn", async () 
 			text: "hello @agent",
 			engagement: { mentioned: true, group: true, authorId: "42" },
 		});
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("mention matching stays case-insensitive across text and caption", () => {
+	const origin: OriginRef = { platform: "telegram", kind: "channel", conversationId: "-100123" };
+	const message = (extra: Record<string, unknown>) => ({
+		message_id: 11,
+		chat: { id: -100123, type: "supergroup" },
+		from: { id: 42 },
+		...extra,
+	});
+	expect(engagementForMessage(message({ text: "LOOK @AGENT" }), origin, "agent", "900").mentioned).toBe(true);
+	expect(
+		engagementForMessage(
+			message({ caption: "look @AGENT", photo: [{ file_id: "p", width: 1, height: 1 }] }),
+			origin,
+			"agent",
+			"900",
+		).mentioned,
+	).toBe(true);
+	expect(engagementForMessage(message({ caption: "just chatting" }), origin, "agent", "900").mentioned).toBe(false);
+});
+
+test("a photo is a turn even without text, with caption-based engagement", async () => {
+	const home = await temporaryHome();
+	try {
+		const state = await TelegramAdapterState.load(home);
+		const adapter = new TelegramAdapter(state, "agent", "900", { chats: {} }, stubIngest());
+		const requests: Array<{ verb: string; params: unknown }> = [];
+		const gateway = mockGateway(requests);
+		const photo = {
+			message_id: 8,
+			chat: { id: -100123, type: "supergroup" },
+			from: { id: 42 },
+			photo: [{ file_id: "large", width: 100, height: 100 }],
+			caption: "look @agent",
+		};
+		expect(await adapter.handleUpdate(gateway, { update_id: 82, message: photo })).toBe(true);
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.verb).toBe("chat.send");
+		expect(requests[0]?.params).toMatchObject({
+			origin: { platform: "telegram", kind: "channel", conversationId: "-100123" },
+			engagement: { mentioned: true, group: true, authorId: "42" },
+		});
+		expect(String((requests[0]?.params as { text: string }).text)).toBe("look @agent\n[image · photo.jpg · image]");
+		// A captionless photo is still a turn.
+		expect(
+			await adapter.handleUpdate(gateway, {
+				update_id: 83,
+				message: { ...photo, message_id: 9, caption: undefined },
+			}),
+		).toBe(true);
+		expect(requests).toHaveLength(2);
+		// A textless non-image document keeps its existing behavior: no turn.
+		expect(
+			await adapter.handleUpdate(gateway, {
+				update_id: 84,
+				message: {
+					...photo,
+					message_id: 10,
+					caption: undefined,
+					photo: undefined,
+					document: { file_id: "d", mime_type: "application/pdf" },
+				},
+			}),
+		).toBe(true);
+		expect(requests).toHaveLength(2);
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}
@@ -216,6 +293,22 @@ test("the delivery subscription routes a reaction to setMessageReaction and neve
 
 async function temporaryHome(): Promise<string> {
 	return mkdtemp(join(tmpdir(), "gajaeway-telegram-adapter-"));
+}
+/**
+ * An ingest whose downloads always fail (Telegram returns no file path): exercises
+ * the unpathed fallback line without any network, the way a real outage would.
+ */
+function stubIngest(): TelegramImageIngest {
+	return new TelegramImageIngest(
+		{
+			token: "stub-token",
+			fetcher: async () => {
+				throw new Error("test must not fetch files");
+			},
+			getFile: async () => ({}),
+		},
+		"/tmp/gajaeway-telegram-stub",
+	);
 }
 
 function delivery(origin: ChatMessagePayload["origin"], text: string): ChatMessagePayload {

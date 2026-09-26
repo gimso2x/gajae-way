@@ -13,10 +13,26 @@ export const ATTACHMENT_SCOPE_NOTICE =
  * those CDN urls verbatim, and the model opened days-old screenshots and talked
  * about them as the current message (live: jip-gajae, 2026-09-01, the
  * "look-at-live-screenshot" incident). History keeps the human-readable part
- * and loses the handle.
+ * and loses the handle. Slack/Telegram ingest (2026-09-26) replaced url handles
+ * with saved local paths, so an absolute-path handle redacts exactly like a url:
+ * a days-old file still on disk is the same "not part of this message" hazard.
+ *
+ * even ` · `, and a name may contain a newline — so no character-level rule can
+ * tell where a bracket ends, and a wrong guess leaves a handle behind. The
+ * redactor therefore draws the line at the attachment start: every handle-shaped
+ * token (a URL, or an absolute path) anywhere after that point in the body is
+ * replaced. False positives (a name that embeds a path, prose after the
+ * bracket) cost history cosmetics; survivors cost incidents.
  */
-const HISTORICAL_ATTACHMENT = /\[((?:image|video|audio|file|voice message)(?: · [^\]\n]*?)?) · https?:\/\/[^\s\]]+\]/g;
+const ATTACHMENT_START = /\[(?:image|video|audio|file|voice message) · /;
+const HANDLE = /(^|[\s[])(https?:\/\/[^\s\]]+|\/[^\]]*)/g;
+const REDACTED = "past attachment; not part of this message, do not fetch";
 
 export function redactHistoricalAttachments(body: string): string {
-	return body.replaceAll(HISTORICAL_ATTACHMENT, "[$1 · past attachment; not part of this message, do not fetch]");
+	const start = body.search(ATTACHMENT_START);
+	if (start === -1) return body;
+	// The separator before a handle is kept so spacing stays human-readable.
+	return (
+		body.slice(0, start) + body.slice(start).replace(HANDLE, (_match, separator: string) => `${separator}${REDACTED}`)
+	);
 }
