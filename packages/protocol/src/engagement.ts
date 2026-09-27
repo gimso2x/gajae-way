@@ -41,10 +41,13 @@ export interface ChannelEngagementDecision {
  * ignores audience and uses the closed gate for every author.
  *
  * `lead` is for the default responder of a room shared with other personas:
- * top-level messages are turns without addressing unless they mention some
- * other account and not this one, while threads need addressing (a mention, a
- * native reply, or a thread this persona is already answering) exactly like
- * `mention-open`. A thread it has no part in belongs to whoever is answering it.
+ * top-level HUMAN messages are turns without addressing unless they mention
+ * some other account and not this one, while threads need addressing (a
+ * mention, a native reply, or a thread this persona is already answering)
+ * exactly like `mention-open`. A thread it has no part in belongs to whoever
+ * is answering it. A bot author never rides the unaddressed turn: its
+ * unmentioned posts are ambient room noise and reach a lead persona only
+ * through an explicit mention in the text.
  */
 export function evaluateChannelEngagement(input: ChannelEngagementInput): ChannelEngagementDecision {
 	const mode = input.policy?.engagement ?? "closed";
@@ -53,7 +56,11 @@ export function evaluateChannelEngagement(input: ChannelEngagementInput): Channe
 		return { engaged: input.addressed && input.authorized, botAudienceAdmission: false };
 	}
 	const unaddressedTurn =
-		mode === "open" || (mode === "lead" && input.topLevel === true && input.mentionsOthers !== true);
+		mode === "open" ||
+		// A bot's unmentioned top-level post is not the lead persona's turn to
+		// take: sibling personas post receipts and chatter all the time, and
+		// only an explicit mention aims a bot message at this one.
+		(mode === "lead" && input.authorIsBot !== true && input.topLevel === true && input.mentionsOthers !== true);
 	if (audience === "bot-only" || audience === "human-only") {
 		const audienceMatches = audience === "bot-only" ? input.authorIsBot : !input.authorIsBot;
 		if (!audienceMatches) return { engaged: false, botAudienceAdmission: false };

@@ -143,3 +143,40 @@ test("lead: top-level human turns unless another account is named; threads need 
 	expect(decideEngagement(thread, human, open).engaged).toBe(true);
 	expect(decideEngagement(top, { ...human, mentionsOthers: true }, open).engaged).toBe(true);
 });
+
+test("lead: a bot's unmentioned post is ambient noise for every audience; only a mention engages", () => {
+	const leadAll = { ...config, channels: { "slack:C1": { engagement: "lead" as const, audience: "all" as const } } };
+	const leadBots = {
+		...config,
+		channels: { "slack:C1": { engagement: "lead" as const, audience: "bot-only" as const } },
+	};
+	const top = { platform: "slack" as const, kind: "channel" as const, conversationId: "C1" };
+	const thread = { platform: "slack" as const, kind: "thread" as const, conversationId: "C1:1.000", parentId: "C1" };
+	const bot = { mentioned: false, group: true, authorId: "BDEV", authorIsBot: true };
+	// A `/new` receipt or sibling chatter at the top level wakes nobody.
+	expect(decideEngagement(top, bot, leadAll)).toEqual({ engaged: false, botAudienceAdmission: false });
+	expect(decideEngagement(top, bot, leadBots)).toEqual({ engaged: false, botAudienceAdmission: false });
+	// Naming us in the text is the only way a bot opens a lead turn.
+	expect(decideEngagement(top, { ...bot, mentioned: true }, leadAll)).toEqual({
+		engaged: true,
+		botAudienceAdmission: true,
+	});
+	expect(decideEngagement(top, { ...bot, mentioned: true }, leadBots)).toEqual({
+		engaged: true,
+		botAudienceAdmission: true,
+	});
+	// An unmentioned bot reply in a thread the persona is answering stays
+	// ambient: thread follow-ups are a human-only addressing shape.
+	expect(decideEngagement(thread, bot, leadAll, true)).toEqual({ engaged: false, botAudienceAdmission: false });
+	expect(decideEngagement(thread, bot, leadBots, true)).toEqual({ engaged: false, botAudienceAdmission: false });
+	// The human free pass is untouched.
+	expect(decideEngagement(top, { mentioned: false, group: true, authorId: "owner" }, leadAll).engaged).toBe(true);
+	// Open channels keep admitting unmentioned bots.
+	const openAll = { ...config, channels: { "slack:C1": { engagement: "open" as const, audience: "all" as const } } };
+	const openBots = {
+		...config,
+		channels: { "slack:C1": { engagement: "open" as const, audience: "bot-only" as const } },
+	};
+	expect(decideEngagement(top, bot, openAll).engaged).toBe(true);
+	expect(decideEngagement(top, bot, openBots).engaged).toBe(true);
+});
