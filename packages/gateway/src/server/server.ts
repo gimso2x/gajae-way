@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
-import { unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { stat, unlink } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
 import {
 	CAPABILITIES,
+	type ChatDeliverResult,
 	type ChatMessagePayload,
 	type ChatProgressActivity,
-	containsSilenceToken,
 	describeChatPlatforms,
 	encodeFrame,
 	type Frame,
@@ -20,6 +20,7 @@ import {
 	originKey,
 	PROFILE_VERSION,
 	ProtocolError,
+	parseOriginKey,
 	parseReactionReply,
 	platformSupportsReaction,
 	REACTIONS_PER_MESSAGE_CAP,
@@ -96,6 +97,17 @@ const RECENT_HISTORY_MAX = 300;
 const KEV_SHADOW_CONTEXT_TURNS = 16;
 const KEV_SHADOW_CONTEXT_WINDOW_MS = 6 * 60 * 60_000;
 const RESTART_EXIT_CODE = 75;
+
+/** A Slack timestamp is only meaningful within the delivery's channel. */
+function reactionTargetMessageId(origin: OriginRef, id: string): string | undefined {
+	if (origin.platform !== "slack") return id;
+	const channel = origin.kind === "thread" ? origin.parentId : origin.conversationId;
+	if (!channel) return undefined;
+	const target = /^\d+\.\d+$/.test(id) ? `${channel}:${id}` : id;
+	const match = /^([^:]+):(\d+\.\d+)$/.exec(target);
+	return match?.[1] === channel && isPlatformMessageId(target) ? target : undefined;
+}
+
 interface Connection {
 	readonly decoder: FrameDecoder;
 	negotiated: boolean;
@@ -186,6 +198,8 @@ export interface GatewayServerOptions {
 	/** Test seam for periodic delivery recovery; production sweeps every 15s. */
 	readonly deliverySweepIntervalMs?: number;
 	/** Mid-work speech pacing (issue #71). */
+	/** Maximum wait for an adapter to settle a direct delivery. */
+	readonly deliverSettlementTimeoutMs?: number;
 }
 interface InboundContext {
 	readonly turnId: string;
@@ -239,6 +253,7 @@ interface Runtime {
 	/** The live config republished by SIGHUP/reload. */
 	config: GatewayConfig;
 	readonly delivery: DeliveryService;
+	readonly directSettlements: Map<string, (result: ChatDeliverResult) => void>;
 	readonly persona: PersonaLoader;
 	readonly sessionPort: SessionPort;
 	readonly personaSessions: PersonaSessionManager;
@@ -476,6 +491,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const connections = new Set<Connection>();
 	const inbound = new Map<string, InboundContext>();
 	const delivery = new DeliveryService(new DeliveryLedger(options.database));
+	const directSettlements = new Map<string, (result: ChatDeliverResult) => void>();
 	const botAudienceTurns = new BotAudienceTurnGuard(options.database);
 	const registry = new MonitorRegistry(options.database);
 	const memory = new MemoryClosureQueue(options.database, options.config.home);
@@ -637,6 +653,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	runtime = {
 		config: options.config,
 		delivery,
+		directSettlements,
 		persona: options.persona ?? new PersonaLoader(options.config.home),
 		sessionPort,
 		personaSessions,
@@ -788,6 +805,8 @@ async function handleRequest(
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack.
 			const confirmOutcome = options.database.deliveryConfirmWithSettle(id, "delivered");
 			if (confirmOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
+			const resolve = runtime.directSettlements.get(id);
+			if (resolve && runtime.delivery.get(id)?.state === "confirmed") resolve({ deliveryId: id, delivered: true });
 			// Monitor batch settlement: a confirmed delivery for a monitor batch
 			// (turn_id === the events' batch_id) advances its authored events to
 			// `delivered` — only AFTER the adapter confirmed (issue #29 defect 2),
@@ -812,6 +831,12 @@ async function handleRequest(
 			const failOutcome = runtime.delivery.fail(params.deliveryId, params.ambiguous);
 			if (failOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			if (failOutcome === "transitioned") {
+				runtime.directSettlements.get(params.deliveryId)?.({
+					deliveryId: params.deliveryId,
+					delivered: false,
+					uncertain: params.ambiguous === true,
+					reason: safeDiagnosticField(params.reason),
+				});
 				const failedRow = runtime.delivery.get(params.deliveryId);
 				if (failedRow?.state === "expired")
 					reportDeliveryExpired(runtime, failedRow, safeDiagnosticField(params.reason));
@@ -1094,6 +1119,12 @@ async function handleRequest(
 					"invalid_params",
 					"chat.react requires targetMessageId to be a platform message id ([A-Za-z0-9._:-], 1-64 chars)",
 				);
+			const targetMessageId = reactionTargetMessageId(origin, params.targetMessageId.trim());
+			if (!targetMessageId)
+				throw new ProtocolError(
+					"invalid_params",
+					"chat.react targetMessageId must identify a message in this Slack channel",
+				);
 			if (typeof params.emoji !== "string") throw new ProtocolError("invalid_params", "chat.react requires an emoji");
 			const resolved = resolveReactionEmoji(params.emoji);
 			if (!resolved)
@@ -1110,7 +1141,7 @@ async function handleRequest(
 					`${origin.platform} cannot react with ${resolved.unicode} (${resolved.name}); it accepts: ${reactionAllowlistDescription(origin.platform)}`,
 				);
 			const reaction: ReactionRef = {
-				targetMessageId: params.targetMessageId.trim(),
+				targetMessageId,
 				emoji: resolved.unicode,
 				emojiName: resolved.name,
 			};
@@ -1202,6 +1233,9 @@ async function handleRequest(
 		case "chat.send":
 			await sendChat(connection, request, options, runtime);
 			return;
+		case "chat.deliver":
+			await deliverChat(connection, request, options, runtime);
+			return;
 		case "chat.edit":
 			await editChat(connection, request, options, runtime);
 			return;
@@ -1209,6 +1243,100 @@ async function handleRequest(
 			throw new ProtocolError("unknown_verb", `unknown verb: ${request.verb}`);
 	}
 }
+async function deliverChat(
+	connection: Connection,
+	request: RequestFrame,
+	options: GatewayServerOptions,
+	runtime: Runtime,
+): Promise<void> {
+	const params = request.params as
+		| { origin?: unknown; sessionId?: unknown; text?: unknown; file?: unknown }
+		| undefined;
+	if (!params || (params.origin === undefined) === (params.sessionId === undefined))
+		throw new ProtocolError("invalid_params", "chat.deliver requires exactly one of origin or sessionId");
+	let origin: OriginRef;
+	try {
+		if (params.sessionId !== undefined) {
+			if (typeof params.sessionId !== "string" || !params.sessionId) throw new Error("invalid sessionId");
+			const binding = options.database.sessionIdentityRows().find((row) => row.gjc_session_id === params.sessionId);
+			if (!binding) throw new Error("session has no bound conversation");
+			origin = parseOriginKey(binding.origin_key);
+		} else {
+			origin = validateOriginRef(params.origin as OriginRef);
+		}
+	} catch {
+		throw new ProtocolError("invalid_params", "chat.deliver requires a valid chat origin or bound sessionId");
+	}
+	if (!isChatPlatform(origin.platform))
+		throw new ProtocolError("invalid_params", `chat.deliver requires a ${describeChatPlatforms()} origin`);
+	const file = params.file as { path?: unknown; caption?: unknown } | undefined;
+	if (
+		(typeof params.text === "string") === (file !== undefined) ||
+		(params.text !== undefined &&
+			(typeof params.text !== "string" || !params.text.trim() || isSilenceToken(params.text))) ||
+		(file !== undefined &&
+			(!file ||
+				typeof file !== "object" ||
+				Array.isArray(file) ||
+				typeof file.path !== "string" ||
+				!isAbsolute(file.path) ||
+				(file.caption !== undefined && (typeof file.caption !== "string" || isSilenceToken(file.caption)))))
+	)
+		throw new ProtocolError("invalid_params", "chat.deliver requires non-silent text or an absolute file path");
+	if (file !== undefined) {
+		try {
+			if (!(await stat(file.path as string)).isFile()) throw new Error("not a regular file");
+		} catch {
+			throw new ProtocolError("invalid_params", "chat.deliver file must be a readable regular file");
+		}
+	}
+	if (
+		![...runtime.connections].some(
+			(recipient) => recipient.negotiated && recipient.client?.name === `adapter-${origin.platform}`,
+		)
+	)
+		throw new ProtocolError("no_adapter", `no ${origin.platform} adapter is connected`);
+	const deliveryId = crypto.randomUUID();
+	const text = file ? ((file.caption as string | undefined) ?? "") : (params.text as string);
+	const payload: ChatMessagePayload = {
+		turnId: deliveryId,
+		origin,
+		role: "assistant",
+		text,
+		final: true,
+		direct: true,
+		deliveryId,
+		...(file
+			? {
+					file: {
+						path: file.path as string,
+						...(file.caption === undefined ? {} : { caption: file.caption as string }),
+					},
+				}
+			: {}),
+	};
+	if (!options.database.withTransaction(() => runtime.delivery.persistInTransaction(payload)))
+		throw new Error("direct delivery id collision");
+	const result = await new Promise<ChatDeliverResult>((resolve) => {
+		const timeout = setTimeout(() => {
+			runtime.directSettlements.delete(deliveryId);
+			resolve({
+				deliveryId,
+				delivered: false,
+				uncertain: true,
+				reason: `delivery was not confirmed within ${options.deliverSettlementTimeoutMs ?? 30_000}ms`,
+			});
+		}, options.deliverSettlementTimeoutMs ?? 30_000);
+		runtime.directSettlements.set(deliveryId, (settlement) => {
+			clearTimeout(timeout);
+			runtime.directSettlements.delete(deliveryId);
+			resolve(settlement);
+		});
+		broadcastDelivery(runtime, payload);
+	});
+	connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+}
+
 async function sendChat(
 	connection: Connection,
 	request: RequestFrame,
@@ -1807,7 +1935,20 @@ async function createInboundTurnLifecycle(
 	const deliverAssistantText = async (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
 		let message = rawMessage;
-		const reactionReply = parseReactionReply(message);
+		// A leading silence marker followed only by a reaction directive is still
+		// control-only, even though the reaction parser expects the directive first.
+		const silentPrefix = /^\[(?:SILENT|silent)\]/.exec(message.trim());
+		if (silentPrefix && parseReactionReply(message.trim().slice(silentPrefix[0].length))?.body === "") return;
+		let reactionReply = parseReactionReply(message);
+		if (
+			reactionReply?.reactions.some(
+				(wanted) => !reactionTargetMessageId(origin, wanted.targetMessageId ?? row.message_id),
+			)
+		) {
+			// Preserve the reply rather than minting a guaranteed-undeliverable reaction.
+			console.error(`gateway reaction skipped for ${key}: invalid target message id`);
+			reactionReply = undefined;
+		}
 		if (reactionReply && reactionsClaimedFor.has(rawMessage)) {
 			message = reactionReply.body;
 			if (!message) return;
@@ -1821,7 +1962,8 @@ async function createInboundTurnLifecycle(
 					);
 					continue;
 				}
-				const targetMessageId = wanted.targetMessageId ?? row.message_id;
+				const targetMessageId = reactionTargetMessageId(origin, wanted.targetMessageId ?? row.message_id);
+				if (!targetMessageId) continue;
 				const rejection = runtime.reactions.claim({ turnId, originKey: key, targetMessageId, emoji: wanted.emoji });
 				if (rejection) {
 					console.error(
@@ -1840,15 +1982,13 @@ async function createInboundTurnLifecycle(
 			message = reactionReply.body;
 			if (!message) return;
 		}
-		// Control tokens are internal protocol, never user-visible. Models routinely
-		// wrap them in a "reasoning" preamble ("...nothing to add.\n\n[SILENT]"), so a
-		// part is judged by whether it CONTAINS the token, not whether it equals it:
-		// any part carrying a silence token is dropped whole, and [REPLY:id] is
-		// honoured wherever it appears and always stripped from the delivered text.
+		// A standalone final marker also suppresses a reasoning preamble, but a
+		// marker quoted inside an ordinary answer must not swallow that answer.
+		// [REPLY:id] is routing metadata and is stripped from delivered text.
 		const spokenParts = message
 			.split(/\n\s*\[BREAK\]\s*\n?/)
 			.map((part) => part.trim())
-			.filter((part) => part.length > 0 && !isSilenceToken(part) && !containsSilenceToken(part))
+			.filter((part) => part.length > 0 && !isSilenceToken(part) && !/\n\s*\[(?:SILENT|silent)\]\s*$/.test(part))
 			.slice(0, 5);
 		// A persona that decided not to speak often says so instead of emitting
 		// the token (#260). On gated traffic, such a part is dropped like one.

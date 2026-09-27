@@ -14,6 +14,7 @@ export const ERROR_CODES = [
 	// verbs
 	"unknown_verb",
 	"invalid_params",
+	"no_adapter",
 	"verb_failed",
 	// lifecycle / policy
 	"gateway_shutting_down",

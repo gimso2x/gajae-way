@@ -622,8 +622,25 @@ for (const [emoji, emojiName, name] of [
 		expect(gateway.requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery" } }]);
 	});
 
+test("Slack reaction resolves a native timestamp inside its thread's parent channel", async () => {
+	const api = new Api();
+	const gateway = new Gateway();
+	await settleSlackReaction(
+		gateway,
+		api,
+		delivery({
+			origin: { platform: "slack", kind: "thread", conversationId: "C1:1.000", parentId: "C1" },
+			reaction: { targetMessageId: "1790433923.203989", emoji: "✅", emojiName: "check" },
+		}),
+	);
+	expect(api.reactions).toEqual([["C1", "1790433923.203989", "white_check_mark"]]);
+	expect(api.posts).toEqual([]);
+	expect(gateway.requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery" } }]);
+});
+
 for (const [target, reason] of [
 	["broken", "malformed"],
+	["1790433923.203989:other", "malformed"],
 	["C2:1.000", "foreign channel"],
 ])
 	test(`Slack reaction rejects ${reason} target definitively`, async () => {

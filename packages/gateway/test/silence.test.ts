@@ -106,6 +106,19 @@ test("a spoken turn in the same open channel does deliver", async () => {
 	expect(message.payload.text).toContain("국밥");
 });
 
+test("a quoted silence marker in an explanation is delivered", async () => {
+	const reply = "무음 결과가 `[SILENT]`이면 종료합니다. 다른 결과와 `[SILENT]`가 섞이면 답변을 보냅니다.";
+	const { frames, database } = await openChannelGateway(reply);
+	const messages = frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
+	expect(messages.map((frame) => frame.payload.text)).toEqual([reply]);
+	expect(database.inboundPendingCount("discord/channel/chan-1")).toBe(0);
+});
+
+test("a standalone final silence marker still suppresses a preamble", async () => {
+	const { frames } = await openChannelGateway("Nothing to add.\n\n[SILENT]");
+	expect(frames.some((frame) => frame.type === "event" && frame.event === "chat.message")).toBe(false);
+});
+
 test("a silent turn still marks its inbound message done so the queue does not stall", async () => {
 	const { database } = await openChannelGateway("[SILENT]");
 	expect(database.inboundPendingCount("discord/channel/chan-1")).toBe(0);

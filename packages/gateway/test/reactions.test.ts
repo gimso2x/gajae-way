@@ -595,3 +595,71 @@ test("a slack channel origin is a chat platform: send, react, and inbound reacti
 	expect(database.deliveryRows()).toHaveLength(3);
 	expect(turns).toHaveLength(1);
 });
+
+test("Slack chat.react canonicalizes native timestamps and refuses foreign or malformed targets before persisting", async () => {
+	const { client, database } = await gateway("unused");
+	const origin = { platform: "slack", kind: "thread", conversationId: "C1:1726543210.123456", parentId: "C1" };
+	for (const [id, targetMessageId] of [
+		["native", "1790433923.203989"],
+		["duplicate", "C1:1790433923.203989"],
+		["foreign", "C2:1790433923.203989"],
+		["malformed", "not-a-timestamp"],
+	] as const)
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "chat.react",
+			params: { origin, targetMessageId, emoji: "✅" },
+		});
+	await settle();
+	expect(reactionEvents(client.frames).map((event) => event.payload.reaction.targetMessageId)).toEqual([
+		"C1:1790433923.203989",
+	]);
+	for (const id of ["duplicate", "foreign", "malformed"])
+		expect(client.frames.find((frame) => frame.id === id).error.code).toBe("invalid_params");
+	expect(database.deliveryRows()).toHaveLength(1);
+});
+
+test("Slack reply reaction tokens normalize native timestamps before preparing delivery", async () => {
+	const origin = { platform: "slack", kind: "thread", conversationId: "C1:1726543210.123456", parentId: "C1" };
+	const send = (client: Client) =>
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "s1",
+			verb: "chat.send",
+			params: {
+				origin,
+				text: "ping",
+				messageId: "C1:1726543210.123456",
+				engagement: { mentioned: true, group: true, authorId: "human-1" },
+			},
+		});
+	const valid = await gateway("[REACT:✅@1790433923.203989]");
+	send(valid.client);
+	await settle();
+	expect(reactionEvents(valid.client.frames)[0].payload.reaction.targetMessageId).toBe("C1:1790433923.203989");
+	expect(valid.database.deliveryRows()).toHaveLength(1);
+});
+
+for (const reply of ["[REACT:✅@C2:1790433923.203989] 확인했습니다", "[REACT:✅@invalid]"])
+	test(`Slack reply with invalid target preserves ${reply} instead of creating a lost delivery`, async () => {
+		const { client, database } = await gateway(reply);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "s1",
+			verb: "chat.send",
+			params: {
+				origin: { platform: "slack", kind: "channel", conversationId: "C1" },
+				text: "ping",
+				messageId: "C1:1726543210.123456",
+				engagement: { mentioned: true, group: true, authorId: "human-1" },
+			},
+		});
+		await settle();
+		expect(reactionEvents(client.frames)).toHaveLength(0);
+		expect(textEvents(client.frames).map((event) => event.payload.text)).toEqual([reply]);
+		expect(database.deliveryRows()).toHaveLength(1);
+	});

@@ -63,6 +63,7 @@ export class SlackRateLimitedError extends Error {
 export const RATE_LIMIT_MAX_RETRIES = 3;
 export const RATE_LIMIT_MAX_WAIT_MS = 30_000;
 const RATE_LIMIT_DEFAULT_WAIT_MS = 1_000;
+export const SLACK_FILE_MAX_BYTES = 20 * 1024 * 1024;
 
 export interface SlackWebApiOptions {
 	readonly fetcher?: FetchLike;
@@ -269,6 +270,40 @@ export class SlackWebApi {
 			unfurl_links: false,
 			...(threadTs === undefined ? {} : { thread_ts: threadTs }),
 		});
+	}
+
+	async uploadFile(file: {
+		readonly channel: string;
+		readonly threadTs?: string;
+		readonly fileName: string;
+		readonly caption?: string;
+		readonly bytes: Uint8Array;
+		readonly mimeType?: string;
+	}): Promise<{ readonly fileId: string }> {
+		if (file.bytes.byteLength === 0) throw new SlackApiError(0, "empty_file", "Slack cannot upload an empty file");
+		if (file.bytes.byteLength > SLACK_FILE_MAX_BYTES)
+			throw new SlackApiError(0, "file_too_large", `Slack file exceeds ${SLACK_FILE_MAX_BYTES} bytes`);
+		const grant = await this.call<{ upload_url: string; file_id: string }>("files.getUploadURLExternal", {
+			filename: file.fileName,
+			length: file.bytes.byteLength,
+		});
+		if (typeof grant.upload_url !== "string" || typeof grant.file_id !== "string")
+			throw new SlackUnreadableResponseError(200);
+		// The presigned URL is a credential. Never attach the bot token to this request.
+		const uploaded = await this.fetcher(grant.upload_url, {
+			method: "POST",
+			headers: file.mimeType ? { "content-type": file.mimeType } : {},
+			body: file.bytes,
+		});
+		if (!uploaded.ok) throw new SlackApiError(uploaded.status, `http_${uploaded.status}`);
+		await this.limiter?.acquire(file.channel);
+		await this.call("files.completeUploadExternal", {
+			files: [{ id: grant.file_id, title: file.fileName }],
+			channel_id: file.channel,
+			...(file.threadTs === undefined ? {} : { thread_ts: file.threadTs }),
+			...(file.caption === undefined ? {} : { initial_comment: file.caption }),
+		});
+		return { fileId: grant.file_id };
 	}
 
 	async addReaction(

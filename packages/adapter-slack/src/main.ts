@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import type {
 	ChannelEngagementPolicy,
@@ -9,7 +9,7 @@ import type {
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
-import { deliveryFailureIsAmbiguous, OutboundLimiter, SlackApiError, SlackWebApi } from "./api";
+import { deliveryFailureIsAmbiguous, OutboundLimiter, SLACK_FILE_MAX_BYTES, SlackApiError, SlackWebApi } from "./api";
 import { describeInboundBody, type SlackFileCarrier } from "./attachments";
 import { SlackDirectory } from "./author";
 import { adapterHome, type LoadedSlackAdapterConfig, loadSlackAdapterConfig } from "./config";
@@ -287,9 +287,23 @@ export function replyThreadTs(message: Pick<ChatMessagePayload, "origin" | "repl
 	return target.ts;
 }
 
+export async function assertBotMembership(
+	api: Pick<SlackWebApi, "conversationsInfo">,
+	channel: string,
+	kind: OriginRef["kind"],
+): Promise<void> {
+	if (kind === "dm") return;
+	const info = await api.conversationsInfo(channel);
+	if ((info as typeof info & { is_member?: boolean }).is_member === false)
+		throw new SlackApiError(0, "not_in_channel", `Slack bot is not a member of ${channel}`);
+}
+
+type DeliveryApi = Pick<SlackWebApi, "postMessage" | "addReaction"> &
+	Partial<Pick<SlackWebApi, "conversationsInfo" | "uploadFile">>;
+
 export async function settleSlackDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
-	api: Pick<SlackWebApi, "postMessage" | "addReaction">,
+	api: DeliveryApi,
 	message: ChatMessagePayload,
 	_log: Pick<Console, "error"> = console,
 	status?: Pick<WorkingStatus, "clear">,
@@ -309,13 +323,44 @@ export async function settleSlackDelivery(
 		const channel = deliveryChannel(message.origin);
 		// Routing is decided before any write, so a bad target never half-posts.
 		const threadTs = replyThreadTs(message);
+		const attachment = message.file;
+		let bytes: Uint8Array | undefined;
+		let mimeType: string | undefined;
+		if (attachment) {
+			const local = Bun.file(attachment.path);
+			try {
+				if (!(await local.exists())) throw new SlackApiError(0, "file_unavailable");
+				if (local.size > SLACK_FILE_MAX_BYTES) throw new SlackApiError(0, "file_too_large");
+				bytes = new Uint8Array(await local.arrayBuffer());
+			} catch (error) {
+				if (error instanceof SlackApiError && error.code === "file_too_large") throw error;
+				throw new SlackApiError(0, "file_unavailable", `Slack delivery file unavailable: ${attachment.path}`);
+			}
+			mimeType = local.type || undefined;
+		}
+		if (message.direct && message.origin.kind !== "dm") {
+			if (!api.conversationsInfo) throw new SlackApiError(0, "membership_unavailable");
+			await assertBotMembership({ conversationsInfo: api.conversationsInfo.bind(api) }, channel, message.origin.kind);
+		}
 		// Mentions are repaired before Markdown \u2192 mrkdwn: a `<@U\u2026>` the model wrapped
 		// in backticks, a bare `@U\u2026`, or an `@handle` the directory knows, all become
 		// a real ping instead of literal text. Unknown or ambiguous names are left alone.
 		const repaired = mentions ? repairMentions(message.text, mentions) : message.text;
 		const text = markdownToMrkdwn(message.duplicateWarning ? `[recovered - may be a duplicate] ${repaired}` : repaired);
 		// Every chunk must stay in the same Slack thread, not just the first chunk.
-		for (const chunk of chunkSlackMessage(text)) await api.postMessage(channel, chunk, threadTs);
+		if (text || !attachment)
+			for (const chunk of chunkSlackMessage(text)) await api.postMessage(channel, chunk, threadTs);
+		if (attachment && bytes) {
+			if (!api.uploadFile) throw new SlackApiError(0, "upload_unavailable");
+			await api.uploadFile({
+				channel,
+				threadTs,
+				fileName: basename(attachment.path),
+				caption: attachment.caption,
+				bytes,
+				mimeType,
+			});
+		}
 		// voiceText is intentionally ignored: Slack has no bot voice messages.
 		await gateway.request("delivery.confirm", { deliveryId });
 	} catch (error) {
@@ -338,9 +383,14 @@ export async function settleSlackReaction(
 	if (message.origin.platform !== "slack" || !message.deliveryId || !message.reaction) return;
 	const deliveryId = message.deliveryId;
 	try {
-		const target = parseSlackMessageId(message.reaction.targetMessageId);
+		const channel = deliveryChannel(message.origin);
+		// Slack also identifies a message by its native timestamp. A reaction
+		// requested with that form is scoped to this delivery's channel; a
+		// channel-qualified id must still name this same channel.
+		const id = message.reaction.targetMessageId;
+		const target = parseSlackMessageId(/^\d+\.\d+$/.test(id) ? `${channel}:${id}` : id);
 		if (!target) throw new SlackApiError(0, "invalid_target", "Slack reaction target has a malformed message id");
-		if (target.channel !== deliveryChannel(message.origin))
+		if (target.channel !== channel)
 			throw new SlackApiError(0, "invalid_target", "Slack reaction target belongs to a foreign channel");
 		await api.addReaction(target.channel, target.ts, slackReactionFor(message.reaction));
 		await gateway.request("delivery.confirm", { deliveryId });
@@ -355,7 +405,7 @@ export async function settleSlackReaction(
 
 export function subscribeSlackDeliveries(
 	gateway: GatewayClientLike,
-	api: Pick<SlackWebApi, "postMessage" | "addReaction">,
+	api: DeliveryApi,
 	log: Pick<Console, "error"> = console,
 	status?: Pick<WorkingStatus, "clear">,
 	mentions?: MentionDirectory,
@@ -418,7 +468,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 
 	constructor(
 		readonly socketPath: string,
-		readonly api: Pick<SlackWebApi, "postMessage" | "addReaction">,
+		readonly api: DeliveryApi,
 		initialClient?: GatewayClientLike,
 		readonly status?: WorkingStatus,
 		readonly mentions?: MentionDirectory,

@@ -225,6 +225,22 @@ export interface ChatSendResult {
 	readonly engaged: boolean;
 }
 
+/** Direct platform delivery, independent of an inbound turn. */
+export interface ChatDeliverParams {
+	readonly origin?: OriginRef;
+	/** Resolve the currently bound conversation of this session when origin is absent. */
+	readonly sessionId?: string;
+	readonly text?: string;
+	readonly file?: { readonly path: string; readonly caption?: string };
+}
+
+export interface ChatDeliverResult {
+	readonly deliveryId: string;
+	readonly delivered: boolean;
+	readonly uncertain?: boolean;
+	readonly reason?: string;
+}
+
 export interface ChatMessagePayload {
 	readonly turnId: string;
 	readonly origin: OriginRef;
@@ -238,6 +254,10 @@ export interface ChatMessagePayload {
 	 * delivery.confirm / delivery.fail.
 	 */
 	readonly deliveryId?: string;
+	/** A direct send, not an assistant reply to an inbound turn. */
+	readonly direct?: boolean;
+	/** A local file the adapter must upload; text is its caption or an empty string. */
+	readonly file?: { readonly path: string; readonly caption?: string };
 	/** Platform message id this message replies to (reply-threading), when the persona chose one. */
 	readonly replyToMessageId?: string;
 	/** True when re-emitted from the ledger after a restart. */
@@ -731,6 +751,7 @@ export interface VerbCatalogV01 {
 	"gateway.shutdown": { params: undefined; result: { readonly stopping: true } };
 	"gateway.reloadConfig": { params: undefined; result: ConfigReloadResult };
 	"chat.send": { params: ChatSendParams; result: ChatSendResult };
+	"chat.deliver": { params: ChatDeliverParams; result: ChatDeliverResult };
 	"chat.edit": { params: ChatEditParams; result: ChatEditResult };
 	"delivery.confirm": { params: DeliveryConfirmParams; result: { readonly settled: true } };
 	"delivery.fail": { params: DeliveryFailParams; result: { readonly recorded: true } };
@@ -779,6 +800,7 @@ export const VERBS_V01 = [
 	"gateway.status",
 	"gateway.shutdown",
 	"chat.send",
+	"chat.deliver",
 	"chat.edit",
 	"delivery.confirm",
 	"delivery.fail",
