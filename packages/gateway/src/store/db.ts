@@ -2561,6 +2561,17 @@ export class GatewayDatabase {
 	monitorDelete(id: string): boolean {
 		return this.#database.query("DELETE FROM monitors WHERE monitor_id = ?").run(id).changes > 0;
 	}
+	/**
+	 * Updates ONLY the authoring instruction. The monitor id, trigger, created_at
+	 * and the cron slot ledger (keyed by monitor id) are untouched by
+	 * construction, so an instruction edit never re-creates the monitor and never
+	 * re-opens already-fired slots. Null clears the instruction.
+	 */
+	monitorUpdateInstruction(id: string, instruction: string | null): boolean {
+		return (
+			this.#database.query("UPDATE monitors SET instruction = ? WHERE monitor_id = ?").run(instruction, id).changes > 0
+		);
+	}
 	monitorEventCreate(row: {
 		eventId: string;
 		monitorId: string;

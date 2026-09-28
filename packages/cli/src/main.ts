@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { Database } from "bun:sqlite";
+import { readFileSync } from "node:fs";
 import { copyFile, lstat, readFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type {
@@ -516,6 +517,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				const client = await GajaewayClient.connectSocket(parsed.socket);
 				try {
 					const [command, ...args] = parsed.rest;
+					const usage = `usage: gajaeway monitors add --json '<MonitorSpec json>'|list [--json] [--fields ${columnNames(MONITOR_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <id>|remove <id>|set-instruction <id> --text <t>|--file <p>|--clear|test <id> [--type T] [--payload J]`;
 					if (command === "add" && args[0] === "--json" && args[1])
 						console.log(JSON.stringify(await client.request("monitor.add", JSON.parse(args[1]))));
 					else if (command === "list") {
@@ -530,7 +532,39 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						console.log(JSON.stringify(await client.request("monitor.inspect", { monitorId: args[0] })));
 					else if (command === "remove" && args[0])
 						console.log(JSON.stringify(await client.request("monitor.remove", { monitorId: args[0] })));
-					else if (command === "test" && args[0]) {
+					else if (command === "set-instruction" && args[0]) {
+						// Rewrites ONLY the instruction: the monitor keeps its id, trigger,
+						// created_at and cron slot ledger. Exactly one of --text/--file/--clear.
+						let text: string | undefined;
+						let file: string | undefined;
+						let clear = false;
+						const seen = new Set<string>();
+						for (let i = 1; i < args.length; i++) {
+							const arg = args[i];
+							if (arg !== "--text" && arg !== "--file" && arg !== "--clear") throw new Error(usage);
+							// Duplicates and flag-as-value (`--text --clear`) are usage
+							// errors BEFORE any request: a flag must never be consumed
+							// as the instruction it was meant to guard.
+							if (seen.has(arg)) throw new Error(usage);
+							seen.add(arg);
+							if (arg === "--clear") {
+								clear = true;
+								continue;
+							}
+							const value = args[i + 1];
+							if (value === undefined || value === "--text" || value === "--file" || value === "--clear")
+								throw new Error(usage);
+							if (arg === "--text") text = value;
+							else file = value;
+							i++;
+						}
+						const modes = [text !== undefined, file !== undefined, clear].filter(Boolean).length;
+						if (modes !== 1) throw new Error(usage);
+						const instruction = clear ? null : file !== undefined ? readFileSync(file, "utf8") : text!;
+						console.log(
+							JSON.stringify(await client.request("monitor.setInstruction", { monitorId: args[0], instruction })),
+						);
+					} else if (command === "test" && args[0]) {
 						let eventType: string | undefined;
 						let payload: unknown = {};
 						for (let i = 1; i < args.length; i++) {
@@ -546,10 +580,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 								}),
 							),
 						);
-					} else
-						throw new Error(
-							`usage: gajaeway monitors add --json '<MonitorSpec json>'|list [--json] [--fields ${columnNames(MONITOR_COLUMNS).join(",")}] [--limit N] [--offset N]|inspect <id>|remove <id>|test <id> [--type T] [--payload J]`,
-						);
+					} else throw new Error(usage);
 				} finally {
 					await client.close();
 				}

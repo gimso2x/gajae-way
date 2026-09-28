@@ -118,6 +118,11 @@ gajaeway monitors list --json
 gajaeway monitors list --fields id,name,schedule --limit 20 --offset 20
 gajaeway monitors inspect <monitor-id>
 gajaeway monitors test <monitor-id> --type review.due --payload '{"source":"manual"}'
+gajaeway monitors set-instruction <monitor-id> --text '가장 오래된 항목 하나만 세 줄로 요약한다'
+gajaeway monitors set-instruction <monitor-id> --file ./instruction.txt
+gajaeway monitors set-instruction <monitor-id> --clear
 ```
 
 `list` prints a one-line-per-monitor table (`id`, `name`, `schedule`, `events`, `target`, `enabled`); `--json` emits the raw monitor records. `--fields a,b,c` selects columns (an unknown name errors and lists the valid names) and `--limit N` / `--offset N` page the rows; both apply to `--json` as well. `sessions list` accepts the same flags. `inspect` returns the selected monitor and its recent event records. `test` submits an event and returns its `eventId`; omit `--type` to use the monitor’s first declared type. See [deployment](deployment.md) for `webhook`, `watcherRoots`, and `scriptRoot` configuration.
+
+`set-instruction` rewrites ONLY the instruction of an existing monitor: the monitor id, trigger, created_at, and the cron slot ledger are untouched, so an instruction edit never re-creates the monitor and never re-opens already-fired slots. Exactly one of `--text`, `--file`, `--clear` is allowed; the text is capped at 4000 characters and an unknown monitor id is an error. The change takes effect on the running gateway immediately (no restart). When the new instruction carries a silence rule (it names the bracketed `[SILENT]` token), built-in guidance that mandates report content in the note for that event type stands down in the authoring prompt — the instruction owns the note semantics.

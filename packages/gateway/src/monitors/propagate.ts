@@ -1,6 +1,7 @@
 import {
 	CATCH_ALL_EVENT_ORIGIN,
 	type ChatMessagePayload,
+	containsSilenceToken,
 	eventTypeOrigin,
 	isSilenceToken,
 	type MonitorEventRecord,
@@ -44,6 +45,17 @@ const MAINTENANCE_GUIDANCE: Record<string, string | undefined> = {
 	"memory.audit":
 		"For memory.audit events: run the memory validator (gajaeway memory audit) and put a one-line pass report or the failure diagnostics plus your repair attempt into the note.",
 };
+
+/**
+ * Built-in guidance entries that mandate report content in the note. When a
+ * monitor's own instruction defines a silence rule, these are dropped from the
+ * authoring prompt: an instruction that orders the note to be exactly
+ * `[SILENT]` and a built-in that orders a pass report into the note cannot
+ * both win, and the instruction is what the owner actually asked for.
+ * Mechanics-only guidance (memory.canonicalize file layout) does not conflict
+ * and still applies.
+ */
+const NOTE_REPORT_GUIDANCE_TYPES: ReadonlySet<string> = new Set(["memory.audit"]);
 
 /**
  * Stable, public-safe dispatch failure codes. The raw error message is NEVER
@@ -405,6 +417,18 @@ export class MonitorPropagator {
 			for (const row of this.#database.monitorEventRows(undefined, "oldest")) {
 				if ((TERMINAL_STAGES as readonly string[]).includes(row.stage)) continue;
 				const output = this.#database.authoredOutput(row.event_id);
+				// Pre-atomic upgrade artifact repair: the old two-write path could
+				// crash between committing output+intent (stage `authored`) and the
+				// separate terminal settle, stranding a silent note on the live
+				// `authored` stage forever (reconcile skipped it: output+intent
+				// present, stage not recoverable). A silence-token note must never
+				// be delivered, so settle it terminally right here — no re-author,
+				// no delivery. Spoken `authored` rows are left to the delivery path
+				// and are NOT touched by this repair.
+				if (row.stage === "authored" && output && isSilenceToken(output)) {
+					this.#database.monitorEventUpdate(row.event_id, "authored_no_delivery");
+					continue;
+				}
 				const hasMemory = this.#database
 					.memoryIntentRows()
 					.some((intent) => intent.kind === "monitor-event" && intent.payload_json.includes(row.event_id));
@@ -596,11 +620,26 @@ export class MonitorPropagator {
 				// Guidance order: the monitor's own instruction first (it is what the
 				// owner actually asked this monitor to do), then any built-in
 				// maintenance semantics for the claimed event types. Without either,
-				// the authoring turn only gets the receipt-note contract.
+				// the authoring turn only gets the receipt-note contract. An
+				// instruction that carries a silence rule (it names the bracketed
+				// `[SILENT]` token) owns the note semantics outright, so built-in
+				// guidance that mandates report content in the note is dropped —
+				// "write a pass report into the note" must not out-shout "when there
+				// is nothing to do the note is exactly [SILENT]". Mechanics-only
+				// built-ins stay, and a monitor with no instruction keeps every
+				// built-in exactly as before.
+				const instruction = monitor.instruction?.trim() || undefined;
+				const silenceRule = instruction !== undefined && containsSilenceToken(instruction);
 				const maintenance = claimed
-					.map((row) => MAINTENANCE_GUIDANCE[row.event_type])
-					.filter((entry, index, all) => entry && all.indexOf(entry) === index);
-				const guidance = [monitor.instruction?.trim() || undefined, ...maintenance].filter(Boolean).join(" ");
+					.map((row) => ({ eventType: row.event_type, guidance: MAINTENANCE_GUIDANCE[row.event_type] }))
+					.filter(
+						(entry, index, all): entry is { eventType: string; guidance: string } =>
+							entry.guidance !== undefined &&
+							all.findIndex((candidate) => candidate.guidance === entry.guidance) === index,
+					)
+					.filter((entry) => !(silenceRule && NOTE_REPORT_GUIDANCE_TYPES.has(entry.eventType)))
+					.map((entry) => entry.guidance);
+				const guidance = [instruction, ...maintenance].filter(Boolean).join(" ");
 				const prompt = `Author monitor events.${guidance ? ` ${guidance}` : ""}${digest ? `\n${digest}\n` : ""} Respond ONLY with a JSON array containing exactly one {"eventId","note"} entry per event: ${JSON.stringify(claimed.map((row) => ({ eventId: row.event_id, eventType: row.event_type, payload: JSON.parse(row.payload_json) })))}`;
 				const opRef = `gw-m-${batchId.replaceAll("-", "")}`;
 				dispatchPhase = "request";
@@ -659,6 +698,21 @@ export class MonitorPropagator {
 				for (const id of claimedIds) {
 					if (!seenIds.has(id)) throw new Error(`authoring response omits event ${id}`);
 				}
+				// Silence classification happens BEFORE any write: a note that IS a
+				// silence token is authored straight into the terminal
+				// `authored_no_delivery` stage by the SAME lease-fenced transaction
+				// that commits its output and memory intent (noDelivery=true), so a
+				// crash can never strand an output+intent row on the live `authored`
+				// stage — that pre-atomic shape is one reconcile can neither settle
+				// nor re-deliver.
+				const entries = authored.flatMap((entry) =>
+					typeof entry.eventId === "string" &&
+					typeof entry.note === "string" &&
+					fenced.some((row) => row.event_id === entry.eventId)
+						? [{ eventId: entry.eventId, note: entry.note }]
+						: [],
+				);
+				const silentIds = new Set(entries.filter((entry) => isSilenceToken(entry.note)).map((entry) => entry.eventId));
 				for (const entry of authored)
 					if (
 						typeof entry.eventId === "string" &&
@@ -672,7 +726,10 @@ export class MonitorPropagator {
 							entry.eventId,
 							leaseId,
 							entry.note,
-							false,
+							// Silent notes settle terminally INSIDE this transaction
+							// (output + intent + authored_no_delivery); spoken notes stay
+							// authored until delivery admission.
+							silentIds.has(entry.eventId),
 							row.event_type,
 							intentId,
 							JSON.stringify(eventTypeOrigin(row.event_type)),
@@ -686,7 +743,7 @@ export class MonitorPropagator {
 							monitorId: monitor.monitorId,
 							eventType: row.event_type,
 							firedAt: row.fired_at,
-							stage: "authored",
+							stage: silentIds.has(entry.eventId) ? "authored_no_delivery" : "authored",
 						});
 					}
 				dispatchPhase = "delivery";
@@ -703,44 +760,45 @@ export class MonitorPropagator {
 					}
 					return;
 				}
+				// Batch join rule: the delivered text joins ONLY the non-silent notes.
+				// An all-silent batch produces no delivery at all — `[SILENT]\n[SILENT]`
+				// must never reach the owner — while a mixed batch still delivers the
+				// spoken notes. Silent events were already settled terminally by the
+				// atomic authoring write above, so a restart can neither re-author nor
+				// re-deliver them.
+				const deliverable = fenced.filter((row) => !silentIds.has(row.event_id));
+				if (!deliverable.length) return;
 				// Fenced delivery admission: the ledger insert is conditional on every
-				// fenced event still holding its lease (same transaction). A stale
+				// delivered event still holding its lease (same transaction). A stale
 				// attempt therefore cannot emit a second delivery.
 				const deliveryId = crypto.randomUUID();
-				const deliveryText = authored
-					.filter(
-						(entry): entry is { eventId: string; note: string } =>
-							typeof entry.eventId === "string" &&
-							typeof entry.note === "string" &&
-							fenced.some((row) => row.event_id === entry.eventId),
-					)
+				const deliveryText = entries
+					.filter((entry) => !silentIds.has(entry.eventId))
 					.map((entry) => entry.note)
 					.join("\n");
-				if (!isSilenceToken(deliveryText)) {
-					const origin = target.origin;
-					const payload: ChatMessagePayload = {
-						turnId: batchId,
-						origin,
-						role: "assistant",
-						text: deliveryText,
-						final: true,
-						deliveryId,
-					};
-					const admitted = this.#database.monitorDeliveryPrepareFenced(
-						deliveryId,
-						batchId,
-						originKey(origin),
-						JSON.stringify(payload),
-						fenced.map((row) => row.event_id),
-						leaseId,
-					);
-					if (!admitted) return;
-					this.#delivery.markInflight(deliveryId);
-					// Push to live adapters NOW: without this the note sat in the ledger
-					// until the next adapter reconnect flushed redeliveries (live finding:
-					// owner-DM canonicalize note stuck inflight for minutes).
-					this.#deliver?.(payload);
-				}
+				const origin = target.origin;
+				const payload: ChatMessagePayload = {
+					turnId: batchId,
+					origin,
+					role: "assistant",
+					text: deliveryText,
+					final: true,
+					deliveryId,
+				};
+				const admitted = this.#database.monitorDeliveryPrepareFenced(
+					deliveryId,
+					batchId,
+					originKey(origin),
+					JSON.stringify(payload),
+					deliverable.map((row) => row.event_id),
+					leaseId,
+				);
+				if (!admitted) return;
+				this.#delivery.markInflight(deliveryId);
+				// Push to live adapters NOW: without this the note sat in the ledger
+				// until the next adapter reconnect flushed redeliveries (live finding:
+				// owner-DM canonicalize note stuck inflight for minutes).
+				this.#deliver?.(payload);
 			} catch (error) {
 				// Public-safe structured evidence only: a stable phase code and event ids.
 				// The raw error body can carry secrets and is never persisted or logged.
