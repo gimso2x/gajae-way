@@ -148,6 +148,27 @@ export class MonitorRegistry {
 	remove(monitorId: string): boolean {
 		return this.#database.withTransaction(() => this.#database.monitorDelete(monitorId));
 	}
+	/**
+	 * Rewrites ONLY the authoring instruction of an existing monitor (null
+	 * clears it). Identity stays put by construction: the monitor id, trigger,
+	 * created_at and the cron slot ledger — which is keyed by monitor id — are
+	 * never touched, so no re-add cycle (new id, new cron slots) is needed.
+	 * The write goes through the same normalisation and 4000-character cap as
+	 * `add`, and an unknown id is an error, not a silent no-op.
+	 */
+	setInstruction(monitorId: string, instruction: string | null): MonitorRecord {
+		if (instruction !== null && typeof instruction !== "string")
+			throw new Error("monitor instruction must be a string or null");
+		if (typeof instruction === "string" && instruction.length > MONITOR_INSTRUCTION_MAX_LENGTH)
+			throw new Error(`monitor instruction must be at most ${MONITOR_INSTRUCTION_MAX_LENGTH} characters`);
+		const updated = this.#database.withTransaction(() =>
+			this.#database.monitorUpdateInstruction(monitorId, instruction?.trim() || null),
+		);
+		if (!updated) throw new Error("unknown monitor");
+		const record = this.get(monitorId);
+		if (!record) throw new Error("unknown monitor");
+		return record;
+	}
 }
 
 function rowToRecord(row: ReturnType<GatewayDatabase["monitorRows"]>[number]): MonitorRecord {

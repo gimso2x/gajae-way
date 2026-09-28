@@ -3561,6 +3561,18 @@ export class GatewayDatabase {
 		return deleted;
 	}
 	/**
+	 * Updates ONLY the authoring instruction. The monitor id, trigger, created_at
+	 * and the cron slot ledger (keyed by monitor id) are untouched by
+	 * construction, so an instruction edit never re-creates the monitor and never
+	 * re-opens already-fired slots. Null clears the instruction.
+	 */
+	monitorUpdateInstruction(id: string, instruction: string | null): boolean {
+		return (
+			this.#database.query("UPDATE monitors SET instruction = ? WHERE monitor_id = ?").run(instruction, id).changes > 0
+		);
+	}
+
+	/**
 	 * Admits one monitor event. Under the `skip` overlap policy the predecessor
 	 * check and the insert share one statement, so two concurrent fires can never
 	 * both see "nothing in flight": the event lands as terminal `skipped` naming

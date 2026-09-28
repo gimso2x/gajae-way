@@ -1338,6 +1338,20 @@ async function handleRequest(
 			void runtime.monitorRuntime.refresh();
 			return;
 		}
+		case "monitor.setInstruction": {
+			const params = request.params as { monitorId?: unknown; instruction?: unknown } | undefined;
+			if (!params || typeof params.monitorId !== "string")
+				throw new ProtocolError("invalid_params", "monitor.setInstruction requires monitorId");
+			if (params.instruction !== null && typeof params.instruction !== "string")
+				throw new ProtocolError("invalid_params", "monitor.setInstruction requires an instruction string or null");
+			try {
+				const monitor = runtime.registry.setInstruction(params.monitorId, params.instruction as string | null);
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { monitor } });
+			} catch (error) {
+				throw new ProtocolError("invalid_params", diagnostic(error) || "unknown monitor");
+			}
+			return;
+		}
 		case "chat.react": {
 			// React to ONE named message. The target id is mandatory: "react to the last
 			// message" is unimplementable without racing whoever spoke next, so it is not

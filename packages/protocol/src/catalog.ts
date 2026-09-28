@@ -969,6 +969,10 @@ export interface VerbCatalogV01 {
 	};
 	"monitor.test": { params: MonitorTestParams; result: { readonly eventId: string } };
 	"monitor.remove": { params: { readonly monitorId: string }; result: { readonly removed: true } };
+	"monitor.setInstruction": {
+		params: { readonly monitorId: string; readonly instruction: string | null };
+		result: { readonly monitor: MonitorRecord };
+	};
 	"ops.backup": {
 		params: { readonly path: string };
 		result: { readonly path: string; readonly bytes: number };
@@ -1014,6 +1018,7 @@ export const VERBS_V01 = [
 	"monitor.inspect",
 	"monitor.test",
 	"monitor.remove",
+	"monitor.setInstruction",
 	"ops.backup",
 	"ops.redeliver",
 	"ops.integrity",

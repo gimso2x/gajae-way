@@ -47,6 +47,117 @@ describe("cli arguments", () => {
 		}
 	});
 
+	test("monitors set-instruction sends exactly one of --text/--file/--clear and refuses flag mixes", async () => {
+		const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-set-instruction-"));
+		const path = join(home, "fake.sock");
+		const file = join(home, "instruction.txt");
+		await writeFile(file, "파일에서 읽은 지시문", "utf8");
+		const received: Array<{ verb: string; params: unknown }> = [];
+		const output: string[] = [];
+		const errors: string[] = [];
+		const originalLog = console.log;
+		const originalError = console.error;
+		const previousExit = process.exitCode;
+		console.log = (line: unknown) => output.push(String(line));
+		console.error = (line: unknown) => errors.push(String(line));
+		const listener = Bun.listen<{ buffer: string }>({
+			unix: path,
+			socket: {
+				open(socket) {
+					socket.data = { buffer: "" };
+				},
+				data(socket, data) {
+					socket.data.buffer += Buffer.from(data).toString("utf8");
+					let newline = socket.data.buffer.indexOf("\n");
+					while (newline >= 0) {
+						const line = socket.data.buffer.slice(0, newline);
+						socket.data.buffer = socket.data.buffer.slice(newline + 1);
+						const frame = JSON.parse(line) as { type: string; id?: string; verb?: string; params?: unknown };
+						if (frame.type === "hello")
+							socket.write(
+								`${JSON.stringify({ v: "0.1", type: "negotiated", payload: { profileVersion: "v0.1" } })}\n`,
+							);
+						else if (frame.type === "request") {
+							const params = frame.params as { monitorId?: string; instruction?: string | null };
+							// Mirror the real gateway's two set-instruction refusals so the
+							// CLI's error surfacing (message + exit code) is exercised.
+							if (
+								params.monitorId === "no-such-monitor" ||
+								(typeof params.instruction === "string" && params.instruction.length > 4000)
+							) {
+								socket.write(
+									`${JSON.stringify({
+										v: "0.1",
+										type: "error",
+										id: frame.id,
+										error: {
+											code: "invalid_params",
+											message:
+												params.monitorId === "no-such-monitor"
+													? "unknown monitor"
+													: "monitor instruction must be at most 4000 characters",
+										},
+									})}\n`,
+								);
+							} else {
+								received.push({ verb: frame.verb as string, params: frame.params });
+								socket.write(
+									`${JSON.stringify({
+										v: "0.1",
+										type: "response",
+										id: frame.id,
+										result: { monitor: { monitorId: "m-1", instruction: null } },
+									})}\n`,
+								);
+							}
+						}
+						newline = socket.data.buffer.indexOf("\n");
+					}
+				},
+			},
+		});
+		try {
+			await main(["--socket", path, "monitors", "set-instruction", "m-1", "--text", "텍스트 지시문"]);
+			await main(["--socket", path, "monitors", "set-instruction", "m-1", "--file", file]);
+			await main(["--socket", path, "monitors", "set-instruction", "m-1", "--clear"]);
+			// Exactly one mode per call; --clear sends null, --file sends the file bytes.
+			expect(received).toEqual([
+				{ verb: "monitor.setInstruction", params: { monitorId: "m-1", instruction: "텍스트 지시문" } },
+				{ verb: "monitor.setInstruction", params: { monitorId: "m-1", instruction: "파일에서 읽은 지시문" } },
+				{ verb: "monitor.setInstruction", params: { monitorId: "m-1", instruction: null } },
+			]);
+			// Flag mixes and missing values are refused BEFORE any request leaves.
+			const before = received.length;
+			await main(["--socket", path, "monitors", "set-instruction", "m-1", "--text", "a", "--clear"]);
+			await main(["--socket", path, "monitors", "set-instruction", "m-1", "--text", "a", "--file", file]);
+			await main(["--socket", path, "monitors", "set-instruction", "m-1"]);
+			await main(["--socket", path, "monitors", "set-instruction", "m-1", "--text"]);
+			await main(["--socket", path, "monitors", "set-instruction", "m-1", "--text", "--clear"]);
+			await main(["--socket", path, "monitors", "set-instruction", "m-1", "--text", "a", "--text", "b"]);
+			await main(["--socket", path, "monitors", "set-instruction", "m-1", "--clear", "--clear"]);
+			await main(["--socket", path, "monitors", "set-instruction", "m-1", "--file", "--clear"]);
+			expect(received.length).toBe(before);
+			expect(errors.join("\n")).toContain("usage:");
+			expect(process.exitCode).toBe(1);
+			// Server-side refusals surface as the CLI's error output with exit 1 —
+			// unknown id and the 4000-character cap (acceptance e, CLI path).
+			await main(["--socket", path, "monitors", "set-instruction", "no-such-monitor", "--text", "x"]);
+			expect(errors.join("\n")).toContain("unknown monitor");
+			expect(process.exitCode).toBe(1);
+			const successLinesBefore = output.length;
+			await main(["--socket", path, "monitors", "set-instruction", "m-1", "--text", "x".repeat(4001)]);
+			expect(errors.join("\n")).toContain("at most 4000 characters");
+			expect(process.exitCode).toBe(1);
+			expect(output.length).toBe(successLinesBefore);
+		} finally {
+			console.log = originalLog;
+			console.error = originalError;
+			process.exitCode = previousExit ?? 0;
+			listener.stop(true);
+			await rm(home, { recursive: true, force: true });
+		}
+	});
+
 	test("ops redeliver sends either the delivery id or an ISO since value", async () => {
 		const home = await mkdtemp(join(tmpdir(), "gajaeway-cli-redeliver-"));
 		const path = join(home, "fake.sock");
