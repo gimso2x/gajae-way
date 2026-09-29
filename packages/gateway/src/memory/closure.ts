@@ -1,7 +1,8 @@
 import { appendFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { originKey, validateOriginRef } from "@gajae-gateway/protocol";
 import type { GatewayDatabase } from "../store/db";
-import { appendDaily, initializeMemory, memoryGit } from "./doctrine";
+import { appendDaily, CorpusWriter, initializeMemory, memoryGit } from "./doctrine";
 
 export interface DailyCaptureMutation {
 	readonly kind: "daily_capture" | "monitor-event";
@@ -15,6 +16,8 @@ type Intent = {
 	kind: string;
 	payload_json: string;
 	state: "queued" | "written" | "committed" | "receipted" | "quarantined";
+	attempts: number;
+	quarantine_reason: string | null;
 };
 export type RecoveryReport = {
 	queued: number;
@@ -33,10 +36,15 @@ export class MemoryClosureQueue {
 	failures = 0;
 	#initializing: Promise<RecoveryReport> | undefined;
 	readonly recovery: RecoveryReport = { queued: 0, written: 0, committed: 0, receipted: 0, quarantined: 0 };
+	/** Corpus commit lock: serializes all writes through one queue (#341). */
+	readonly #corpusLocks: Map<string, Promise<void>> = new Map();
+	/** Test hook: invoked after appendDaily, before commit (for #341 regression test). */
+	readonly #afterWrite?: () => Promise<void>;
 
-	constructor(database: GatewayDatabase, home: string) {
+	constructor(database: GatewayDatabase, home: string, options?: { afterWrite?: () => Promise<void> }) {
 		this.#database = database;
 		this.#home = home;
+		this.#afterWrite = options?.afterWrite;
 	}
 
 	get queueDepth(): number {
@@ -58,12 +66,23 @@ export class MemoryClosureQueue {
 	async #initialize(): Promise<RecoveryReport> {
 		await initializeMemory(this.#home);
 		for (const intent of this.#database.memoryIntentRows()) {
-			if (intent.state === "receipted" || intent.state === "quarantined") continue;
+			if (intent.state === "receipted") continue;
+			if (intent.state === "quarantined") {
+				const reason = intent.quarantine_reason ?? "reason unavailable (legacy quarantined intent)";
+				if (!intent.quarantine_reason) this.#database.memoryIntentQuarantine(intent.id, reason);
+				await this.#ensureQuarantineReceipt(intent.id, reason);
+				continue;
+			}
 			try {
 				await this.#recover(intent);
-			} catch {
-				this.#database.memoryIntentUpdate(intent.id, "quarantined");
+			} catch (error) {
+				const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+				this.#database.memoryIntentQuarantine(intent.id, reason);
 				this.recovery.quarantined++;
+				console.warn(
+					`memory_intent_quarantined id=${this.#logField(intent.id)} kind=${this.#logField(intent.kind)} origin=${this.#originKey(intent)} reason=${this.#logField(reason)}`,
+				);
+				await this.#ensureQuarantineReceipt(intent.id, reason);
 			}
 		}
 		return this.recovery;
@@ -119,6 +138,31 @@ export class MemoryClosureQueue {
 		await this.#tail;
 	}
 
+	/**
+	 * Serialize work through the corpus lock. Intent processing and autolink
+	 * coordinate commits to prevent races (#341).
+	 */
+	async coordinateCommit<T>(root: string, work: () => Promise<T>): Promise<T> {
+		const previous = this.#corpusLocks.get(root) ?? Promise.resolve();
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const current = previous.then(() => gate);
+		this.#corpusLocks.set(root, current);
+		await previous;
+		try {
+			return await work();
+		} finally {
+			release();
+			if (this.#corpusLocks.get(root) === current) this.#corpusLocks.delete(root);
+		}
+	}
+
+	getWriter(root: string): CorpusWriter {
+		return new CorpusWriter(root);
+	}
+
 	async #recover(intent: Intent): Promise<void> {
 		if (intent.state === "queued") this.recovery.queued++;
 		if (intent.state === "written") this.recovery.written++;
@@ -128,32 +172,53 @@ export class MemoryClosureQueue {
 	}
 
 	async #process(intent: Intent): Promise<void> {
+		this.#database.memoryIntentBeginAttempt(intent.id);
 		const root = await initializeMemory(this.#home);
 		const mutation = this.#parse(intent);
 		let state = intent.state;
+		let writtenPath: string | undefined;
+
+		// Before lock: appendDaily if needed (pass intent ID as unique marker)
 		if (state === "queued") {
-			await appendDaily(root, mutation.originRefJson, mutation.userText, mutation.replyText);
+			writtenPath = await appendDaily(root, mutation.originRefJson, mutation.userText, mutation.replyText, intent.id);
 			this.#database.memoryIntentUpdate(intent.id, "written");
 			state = "written";
 			this.#kill("after-write");
+			// Test hook: allow concurrent operations (e.g., autolink) to start between appendDaily and commit (#341)
+			if (this.#afterWrite) await this.#afterWrite();
 		}
+
 		const existing = await this.#commitFor(root, intent.id);
 		let commit = existing;
 		if (!commit) {
 			if (state !== "written") throw new Error(`memory intent ${intent.id} lacks recoverable written evidence`);
-			// Stage the whole corpus, not just the capture axis. Every registered axis —
-			// built-in, custom, or an axis a human curated by hand — is memory, so a
-			// reflection or an ops rule written between two captures would otherwise stay
-			// permanently untracked and drop out of the Git history the doctrine promises
-			// to review. Naming axes here would also silently miss any axis added later.
-			await memoryGit(root, ["add", "--all", "."]);
-			await memoryGit(root, ["commit", "-m", `Memory mutation\n\nGajaeway-Mutation-Id: ${intent.id}`]);
-			commit = await this.#commitFor(root, intent.id);
-			if (!commit) throw new Error(`memory intent ${intent.id} commit trailer missing`);
+
+			// Inside lock: serialize to prevent #341 (autolink + intent races)
+			commit = await this.coordinateCommit(root, async () => {
+				const writer = this.getWriter(root);
+				const trailer = `Gajaeway-Mutation-Id: ${intent.id}`;
+
+				// Stage everything (intent paths + any concurrent changes) and commit atomically
+				// The lock ensures autolink + intent don't race (#341)
+				await memoryGit(root, ["add", "--all", "."]);
+				const intentCommit = await writer.commit(`Memory mutation`, trailer);
+
+				// If nothing to commit, content already in HEAD (recovery case):
+				// find by intent ID marker in the entry
+				if (!intentCommit) {
+					const found = await writer.findCommitByTrailer(`intent-id: ${intent.id}`);
+					if (!found) throw new Error(`memory intent ${intent.id} content not found`);
+					return found;
+				}
+
+				return intentCommit;
+			});
+
 			this.#database.memoryIntentUpdate(intent.id, "committed");
 			state = "committed";
 			this.#kill("after-commit");
 		}
+
 		if (state !== "receipted") {
 			if (!(await this.#hasReceipt(intent.id))) {
 				await appendFile(
@@ -199,6 +264,42 @@ export class MemoryClosureQueue {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
 			throw error;
 		}
+	}
+
+	async #ensureQuarantineReceipt(id: string, reason: string): Promise<void> {
+		if (await this.#hasQuarantineReceipt(id)) return;
+		await appendFile(
+			join(this.#home, "memory-receipts.jsonl"),
+			`${JSON.stringify({ id, state: "quarantined", reason, at: new Date().toISOString() })}\n`,
+			"utf8",
+		);
+	}
+
+	async #hasQuarantineReceipt(id: string): Promise<boolean> {
+		try {
+			return (await readFile(join(this.#home, "memory-receipts.jsonl"), "utf8")).split("\n").some((line) => {
+				if (!line) return false;
+				const receipt = JSON.parse(line) as { id?: string; state?: string };
+				return receipt.id === id && receipt.state === "quarantined";
+			});
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw error;
+		}
+	}
+
+	#originKey(intent: Intent): string {
+		try {
+			const payload = JSON.parse(intent.payload_json) as { originRefJson?: unknown };
+			if (typeof payload.originRefJson !== "string") return "unknown";
+			return originKey(validateOriginRef(JSON.parse(payload.originRefJson) as never));
+		} catch {
+			return "unknown";
+		}
+	}
+
+	#logField(value: string): string {
+		return JSON.stringify(value).slice(1, -1);
 	}
 
 	#kill(point: string): void {

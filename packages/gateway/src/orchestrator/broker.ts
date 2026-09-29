@@ -21,9 +21,24 @@ export {
 	readBrokerDiscovery,
 } from "./broker-liveness";
 
-export const MIN_GJC_VERSION = "0.15.6";
+export const MIN_GJC_VERSION = "0.16.0";
 export const HEALTH_PROBE_SESSION_ID = "00000000-0000-4000-8000-000000000000";
 const COMMAND_TIMEOUT_MS = 30_000;
+// GJC's authoritative shared session flags are in packages/coding-agent/src/commands/sdk.ts;
+// value-taking options here keep literal --json payloads from becoming output flags.
+const SESSION_VALUE_OPTIONS = new Set([
+	"--cursor",
+	"--idempotency-key",
+	"--json-input",
+	"--op",
+	"--op-ref",
+	"--prompt",
+	"--query",
+	"--repo",
+	"--scope",
+	"--text",
+	"--timeout-ms",
+]);
 export type SpawnFn = typeof Bun.spawn;
 export type GjcCommandRunner = CliRunner;
 export type BrokerGenerationListener = (generation: number) => void;
@@ -51,6 +66,18 @@ export interface GlobalGjcClientOptions {
 	readonly readinessDelayMs?: number;
 	readonly reconnectBackoff?: { readonly initialMs?: number; readonly maxMs?: number };
 	readonly log?: (line: string) => void;
+	/**
+	 * How long a started client may keep failing to reach a broker whose own
+	 * discovery record says it is live before `onLiveOutageExceeded` fires.
+	 */
+	readonly liveOutageLimitMs?: number;
+	/**
+	 * The broker is up but this process has not reached it for
+	 * `liveOutageLimitMs`: the fault is on the gateway side, so the owner should
+	 * exit and let the service manager restart it (#246). A dead or absent broker
+	 * never fires this; restarting the gateway would not bring it back.
+	 */
+	readonly onLiveOutageExceeded?: (detail: string) => void;
 }
 export type GlobalGjcClientDependencies = Omit<GlobalGjcClientOptions, "cwd">;
 
@@ -186,8 +213,11 @@ export async function preflightGjcRuntime(
 			throw new Error(`gjc runtime preflight failed: requires gjc >= ${minimumVersion}`);
 		if (Number(version[i]) > Number(minimum[i])) break;
 	}
+	// A failed session list is the broker not answering yet (host reboot, stale
+	// lock being cleared), not a wrong runtime: it is classed as unavailable so
+	// boot waits it out instead of exiting into a restart loop (#182).
 	if (sdk && !isHealthySessionList(await sdk(brokerHealthArgs(), { timeoutMs: COMMAND_TIMEOUT_MS }))) {
-		throw new Error("gjc runtime preflight failed: invalid session-list envelope");
+		throw new GjcCliUnavailableError("gjc runtime preflight failed: invalid session-list envelope");
 	}
 	// The relay argv contract is boot-gated: a usage rejection (exit 2) here
 	// means EVERY tail stream would die at spawn and the gateway would silently
@@ -238,11 +268,20 @@ export class GlobalGjcClient {
 	#identity: string | undefined;
 	#available = false;
 	#stopped = false;
+	#stoppedAtEpoch: number | undefined; // When stopped due to involuntary termination failure
+	#stoppedAtTime: number | undefined; // Time when involuntary stop occurred
 	#started = false;
 	#epoch = 0;
 	#failures = 0;
 	/** Why the most recent observation failed; logged so an outage names its cause. */
 	#unavailableReason = "not observed";
+	/** Whether the most recent failed observation saw a live broker in discovery. */
+	#observedLiveBroker = false;
+	/** Start of the current post-start outage, whatever its cause. */
+	#outageSince: number | undefined;
+	/** Start of the current run of failures against a broker discovery calls live. */
+	#liveOutageSince: number | undefined;
+	readonly #liveOutageLimit: number;
 	#timer: ReturnType<typeof setTimeout> | undefined;
 	#starting: Promise<void> | undefined;
 	#gjcVersion: string | undefined;
@@ -280,6 +319,7 @@ export class GlobalGjcClient {
 		this.#interval = integer(options.healthIntervalMs, 5_000, 1);
 		this.#initialBackoff = integer(options.reconnectBackoff?.initialMs, 250, 1);
 		this.#maxBackoff = integer(options.reconnectBackoff?.maxMs, 10_000, this.#initialBackoff);
+		this.#liveOutageLimit = integer(options.liveOutageLimitMs, 180_000, 1);
 		integer(options.readinessAttempts, 20, 1);
 		integer(options.readinessDelayMs, 100, 0);
 		this.cli = (args, commandOptions) => this.#run(bindAgentDir(args, this.agentDir), commandOptions?.timeoutMs);
@@ -289,6 +329,11 @@ export class GlobalGjcClient {
 	}
 	get gjcVersion(): string | undefined {
 		return this.#gjcVersion;
+	}
+	/** The current broker outage as a log fragment, or undefined while requests can be served. */
+	outage(now = Date.now()): string | undefined {
+		if (this.#outageSince === undefined) return undefined;
+		return `broker_unavailable_for=${Math.max(0, Math.floor((now - this.#outageSince) / 1000))}s reason=${this.#unavailableReason}`;
 	}
 	/** Judges the daemon from its own discovery file, bypassing SDK transport. */
 	judgeLiveness(): Promise<BrokerLivenessVerdict> {
@@ -308,7 +353,8 @@ export class GlobalGjcClient {
 	}
 	async start(): Promise<void> {
 		if (this.#starting) return this.#starting;
-		if (this.#started) return;
+		// Allow recovery from involuntary stop even if already started
+		if (this.#started && !this.#stopped) return;
 		if (this.#children.size > 0) throw new GjcCliUnavailableError("owned child exit remains unconfirmed");
 		this.#stopped = false;
 		const epoch = ++this.#epoch;
@@ -340,8 +386,12 @@ export class GlobalGjcClient {
 	}
 	async stop(): Promise<void> {
 		this.#stopped = true;
+		this.#stoppedAtEpoch = undefined; // Clear involuntary stop markers
+		this.#stoppedAtTime = undefined;
 		this.#started = false;
 		this.#available = false;
+		this.#outageSince = undefined;
+		this.#liveOutageSince = undefined;
 		++this.#epoch;
 		if (this.#timer) clearTimeout(this.#timer);
 		this.#timer = undefined;
@@ -357,6 +407,14 @@ export class GlobalGjcClient {
 		void child.exited.then(
 			() => {
 				this.#children.delete(child);
+				// If this was the last unconfirmed child from an involuntary stop,
+				// clear the stop markers and attempt recovery via start().
+				if (this.#stoppedAtEpoch !== undefined && this.#children.size === 0) {
+					this.#stoppedAtEpoch = undefined;
+					this.#stoppedAtTime = undefined;
+					// Attempt to restart; if it fails, the client stays stopped for diagnostics.
+					void this.start().catch(() => {});
+				}
 			},
 			() => {},
 		);
@@ -367,12 +425,17 @@ export class GlobalGjcClient {
 		const termination = terminateChild(child)
 			.catch((error: unknown) => {
 				// Unconfirmed children must not overlap a replacement client generation.
+				// Mark involuntary stop and keep observation running so the #246 guard
+				// (onLiveOutageExceeded) can trigger if the child stays unconfirmed too long.
 				this.#stopped = true;
+				this.#stoppedAtEpoch = this.#epoch; // Mark involuntary stop
+				this.#stoppedAtTime = Date.now();
 				this.#started = false;
 				this.#available = false;
 				++this.#epoch;
 				if (this.#timer) clearTimeout(this.#timer);
 				this.#timer = undefined;
+				this.#schedule(this.#epoch);
 				throw error;
 			})
 			.finally(() => {
@@ -391,14 +454,18 @@ export class GlobalGjcClient {
 		);
 	}
 	async #observe(epoch: number): Promise<boolean> {
+		this.#observedLiveBroker = false;
 		try {
 			const discovery = await this.#discovery();
 			if (epoch !== this.#epoch || this.#stopped) return false;
 			if (!discovery) {
 				this.#available = false;
-				this.#unavailableReason = describeDiscoveryFailure(await this.judgeLiveness());
+				const verdict = await this.judgeLiveness();
+				this.#observedLiveBroker = verdict.state === "live";
+				this.#unavailableReason = describeDiscoveryFailure(verdict);
 				return false;
 			}
+			this.#observedLiveBroker = true;
 			const healthy = await bounded(
 				this.#options.healthProbe
 					? Promise.resolve(
@@ -443,23 +510,60 @@ export class GlobalGjcClient {
 		}
 	}
 	#schedule(epoch: number): void {
-		if (this.#stopped || epoch !== this.#epoch) return;
+		// Continue observation after involuntary stops so the #246 guard can trigger.
+		// Only skip if voluntarily stopped (user called stop(), not termination failure).
+		const voluntarilyStop = this.#stopped && this.#stoppedAtEpoch === undefined;
+		if (voluntarilyStop || epoch !== this.#epoch) return;
 		const wait = this.#available
 			? this.#interval
 			: Math.min(this.#initialBackoff * 2 ** Math.min(this.#failures++, 20), this.#maxBackoff);
 		this.#timer = setTimeout(() => {
 			this.#timer = undefined;
 			void this.#observe(epoch).then((healthy) => {
-				if (healthy) this.#failures = 0;
-				else
+				const now = Date.now();
+				if (healthy) {
+					this.#failures = 0;
+					this.#outageSince = undefined;
+					this.#liveOutageSince = undefined;
+				} else if (epoch === this.#epoch && !this.#stopped) {
 					this.#log(
 						new GjcCliUnavailableError(
 							`global broker unavailable; observing without repair: ${this.#unavailableReason}`,
 						),
 					);
+					this.#noteOutage(now);
+				}
+				// Check for unconfirmed child timeout regardless of broker health.
+				// If child is still unconfirmed past the deadline, exit so systemd restarts.
+				if (epoch === this.#epoch && this.#stoppedAtEpoch !== undefined && this.#children.size > 0) {
+					const elapsed = now - (this.#stoppedAtTime ?? 0);
+					if (elapsed >= this.#liveOutageLimit) {
+						this.#options.onLiveOutageExceeded?.(
+							sanitizeDiagnostic(
+								`owned child unconfirmed for ${Math.floor(elapsed / 1000)}s; exiting for systemd restart`,
+							),
+						);
+					}
+				}
 				this.#schedule(epoch);
 			});
 		}, wait);
+	}
+	#noteOutage(now: number): void {
+		this.#outageSince ??= now;
+		if (!this.#observedLiveBroker) {
+			this.#liveOutageSince = undefined;
+			return;
+		}
+		this.#liveOutageSince ??= now;
+		const elapsed = now - this.#liveOutageSince;
+		if (elapsed < this.#liveOutageLimit) return;
+		// Restart the window so an owner that does not exit is told again later,
+		// not on every probe.
+		this.#liveOutageSince = now;
+		this.#options.onLiveOutageExceeded?.(
+			sanitizeDiagnostic(`live broker unreachable for ${Math.floor(elapsed / 1000)}s: ${this.#unavailableReason}`),
+		);
 	}
 	#log(error: unknown): void {
 		(this.#options.log ?? console.error)(sanitizeDiagnostic(error instanceof Error ? error.message : String(error)));
@@ -649,9 +753,29 @@ function bindAgentDir(args: readonly string[], agentDir: string): readonly strin
 	// `gjc sdk serve` has no --agent-dir flag (exit 2 + usage on gjc 0.16.6):
 	// the relay takes its agent dir from the exported GJC_*_AGENT_DIR env.
 	if (bound[1] === "serve") return bound;
-	// Every `sdk session` leaf owns its own --agent-dir option; gjc 0.17.4
-	// rejects it at the family level (`sdk session --agent-dir <dir> list`,
-	// exit 2 usage). The leaf-level spelling parses on 0.17.2 and 0.17.4.
+	if (bound[1] === "session") {
+		// gjc 0.17.6 requires --json for machine-readable session errors.
+		// Skip option payloads so a literal --json value is not an output flag.
+		let jsonFlags = 0;
+		for (let i = 2; i < bound.length; i++) {
+			const arg = bound[i]!;
+			if (arg === "--") throw new Error("Global GJC client rejects session option delimiters");
+			if (SESSION_VALUE_OPTIONS.has(arg)) {
+				if (bound[i + 1] === undefined) throw new Error(`Global GJC client requires a value after ${arg}`);
+				i++;
+			} else if (arg === "--json") {
+				if (++jsonFlags > 1) throw new Error("Global GJC client rejects duplicate --json flags");
+			} else if (arg.startsWith("--json=")) {
+				throw new Error("Global GJC client rejects --json values");
+			}
+		}
+		if (jsonFlags === 0) bound.push("--json");
+		// Every `sdk session` leaf owns its own --agent-dir option; gjc 0.17.4
+		// rejects it at the family level (`sdk session --agent-dir <dir> list`,
+		// exit 2 usage). Keep this leaf-level binding last.
+		bound.push("--agent-dir", agentDir);
+		return bound;
+	}
 	bound.push("--agent-dir", agentDir);
 	return bound;
 }

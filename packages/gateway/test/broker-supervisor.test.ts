@@ -115,6 +115,96 @@ test("CLI timeout with unconfirmed termination fences client generation until ob
 	}
 }, 10_000);
 
+test("unconfirmed child with healthy broker triggers exit after deadline", async () => {
+	// Issue #330: After child termination fails, if broker stays healthy but child
+	// stays unconfirmed past liveOutageLimitMs, the client must exit via
+	// onLiveOutageExceeded so systemd can restart it.
+	let finish = (_code: number) => {};
+	const exited = new Promise<number>((resolve) => {
+		finish = resolve;
+	});
+	const outageHandlerCalls: string[] = [];
+	const spawn = (() => ({
+		exited,
+		stdout: new Blob([]).stream(),
+		stderr: new Blob([]).stream(),
+		kill() {},
+	})) as unknown as SpawnFn;
+	const value = client({
+		spawn,
+		command: undefined,
+		// Short deadline for test
+		liveOutageLimitMs: 100,
+		onLiveOutageExceeded: (detail) => outageHandlerCalls.push(detail),
+	});
+	await value.start();
+	const gen1 = value.generation;
+	try {
+		// Spawn child that fails to terminate
+		await expect(value.cli(["sdk", "session", "list"], { timeoutMs: 5 })).rejects.toThrow("termination failed");
+		// Child is unconfirmed, client is stopped
+		await expect(value.cli(["sdk", "session", "list"])).rejects.toThrow("stopped");
+		await expect(value.start()).rejects.toThrow("exit remains unconfirmed");
+		// Wait for exit callback to fire (100ms deadline + observation delay)
+		const deadline = Date.now() + 500;
+		while (outageHandlerCalls.length === 0 && Date.now() < deadline) {
+			await Bun.sleep(10);
+		}
+		// Verify exit callback was called due to unconfirmed child timeout
+		expect(outageHandlerCalls.length).toBeGreaterThan(0);
+		expect(outageHandlerCalls[0]).toContain("owned child unconfirmed");
+		// Generation unchanged: no second generation started while child unconfirmed
+		expect(value.generation).toBe(gen1);
+	} finally {
+		finish(0);
+		await exited;
+		await value.stop();
+	}
+}, 10_000);
+
+test("unconfirmed child can restart once exit is confirmed", async () => {
+	// Issue #330: After child termination fails and client becomes stuck-stopped,
+	// once the child process actually exits (confirmed), the client should
+	// automatically recover and restart.
+	let finish = (_code: number) => {};
+	const exited = new Promise<number>((resolve) => {
+		finish = resolve;
+	});
+	const spawn = (() => ({
+		exited,
+		stdout: new Blob([]).stream(),
+		stderr: new Blob([]).stream(),
+		kill() {},
+	})) as unknown as SpawnFn;
+	const value = client({ spawn, command: undefined });
+	await value.start();
+	try {
+		// Spawn child that fails to terminate
+		await expect(value.cli(["sdk", "session", "list"], { timeoutMs: 5 })).rejects.toThrow("termination failed");
+		// Child is unconfirmed, client is stopped
+		await expect(value.cli(["sdk", "session", "list"])).rejects.toThrow("stopped");
+		await expect(value.start()).rejects.toThrow("exit remains unconfirmed");
+		// Confirm the child exit
+		finish(0);
+		await exited;
+		// Wait for automatic restart to clear the stop state
+		const deadline = Date.now() + 500;
+		while (true) {
+			try {
+				// After child exit confirmation and automatic recovery,
+				// start() should succeed without throwing "exit remains unconfirmed"
+				await value.start();
+				break; // Successfully restarted
+			} catch (e) {
+				if (Date.now() >= deadline) throw e;
+				await Bun.sleep(10);
+			}
+		}
+	} finally {
+		await value.stop();
+	}
+}, 10_000);
+
 test("normal owned relay exit is observed and allows clean idempotent stop", async () => {
 	let finish = (_code: number) => {};
 	const exited = new Promise<number>((resolve) => {
@@ -277,7 +367,7 @@ test("no discovery launches only a read-only explicit all-scope readiness reques
 		},
 	});
 	await value.start();
-	expect(calls).toEqual([["sdk", "session", "list", "--scope", "all", "--agent-dir", value.agentDir]]);
+	expect(calls).toEqual([["sdk", "session", "list", "--scope", "all", "--json", "--agent-dir", value.agentDir]]);
 	expect(value.generation).toBe(1);
 });
 
@@ -360,6 +450,60 @@ test("each unavailable observation names why the broker was rejected", async () 
 	await eventually(() => logs.some((line) => line.endsWith("observing without repair: discovery pid 12345 is dead)")));
 	await rm(join(agentDir, "sdk", "broker.json"));
 	await eventually(() => logs.some((line) => line.endsWith("observing without repair: discovery absent)")));
+});
+
+test("a live broker the gateway cannot reach past the bound asks the owner to exit (#246)", async () => {
+	// 2026-09-21: a current, healthy broker, yet every request failed
+	// broker_unavailable for 37 minutes while service_alive kept ticking; only a
+	// gateway restart recovered it.
+	let probeOk = true;
+	const exceeded: string[] = [];
+	const value = client({
+		healthProbe: async () => probeOk,
+		healthIntervalMs: 2,
+		reconnectBackoff: { initialMs: 2, maxMs: 2 },
+		liveOutageLimitMs: 40,
+		onLiveOutageExceeded: (detail) => exceeded.push(detail),
+	});
+	await value.start();
+	expect(value.outage()).toBeUndefined();
+	probeOk = false;
+	await eventually(() => exceeded.length > 0);
+	expect(exceeded[0]).toMatch(/^live broker unreachable for \d+s: endpoint probe failed for live discovery pid 12345$/);
+	expect(value.outage()).toMatch(
+		/^broker_unavailable_for=\d+s reason=endpoint probe failed for live discovery pid 12345$/,
+	);
+	probeOk = true;
+	await eventually(() => value.outage() === undefined);
+});
+
+test("a dead or absent broker never asks the gateway to exit (#246)", async () => {
+	// 2026-09-23: the broker itself was being killed; restarting the gateway on
+	// top of it would only stack restarts.
+	const agentDir = await directory();
+	await mkdir(join(agentDir, "sdk"));
+	await writeFile(
+		join(agentDir, "sdk", "broker.json"),
+		JSON.stringify({ ...discovery(), protocolVersion: 3, host: "127.0.0.1" }),
+	);
+	let alive = true;
+	const exceeded: string[] = [];
+	const value = client({
+		agentDir,
+		discovery: undefined,
+		isPidAlive: () => alive,
+		healthProbe: async () => alive,
+		healthIntervalMs: 2,
+		reconnectBackoff: { initialMs: 2, maxMs: 2 },
+		liveOutageLimitMs: 20,
+		onLiveOutageExceeded: (detail) => exceeded.push(detail),
+	});
+	await value.start();
+	alive = false;
+	await eventually(() => value.outage()?.endsWith("reason=discovery pid 12345 is dead") === true);
+	await Bun.sleep(80);
+	expect(value.outage()).toContain("reason=discovery pid 12345 is dead");
+	expect(exceeded).toEqual([]);
 });
 
 test("rejects retarget arguments before executing commands", async () => {
@@ -562,7 +706,12 @@ test("discovery refuses stale, future, foreign endpoints and dead PIDs without d
 test("runtime capability requires a real session envelope and explicit all scope", async () => {
 	expect(brokerHealthArgs()).toEqual(["sdk", "session", "list", "--scope", "all"]);
 	expect(isHealthySessionList({ ...healthy, stdout: "USAGE gjc sdk" })).toBe(false);
-	await expect(preflightGjcRuntime(async () => ({ ...healthy, stdout: "gjc/0.14.0" }))).rejects.toThrow("requires");
+	await expect(preflightGjcRuntime(async () => ({ ...healthy, stdout: "gjc/0.15.6" }))).rejects.toThrow(
+		"requires gjc >= 0.16.0",
+	);
+	await expect(preflightGjcRuntime(async () => ({ ...healthy, stdout: "gjc/0.16.0" }))).resolves.toEqual({
+		version: "0.16.0",
+	});
 	await expect(
 		preflightGjcRuntime(
 			async () => ({ ...healthy, stdout: "gjc/0.16.3" }),
@@ -665,7 +814,7 @@ test("the gjc 0.17.4 structured usage envelope is a usage rejection; runtime env
 	expect(isUsageRejection({ exitCode: 2, stdout: "", stderr: 'ERROR {"code":"broker_unavailable"}\n' })).toBe(false);
 });
 
-test("every sdk session call binds --agent-dir at the leaf, never between `session` and the leaf", async () => {
+test("every sdk session call adds JSON output and binds --agent-dir at the leaf", async () => {
 	const calls: string[][] = [];
 	const value = client({
 		command: async (args) => {
@@ -675,18 +824,49 @@ test("every sdk session call binds --agent-dir at the leaf, never between `sessi
 	});
 	await value.start();
 	for (const leaf of [
+		["list", "--scope", "all"],
 		["inspect", "s-1"],
 		["status", "s-1", "op-1"],
+		["send", "s-1", "--text", "hello", "--op-ref", "op-1", "--wait", "--json"],
+		["tail", "s-1", "--strict", "--all-events", "--json"],
+		["tail", "s-1", "--cursor", "cursor-1"],
+		["close", "s-1"],
+		["retire", "s-1"],
+		["raw", "control", "s-1", "--op", "model.set", "--json-input", '{"id":"test-model"}'],
 		["raw", "query", "s-1", "--query", "transcript.list"],
 		["raw", "global", "--op", "session.close"],
+		["raw", "global", "--op", "session.create", "--idempotency-key", "create-1", "--json-input", '{"cwd":"/work"}'],
 	]) {
 		await value.cli(["sdk", "session", ...leaf]);
 	}
 	for (const args of calls) {
 		expect(args[2]).not.toBe("--agent-dir");
+		expect(args.filter((arg) => arg === "--json")).toHaveLength(1);
 		expect(args.slice(-2)).toEqual(["--agent-dir", value.agentDir]);
 	}
-	expect(calls.length).toBe(4);
+	expect(calls).toHaveLength(12);
+	expect(calls[11]).toContain('{"cwd":"/work"}');
+});
+
+test("session payload values equal to --json are preserved while output mode is added", async () => {
+	let invocation: readonly string[] | undefined;
+	const value = client({
+		command: async (args) => {
+			invocation = [...args];
+			return healthy;
+		},
+	});
+	const args = ["sdk", "session", "send", "s-1", "--text", "--json"];
+	await value.cli(args);
+	expect(invocation).toEqual([...args, "--json", "--agent-dir", value.agentDir]);
+	expect(args).toEqual(["sdk", "session", "send", "s-1", "--text", "--json"]);
+	await value.cli([...args, "--json"]);
+	expect(invocation).toEqual([...args, "--json", "--agent-dir", value.agentDir]);
+	const cursorArgs = ["sdk", "session", "tail", "s-1", "--cursor", "--json"];
+	await value.cli(cursorArgs);
+	expect(invocation).toEqual([...cursorArgs, "--json", "--agent-dir", value.agentDir]);
+	expect(() => value.cli(["sdk", "session", "list", "--json", "--json"])).toThrow("duplicate --json flags");
+	expect(() => value.cli(["sdk", "session", "list", "--", "--json"])).toThrow("option delimiters");
 });
 
 test("relay stdout and stderr are decoded independently: a multibyte character split across stdout chunks survives interleaved stderr and stderr EOF", async () => {

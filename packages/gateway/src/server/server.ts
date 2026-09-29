@@ -7,6 +7,7 @@ import {
 	type ChatMessagePayload,
 	type ChatProgressActivity,
 	describeChatPlatforms,
+	type EngagementContext,
 	encodeFrame,
 	type Frame,
 	FrameDecoder,
@@ -14,7 +15,9 @@ import {
 	isChatPlatform,
 	isPlatformMessageId,
 	isSilenceToken,
+	isSilentOutput,
 	LOOPBACK_ORIGIN,
+	type MonitorEventRecord,
 	negotiate,
 	type OriginRef,
 	originKey,
@@ -30,6 +33,7 @@ import {
 	reactionAllowlistDescription,
 	resolveReactionEmoji,
 	validateOriginRef,
+	type WorkRetireResult,
 } from "@gajae-gateway/protocol";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { type ConfigOverrides, type GatewayConfig, type ReloadResult, reloadConfig } from "../config";
@@ -72,15 +76,21 @@ import {
 import { formatFailureNotice, sanitizeDiagnostic } from "../orchestrator/rebind";
 import type { SessionPort } from "../orchestrator/session-port";
 import { deterministicInterimDeliveryId, deterministicTerminalDeliveryId } from "../orchestrator/tail-runner";
-import { WorkLaneManager } from "../orchestrator/work-lane";
+import { laneLastCommit, WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
-import type { GatewayDatabase, InboundMessageRow, MonitorEventStage } from "../store/db";
+import {
+	type GatewayDatabase,
+	type InboundMessageRow,
+	type MonitorEventStage,
+	type TerminalUnlinkedReason,
+	terminalDeliveryIds,
+} from "../store/db";
 import { DeliveryLedger, type ExpiredDeliveryRow } from "../store/ledger";
 import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
 import { OrderedFrameWriter } from "./frame-writer";
-import { applyModelCommand } from "./model-command";
+import { applyModelCommand, listModelChoices } from "./model-command";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
@@ -534,11 +544,17 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		// (resolved at terminal or after a restart) is finalized exactly like a
 		// live one: read context, ownership released.
 		heldSteerContextMessageId: (row) =>
-			(JSON.parse(row.origin_ref_json) as { platform?: string }).platform === "loopback"
+			row.source === "lane_report"
 				? undefined
-				: (editedMessageId(row.message_id) ?? row.message_id),
-		onHeldSteerAccepted: ({ row }) => {
+				: (JSON.parse(row.origin_ref_json) as { platform?: string }).platform === "loopback"
+					? undefined
+					: (editedMessageId(row.message_id) ?? row.message_id),
+		onHeldSteerAccepted: ({ row, abandoned }) => {
+			const turnId = runtime.inbound.get(row.message_id)?.turnId;
 			runtime.inbound.delete(row.message_id);
+			// A steer the runtime recorded after its turn ended still gets its 👀;
+			// one closed because its session is gone was never seen, so it gets none.
+			if (!abandoned) acknowledgeSteer(runtime, row, turnId);
 		},
 		onInboundDiscard: (messageIds) => {
 			for (const messageId of messageIds) inbound.delete(messageId);
@@ -567,11 +583,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 					originKey: `monitor/session/${sessionId}`,
 				}),
 		},
-		emit: (payload) => {
-			for (const connection of connections)
-				if (connection.negotiated)
-					connection.write({ v: PROFILE_VERSION, type: "event", event: "monitor.event", payload });
-		},
+		emit: (payload) => broadcastMonitorEvent(runtime, payload),
 		deliver: (payload) => {
 			for (const connection of connections)
 				if (connection.negotiated)
@@ -591,7 +603,12 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		lanes,
 		ownerTarget: () => runtime.config.ownerTarget?.origin,
 		brokerGeneration: () => options.broker?.generation ?? 0,
-		deliver: (payload) => broadcastDelivery(runtime, payload),
+		allowNested: () => runtime.config.work?.allowNested === true,
+		personaHold: (originKey) => personaSessions.admissionHold(originKey),
+		notifyPersona: (originKey) => {
+			void personaSessions.notifyInbound(originKey);
+		},
+		deliverFallback: (payload) => broadcastDelivery(runtime, payload),
 	});
 	const reconcileTimer = setInterval(() => {
 		void monitors.reconcile();
@@ -600,14 +617,18 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			.catch((error: unknown) => console.error(`persona recovery sweep failed: ${diagnostic(error)}`));
 		void work
 			.recover()
-			.then(() => lanes.sweep())
+			.then(async () => {
+				await lanes.sweep();
+				// Also release dead/disowned lanes via reconciliation
+				await lanes.retireAllDead();
+			})
 			.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`));
 	}, 60_000);
 	const deliverySweepTimer = setInterval(() => {
 		if (![...connections].some((connection) => connection.negotiated)) return;
 		try {
 			const sweep = delivery.sweep();
-			for (const expired of sweep.expired) reportDeliveryExpired(runtime, expired, "age");
+			for (const expired of sweep.expired) reportDeliveryExpired(runtime, options.database, expired, "age");
 			for (const payload of sweep.payloads) broadcastDelivery(runtime, payload);
 		} catch (error) {
 			console.error(`delivery sweep failed: ${diagnostic(error)}`);
@@ -624,6 +645,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		}
 	}, options.stallCheckIntervalMs ?? DEFAULT_STALL_CHECK_INTERVAL_MS);
 	options.database.contextMaintain();
+	reportTerminalLinkAudit(options.database);
 	const contextMaintenanceTimer = setInterval(
 		() => {
 			try {
@@ -631,6 +653,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			} catch (error) {
 				console.error(`gateway context maintenance failed: ${diagnostic(error)}`);
 			}
+			reportTerminalLinkAudit(options.database);
 		},
 		60 * 60 * 1000,
 	);
@@ -669,7 +692,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		...(stopBrokerGenerationListener ? { stopBrokerGenerationListener } : {}),
 		reactions: new ReactionBudget(),
 		botAudienceTurns,
-		cycle: new RuntimeCycleProjector(options.database, memory, { maxLanes: lanes.maxLanes }),
+		cycle: new RuntimeCycleProjector(options.database, memory, {
+			maxLanes: lanes.maxLanes,
+			agentDir: options.broker?.agentDir,
+		}),
 		lanes,
 		work,
 		inbound,
@@ -732,7 +758,7 @@ async function handleFrame(
 			};
 			connection.write({ v: PROFILE_VERSION, type: "negotiated", payload: result.negotiated });
 			const sweep = runtime.delivery.sweep(Date.now(), true);
-			for (const expired of sweep.expired) reportDeliveryExpired(runtime, expired, "age");
+			for (const expired of sweep.expired) reportDeliveryExpired(runtime, options.database, expired, "age");
 			for (const payload of sweep.payloads)
 				connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
 			return;
@@ -803,10 +829,31 @@ async function handleRequest(
 			const id = (request.params as { deliveryId?: unknown } | undefined)?.deliveryId;
 			if (typeof id !== "string") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack.
+			const delivery = options.database.deliveryRows().find((row) => row.delivery_id === id);
+			const authoredEvents = delivery
+				? options.database
+						.monitorEventRows()
+						.filter((row) => row.batch_id === delivery.turn_id && row.stage === "authored")
+						.map((row) => row.event_id)
+				: [];
 			const confirmOutcome = options.database.deliveryConfirmWithSettle(id, "delivered");
 			if (confirmOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			const resolve = runtime.directSettlements.get(id);
 			if (resolve && runtime.delivery.get(id)?.state === "confirmed") resolve({ deliveryId: id, delivered: true });
+			if (confirmOutcome === "transitioned" && authoredEvents.length > 0) {
+				const authoredEventIds = new Set(authoredEvents);
+				for (const row of options.database.monitorEventRows()) {
+					if (authoredEventIds.has(row.event_id) && row.stage === "delivered") {
+						broadcastMonitorEvent(runtime, {
+							eventId: row.event_id,
+							monitorId: row.monitor_id,
+							eventType: row.event_type,
+							firedAt: row.fired_at,
+							stage: row.stage,
+						});
+					}
+				}
+			}
 			// Monitor batch settlement: a confirmed delivery for a monitor batch
 			// (turn_id === the events' batch_id) advances its authored events to
 			// `delivered` — only AFTER the adapter confirmed (issue #29 defect 2),
@@ -839,7 +886,7 @@ async function handleRequest(
 				});
 				const failedRow = runtime.delivery.get(params.deliveryId);
 				if (failedRow?.state === "expired")
-					reportDeliveryExpired(runtime, failedRow, safeDiagnosticField(params.reason));
+					reportDeliveryExpired(runtime, options.database, failedRow, safeDiagnosticField(params.reason));
 			}
 			// A failed monitor-batch delivery stays distinguishable: its events keep
 			// stage `authored` (or `batched` before authoring) so reconcile and the
@@ -918,14 +965,30 @@ async function handleRequest(
 					...row,
 					session_id: lane?.gjc_session_id ?? "",
 					last_activity_at: lane?.last_activity_at ?? null,
+					// Repository evidence (issue #67): a lane whose op died but whose HEAD
+					// moved is progressing; it is read from the worktree, not the record.
+					last_commit: laneLastCommit(row.worktree_path),
+					reports: row.lane_key.startsWith("work-")
+						? options.database.laneReportCounts(row.lane_key.slice("work-".length))
+						: { pending: 0, claimed: 0, held: 0, undeliverable: 0 },
 					...(options.database.isBrokerQuarantined("work", row.job_id)
 						? { quarantined: true, reason: "broker_authority_quarantined" }
 						: {}),
 				};
 				try {
 					const record = parseLaneJobRecord(options.database.laneJobJson(row.job_id) ?? "");
+					const attempt = record.attempts.at(-1);
 					return {
 						...bound,
+						// The job is the primary object; the current attempt is a detail.
+						accepted_at: record.createdAt,
+						attempt: attempt
+							? {
+									op_ref: attempt.opRef,
+									started_at: attempt.startedAt,
+									...(attempt.endedAt ? { ended_at: attempt.endedAt } : {}),
+								}
+							: null,
 						attempts: record.attempts.length,
 						checkpoints: record.checkpoints.length,
 						escalations: record.escalations.length,
@@ -948,7 +1011,42 @@ async function handleRequest(
 			return;
 		}
 		case "work.retire": {
-			const params = request.params as { name?: unknown } | undefined;
+			const params = request.params as { name?: unknown; force?: unknown; allDead?: unknown } | undefined;
+			const force = params?.force === true;
+			const allDead = params?.allDead === true;
+			if (force && allDead) throw new ProtocolError("invalid_params", "force and allDead are mutually exclusive");
+			if (allDead) {
+				// Retire all dead lanes
+				await runtime.work.recover();
+				const { count, names } = await runtime.lanes.retireAllDead();
+				// Return result with count and names of retired lanes
+				const result: Record<string, unknown> = {
+					retired: count > 0,
+					count,
+					names,
+					sessionKey: "work/*",
+					sessionId: "",
+					closed: true,
+				};
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "response",
+					id: request.id,
+					result,
+				});
+				return;
+			}
+			if (force) {
+				if (typeof params?.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(params.name))
+					throw new ProtocolError(
+						"invalid_params",
+						"work.retire --force requires name matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}",
+					);
+				await runtime.work.recover();
+				const outcome = await runtime.lanes.forceRetire(params.name);
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: outcome });
+				return;
+			}
 			if (typeof params?.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(params.name))
 				throw new ProtocolError("invalid_params", "work.retire requires name matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}");
 			await runtime.work.recover();
@@ -983,6 +1081,11 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { sessions } });
 			return;
 		}
+		case "session.modelChoices": {
+			const choices = await listModelChoices(options.broker?.agentDir, runtime.config.model);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { choices } });
+			return;
+		}
 		case "session.recall": {
 			const params = (request.params ?? {}) as { query?: unknown; limit?: unknown; requestingOrigin?: unknown };
 			const requesting = params.requestingOrigin
@@ -1015,8 +1118,9 @@ async function handleRequest(
 		case "memory.autolink": {
 			// Deterministic crosslink sweep: alias index from canonical filenames,
 			// titles, and frontmatter aliases; first mention per file gets linked.
+			// Runs through shared lock to serialize with intent commits (#341).
 			const root = await initializeMemory(options.config.home);
-			const report = await autolinkCorpus(root);
+			const report = await autolinkCorpus(root, runtime.memory);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: report });
 			return;
 		}
@@ -1045,6 +1149,22 @@ async function handleRequest(
 				void runtime.monitorRuntime.refresh();
 			} catch (error) {
 				throw new ProtocolError("invalid_params", diagnostic(error) || "invalid monitor");
+			}
+			return;
+		}
+		case "monitor.update": {
+			try {
+				const monitor = runtime.registry.update(request.params as never);
+				if (!monitor) throw new Error("unknown monitorId");
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "response",
+					id: request.id,
+					result: { monitorId: monitor.monitorId },
+				});
+				void runtime.monitorRuntime.refresh();
+			} catch (error) {
+				throw new ProtocolError("invalid_params", diagnostic(error) || "invalid monitor update");
 			}
 			return;
 		}
@@ -1355,6 +1475,8 @@ async function sendChat(
 		| undefined;
 	if (!params || typeof params.text !== "string" || !params.text)
 		throw new ProtocolError("invalid_params", "chat.send requires non-empty text");
+	if (typeof params.messageId === "string" && params.messageId.startsWith("lane-report-"))
+		throw new ProtocolError("invalid_params", "lane report identifiers are internal and cannot be sent to chat");
 	const userText: string = params.text;
 	let origin: ReturnType<typeof validateOriginRef>;
 	try {
@@ -1552,14 +1674,16 @@ async function sendChat(
 	// turn reads the full unread diff since the persona's last reply.
 	if (nonLoopback && inboundMessageId) {
 		const engagement = params.engagement as { authorId?: string; authorName?: unknown } | undefined;
-		options.database.contextRecord({
-			messageId: inboundMessageId,
-			originKey: key,
-			authorId: typeof engagement?.authorId === "string" ? engagement.authorId : undefined,
-			authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
-			body: userText,
-			...(receivedAt ? { receivedAt } : {}),
-		});
+		ingestOrReportDrop(key, inboundMessageId, engagementDecision.engaged, () =>
+			options.database.contextRecord({
+				messageId: inboundMessageId,
+				originKey: key,
+				authorId: typeof engagement?.authorId === "string" ? engagement.authorId : undefined,
+				authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
+				body: userText,
+				...(receivedAt ? { receivedAt } : {}),
+			}),
+		);
 	}
 	if (!engaged) {
 		connection.write({
@@ -1640,17 +1764,19 @@ async function sendChat(
 	const turnId = crypto.randomUUID();
 	// Persist before dispatch: this insert is the durable acceptance boundary. The
 	// per-origin actor receives the notification only after this transaction wins.
-	const accepted = options.database.inboundEnqueue({
-		messageId,
-		originKey: key,
-		originRefJson: JSON.stringify(origin),
-		body: userText,
-		// The delivery-side gate needs the same bypass decision after a restart,
-		// so it travels with the durable row.
-		engagementJson: params.engagement
-			? JSON.stringify(speechGated ? { ...params.engagement, speechGated: true } : params.engagement)
-			: undefined,
-	});
+	const accepted = ingestOrReportDrop(key, messageId, true, () =>
+		options.database.inboundEnqueue({
+			messageId,
+			originKey: key,
+			originRefJson: JSON.stringify(origin),
+			body: userText,
+			// The delivery-side gate needs the same bypass decision after a restart,
+			// so it travels with the durable row.
+			engagementJson: params.engagement
+				? JSON.stringify(speechGated ? { ...params.engagement, speechGated: true } : params.engagement)
+				: undefined,
+		}),
+	);
 	if (!accepted) {
 		// Duplicate message id: already accepted once, so acknowledge without dispatching.
 		connection.write({
@@ -1714,6 +1840,8 @@ async function editChat(
 		throw new ProtocolError("invalid_params", "chat.edit requires non-empty text");
 	if (typeof params.messageId !== "string" || !params.messageId)
 		throw new ProtocolError("invalid_params", "chat.edit requires the edited messageId");
+	if (params.messageId.startsWith("lane-report-"))
+		throw new ProtocolError("invalid_params", "lane report identifiers are internal and cannot be edited");
 	let origin: ReturnType<typeof validateOriginRef>;
 	try {
 		origin = validateOriginRef(params.origin as typeof LOOPBACK_ORIGIN);
@@ -1771,14 +1899,17 @@ async function editChat(
 	}
 	const messageId = messageEditId(params.messageId, params.text);
 	const turnId = crypto.randomUUID();
-	const accepted = options.database.inboundEnqueue({
-		messageId,
-		originKey: key,
-		originRefJson: JSON.stringify(origin),
-		body: renderMessageEdit(params.messageId, params.text),
-		engagementJson: params.engagement ? JSON.stringify(params.engagement) : undefined,
-		...(parseReceivedAt(params.receivedAt) ? { receivedAt: parseReceivedAt(params.receivedAt) } : {}),
-	});
+	const { messageId: editedId, text: edit } = params;
+	const accepted = ingestOrReportDrop(key, messageId, true, () =>
+		options.database.inboundEnqueue({
+			messageId,
+			originKey: key,
+			originRefJson: JSON.stringify(origin),
+			body: renderMessageEdit(editedId, edit),
+			engagementJson: params.engagement ? JSON.stringify(params.engagement) : undefined,
+			...(parseReceivedAt(params.receivedAt) ? { receivedAt: parseReceivedAt(params.receivedAt) } : {}),
+		}),
+	);
 	if (!accepted) {
 		// The same edit event delivered twice: acknowledged once, dispatched once.
 		connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { turnId: null, engaged: true } });
@@ -1797,8 +1928,13 @@ async function createInboundTurnLifecycle(
 ): Promise<PersonaTurnLifecycle> {
 	// One inbound message is one turn; it carries the live requester/voice context.
 	const row = input.trigger;
+	const laneReport = row.source === "lane_report";
+	// The requester context (turnId, connection, voice) outlives this lifecycle:
+	// a turn released before its prompt landed (attach/model/send refusal, or
+	// recovery requeueing an unaccepted turn) re-dispatches the same trigger under
+	// a new lifecycle, which must still answer the original request. It is
+	// dropped once the trigger settles (onSettled) or is discarded (onInboundDiscard).
 	const context = runtime.inbound.get(row.message_id);
-	runtime.inbound.delete(row.message_id);
 	const connection = context?.connection ?? [...runtime.connections][0];
 	const turnId = context?.turnId ?? crypto.randomUUID();
 	const voiceTurn = context?.voice === true;
@@ -1827,14 +1963,16 @@ async function createInboundTurnLifecycle(
 		[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
 		`${origin.platform} ${origin.kind} ${origin.conversationId}`;
 	const bootstrapState = options.database.getSessionBootstrap(key);
-	let turnText = userText;
+	let turnText = laneReport ? laneReportTriggerText(userText) : userText;
 	let contextMessageIds: readonly string[] = [];
 	let contextOmissionRevision = 0;
 	if (nonLoopback) {
 		const prepared = options.database.contextWindow(key, row.message_id);
 		// A pointer-update turn reads its ORIGINAL message's row (the edited body
 		// lives there); commit that id, not the synthetic edit row.
-		contextMessageIds = [...prepared.selectedMessageIds, editedMessageId(row.message_id) ?? row.message_id];
+		contextMessageIds = laneReport
+			? [...prepared.selectedMessageIds]
+			: [...prepared.selectedMessageIds, editedMessageId(row.message_id) ?? row.message_id];
 		contextOmissionRevision = prepared.omissionRevision;
 		const lines = prepared.rows.map(
 			(entry) =>
@@ -1885,7 +2023,7 @@ async function createInboundTurnLifecycle(
 					? `${droppedNote}\n`
 					: ""
 		}`;
-		turnText = `${header}${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`;
+		turnText = `${header}${laneReport ? laneReportTriggerText(userText) : `${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`}`;
 	}
 
 	const bootstrap =
@@ -1909,6 +2047,22 @@ async function createInboundTurnLifecycle(
 	const effectiveModel = modelOverride ?? runtime.config.model;
 
 	const deliveredParts: string[] = [];
+	/** Ledger ids of every text part and reaction this turn put on the wire, in order. */
+	const deliveredIds: string[] = [];
+	/**
+	 * Closes the trigger's terminal link. Terminal parts claim their own slots as
+	 * they ship; a turn whose visible output was interim text or a reaction (then
+	 * a silent or failed terminal) is linked to the last delivery it made, and a
+	 * turn that delivered nothing records why, so `done` never leaves it NULL (#247).
+	 */
+	const closeTerminalLink = (reason: TerminalUnlinkedReason) => {
+		const last = deliveredIds.at(-1);
+		if (last === undefined) options.database.inboundTurnMarkUnlinked(input.turn.opRef, reason);
+		else if (
+			terminalDeliveryIds(options.database.inboundTurnRow(input.turn.opRef)?.terminal_delivery_id ?? null).length === 0
+		)
+			options.database.inboundTurnClaimTerminal(input.turn.opRef, 0, last);
+	};
 	let assistantDeliveryStarted = false;
 	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
@@ -1962,6 +2116,10 @@ async function createInboundTurnLifecycle(
 					);
 					continue;
 				}
+				if (laneReport && wanted.targetMessageId === undefined) {
+					console.error(`gateway reaction skipped for internal lane report origin=${key} reason=no_trigger_message`);
+					continue;
+				}
 				const targetMessageId = reactionTargetMessageId(origin, wanted.targetMessageId ?? row.message_id);
 				if (!targetMessageId) continue;
 				const rejection = runtime.reactions.claim({ turnId, originKey: key, targetMessageId, emoji: wanted.emoji });
@@ -1977,6 +2135,7 @@ async function createInboundTurnLifecycle(
 					emojiName: wanted.emojiName,
 				});
 				assistantDeliveryStarted = true;
+				deliveredIds.push(payload.deliveryId as string);
 				broadcastDelivery(runtime, payload);
 			}
 			message = reactionReply.body;
@@ -1988,7 +2147,7 @@ async function createInboundTurnLifecycle(
 		const spokenParts = message
 			.split(/\n\s*\[BREAK\]\s*\n?/)
 			.map((part) => part.trim())
-			.filter((part) => part.length > 0 && !isSilenceToken(part) && !/\n\s*\[(?:SILENT|silent)\]\s*$/.test(part))
+			.filter((part) => part.length > 0 && !isSilentOutput(part))
 			.slice(0, 5);
 		// A persona that decided not to speak often says so instead of emitting
 		// the token (#260). On gated traffic, such a part is dropped like one.
@@ -2008,8 +2167,9 @@ async function createInboundTurnLifecycle(
 		// Thread origins already carry their root; explicit [REPLY:…] always wins.
 		// Slack only: a Discord DM's reply metadata is an ordinary "replied to X"
 		// note whose delivery would otherwise turn into a quoted reply nobody asked for.
-		const inboundThreadRoot =
-			origin.platform !== "slack"
+		const inboundThreadRoot = laneReport
+			? undefined
+			: origin.platform !== "slack"
 				? undefined
 				: origin.kind === "channel" &&
 						nonLoopback &&
@@ -2028,7 +2188,7 @@ async function createInboundTurnLifecycle(
 				.replace(/\s*\[BREAK\]\s*/g, " ")
 				.trim();
 			if (!body) continue;
-			const replyTo = slackReplyTargetInChannel(origin, replyMatch?.[1]) ?? inboundThreadRoot;
+			const replyTo = replyMatch?.[1] || inboundThreadRoot;
 			planned.push({ body, ...(replyTo ? { replyTo } : {}) });
 		}
 		const spoken = spokenReply(
@@ -2062,9 +2222,21 @@ async function createInboundTurnLifecycle(
 				);
 				if (owner !== deliveryId) continue;
 			}
-			const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, step.body, step.replyTo, deliveryId);
+			// Mid-work speech is not the end of the turn: `final: false` keeps the
+			// adapter's working status (typing, presence, Slack status line) alive
+			// while the persona keeps streaming. Only the terminal reply - or the
+			// unconditional final progress tick - tears it down.
+			const payload = runtime.delivery.prepare(
+				crypto.randomUUID(),
+				origin,
+				step.body,
+				step.replyTo,
+				deliveryId,
+				source === "terminal",
+			);
 			if (!payload) continue;
 			deliveredParts.push(step.body);
+			deliveredIds.push(payload.deliveryId as string);
 			assistantDeliveryStarted = true;
 			const isLast = index === planned.length - 1;
 			broadcastDelivery(runtime, isLast && spoken !== "" ? { ...payload, voiceText: spoken } : payload);
@@ -2168,6 +2340,7 @@ async function createInboundTurnLifecycle(
 	};
 
 	const renderSteer = (steered: InboundMessageRow): string => {
+		if (steered.source === "lane_report") return steered.body;
 		const steerEngagement = steered.engagement_json
 			? (JSON.parse(steered.engagement_json) as NonNullable<typeof engagement>)
 			: undefined;
@@ -2181,11 +2354,17 @@ async function createInboundTurnLifecycle(
 	// message (that is where the edited body now lives). Consumed in the same
 	// transaction as the acceptance; only transient ownership is released here.
 	const steerContextMessageId = (steered: InboundMessageRow): string | undefined =>
-		nonLoopback ? (editedMessageId(steered.message_id) ?? steered.message_id) : undefined;
+		steered.source === "lane_report"
+			? undefined
+			: nonLoopback
+				? (editedMessageId(steered.message_id) ?? steered.message_id)
+				: undefined;
 	const onSteerAccepted = ({ row: steered }: PersonaSteerInput) => {
 		runtime.inbound.delete(steered.message_id);
+		acknowledgeSteer(runtime, steered, turnId);
 	};
 	const onTerminal = async ({ text }: PersonaTerminalInput) => {
+		let threw = false;
 		try {
 			if (nonLoopback) options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
 			if (bootstrap)
@@ -2204,7 +2383,7 @@ async function createInboundTurnLifecycle(
 					`user: ${userText.slice(0, 500)}\nassistant: ${replyText.slice(0, 500)}`,
 				);
 			});
-			if (deliveredParts.length === 0 && isSilenceToken(text)) return;
+			if (deliveredParts.length === 0 && isSilentOutput(text)) return;
 			if (!nonLoopback) {
 				if (connection)
 					connection.write({
@@ -2247,15 +2426,27 @@ async function createInboundTurnLifecycle(
 				userText: capturedUser,
 				replyText,
 			});
+		} catch (error) {
+			threw = true;
+			throw error;
 		} finally {
-			endProgress();
+			try {
+				if (!threw) closeTerminalLink(nonLoopback ? "silent" : "loopback");
+			} finally {
+				endProgress();
+			}
 		}
 	};
 
-	const onFailure = async ({ error }: PersonaFailureInput) => {
+	const onFailure = async ({ error, recoveredText }: PersonaFailureInput) => {
 		try {
 			const failureNotice = formatFailureNotice(error);
 			console.error(failureNotice);
+			// The turn wrote its answer before it failed (#210): deliver it through
+			// the ordinary terminal slot. It then counts as a visible reply, and the
+			// failure stays in the operator log instead of replacing the answer.
+			if (nonLoopback && recoveredText && !assistantDeliveryStarted)
+				await deliverAssistantText(recoveredText, "terminal");
 			if (nonLoopback && assistantDeliveryStarted)
 				options.database.contextCommitWindow(key, contextMessageIds, contextOmissionRevision);
 			if (nonLoopback && !assistantDeliveryStarted) {
@@ -2274,11 +2465,25 @@ async function createInboundTurnLifecycle(
 					broadcastDelivery(runtime, notice);
 				}
 			}
+			// A loopback requester waits for a final chat.message on its turnId; without
+			// this it waits out its whole turn timeout for a turn that already failed.
+			if (!nonLoopback && connection)
+				connection.write({
+					v: PROFILE_VERSION,
+					type: "event",
+					event: "chat.message",
+					...(context ? { id: context.requestId } : {}),
+					payload: { turnId, origin, role: "assistant", text: failureNotice, final: true },
+				});
+			// The `[turn failed]` notice is a diagnostic, not an answer: it never
+			// claims the slot, but visible interim output before the failure does.
+			closeTerminalLink(nonLoopback ? "turn_failed" : "loopback");
 		} finally {
 			endProgress();
 		}
 	};
 	const onSettled = ({ terminalDeliveryId }: PersonaTurnSettledInput) => {
+		if (runtime.inbound.get(row.message_id) === context) runtime.inbound.delete(row.message_id);
 		if (engagement?.authorIsBot !== true || terminalDeliveryId !== null) return;
 		// A delivered `[turn failed]` notice is a diagnostic, not an answer: it is
 		// deliberately emitted under a different delivery/turn identity, so it does
@@ -2292,6 +2497,7 @@ async function createInboundTurnLifecycle(
 		systemPreamble,
 		...(effectiveModel ? { effectiveModel } : {}),
 		...(runtime.config.serviceTier ? { effectiveServiceTier: runtime.config.serviceTier } : {}),
+		contextMessageIds: new Set(contextMessageIds),
 		renderSteer,
 		steerContextMessageId,
 		onSteerAccepted,
@@ -2310,6 +2516,28 @@ async function createInboundTurnLifecycle(
 	};
 }
 
+/**
+ * #247 invariant: every `done` trigger names the delivery that closed it or
+ * the reason none did. Reports the last 24 h at startup and hourly, so a
+ * dispatch path that drops the link is visible without a manual ledger audit.
+ */
+function reportTerminalLinkAudit(database: GatewayDatabase): void {
+	try {
+		const { done, unlinked } = database.inboundTerminalLinkAudit(
+			new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+		);
+		if (unlinked > 0)
+			console.error(
+				`gateway terminal link audit: ${unlinked}/${done} done turns in the last 24h have no terminal_delivery_id`,
+			);
+	} catch (error) {
+		console.error(`gateway terminal link audit failed: ${diagnostic(error)}`);
+	}
+}
+
+function laneReportTriggerText(body: string): string {
+	return `[Internal lane report: from your work lane, not from a human; no human has seen it. Tell this conversation only what it needs by replying normally, or answer [SILENT].]\n\n${body}`;
+}
 function parseReceivedAt(value: unknown): string | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "string" || !value)
@@ -2397,8 +2625,72 @@ function broadcastDelivery(runtime: Pick<Runtime, "delivery" | "connections">, p
 		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
 }
 
+/**
+ * The 👀 acknowledgement tells a human their message to the persona landed. In
+ * a group room most steers are ambient chatter the persona merely reads, so only
+ * a message that explicitly addressed it (a mention, or any DM) gets one; bot
+ * authors never do. A row without engagement metadata (non-chat) gets none.
+ */
+function steerAddressedPersona(steered: InboundMessageRow): boolean {
+	if (!steered.engagement_json) return false;
+	const engagement = JSON.parse(steered.engagement_json) as Partial<EngagementContext>;
+	if (engagement.authorIsBot === true) return false;
+	return engagement.mentioned === true || engagement.group === false;
+}
+
+/**
+ * A steer lands inside a running turn whose model may take minutes to say
+ * anything (a folded foreground wait, a long tool). The owner must see at once
+ * that the message arrived, independent of the model: the gateway acknowledges
+ * an accepted steer with 👀 on the steered message itself, through the same
+ * ledger and budget as every reaction. It runs AFTER the steer is durably
+ * accepted, so it must never throw: a cap, a duplicate (the model reacting 👀
+ * too) or a storage error is logged and the acceptance stands.
+ */
+function acknowledgeSteer(runtime: Runtime, steered: InboundMessageRow, turnId: string | undefined): void {
+	try {
+		const origin = validateOriginRef(JSON.parse(steered.origin_ref_json) as OriginRef);
+		if (!isChatPlatform(origin.platform)) return;
+		if (!steerAddressedPersona(steered)) return;
+		const targetMessageId = editedMessageId(steered.message_id) ?? steered.message_id;
+		if (!isPlatformMessageId(targetMessageId)) return;
+		const eyes = resolveReactionEmoji("👀");
+		if (!eyes || !platformSupportsReaction(origin.platform, eyes.name)) return;
+		const key = originKey(origin);
+		const rejection = runtime.reactions.claim({
+			...(turnId ? { turnId } : {}),
+			originKey: key,
+			targetMessageId,
+			emoji: eyes.unicode,
+		});
+		if (rejection) {
+			console.error(
+				`gateway steer acknowledgement skipped (${rejection.reason}) for ${key} message ${targetMessageId}: ${rejection.detail}`,
+			);
+			return;
+		}
+		broadcastDelivery(
+			runtime,
+			runtime.delivery.prepareReaction(crypto.randomUUID(), origin, {
+				targetMessageId,
+				emoji: eyes.unicode,
+				emojiName: eyes.name,
+			}),
+		);
+	} catch (error) {
+		console.error(`gateway steer acknowledgement failed for message ${steered.message_id}: ${diagnostic(error)}`);
+	}
+}
+
+/** Fans a committed monitor-event stage transition out to every negotiated adapter. */
+function broadcastMonitorEvent(runtime: Runtime, payload: MonitorEventRecord): void {
+	for (const recipient of runtime.connections)
+		if (recipient.negotiated) recipient.write({ v: PROFILE_VERSION, type: "event", event: "monitor.event", payload });
+}
+
 function reportDeliveryExpired(
 	runtime: Runtime,
+	database: GatewayDatabase,
 	expired: Pick<ExpiredDeliveryRow, "deliveryId" | "originKey" | "attempts">,
 	reason: string,
 ): void {
@@ -2407,6 +2699,12 @@ function reportDeliveryExpired(
 	const attempts = Number.isSafeInteger(expired.attempts) && expired.attempts >= 0 ? expired.attempts : 0;
 	console.error(
 		`delivery_expired deliveryId=${deliveryId} origin=${origin} attempts=${attempts} reason=${safeDiagnosticField(reason)}`,
+	);
+	// A monitor batch riding on this delivery can never be confirmed now: fail its
+	// events terminally with the delivery evidence instead of leaving them
+	// `authored` forever (#94).
+	database.withTransaction(() =>
+		database.monitorEventsFailExpiredDelivery(expired.deliveryId, safeDiagnosticField(reason)),
 	);
 	if (expired.deliveryId.startsWith("gw-x-")) return;
 	const ownerTarget = runtime.config.ownerTarget?.origin;
@@ -2486,6 +2784,14 @@ export function currentConversationNotice(origin: OriginRef): string {
 					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. With nothing after the token you acknowledge with a reaction and say nothing; text after the token is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
 				]
 			: []),
+		// Live 2026-09-25: the persona held turns open for 13 minutes in a
+		// foreground `gh run watch`, and answered 22 owner steers with a bare
+		// [REACT:👀] while it kept polling lanes with `sleep N; gajaeway work jobs`.
+		// A conversation turn is the owner's line to the persona; it must not be
+		// spent waiting. Waits are backgrounded or handed to a lane that reports to its parent.
+		"## Staying responsive while you work",
+		'Answer in words first. Never block a conversation turn on a foreground wait: no `gh run watch`, `gh pr checks --watch`, `sleep N; <poll>` loops, or repeated `gajaeway work jobs` / `work status` polling. Run a long wait as a background job (bash with async), or delegate to a lane with `gajaeway work start <name> "<task>"`; its result returns here as an internal report, not a chat post. Say what you started and end the turn.',
+		`When a new message arrives while you are working, it interrupts you: any foreground command is moved to the background so you can answer. Always answer it in words, right away; a reaction alone is never the whole answer to a message from the owner.${isChatPlatform(origin.platform) ? " The gateway already marks the message 👀 when it lands, so do not spend your reply on another reaction." : ""}`,
 	].join("\n");
 }
 /** A Slack platform message id is `channel:ts`; synthetic trigger ids (`slash-\u2026`, `edit:\u2026`) never thread. */
@@ -2494,18 +2800,21 @@ function isSlackMessageId(value: string): boolean {
 }
 
 /**
- * The persona's explicit `[REPLY:<id>]` target, or undefined when it cannot be
- * delivered here. The model copies ids from message headers and sometimes
- * garbles them (`C0C4C4HKW6ZMF:\u2026` for `C0C4HKW6ZMF:\u2026`, live 2026-09-25): the
- * Slack adapter correctly refuses a reply into a foreign channel, the delivery
- * retries until it expires, and the whole answer is lost. On Slack a target
- * that is not a `channel:ts` id in this conversation's channel therefore falls
- * back to the default thread root instead of poisoning the delivery.
+ * Runs one inbound ledger write. A failure still fails the request closed (no
+ * turn is admitted without its row), but it is first logged as a drop naming
+ * the message and origin (#176): the generic request-failure line carried
+ * neither, so a mention lost to an ingest error was indistinguishable from
+ * silence.
  */
-function slackReplyTargetInChannel(origin: OriginRef, target: string | undefined): string | undefined {
-	if (!target || origin.platform !== "slack") return target;
-	const channel = origin.kind === "thread" ? (origin.parentId ?? origin.conversationId) : origin.conversationId;
-	return isSlackMessageId(target) && target.startsWith(`${channel}:`) ? target : undefined;
+function ingestOrReportDrop<T>(originKey: string, messageId: string, engaged: boolean, write: () => T): T {
+	try {
+		return write();
+	} catch (error) {
+		console.error(
+			`inbound_dropped message=${messageId} origin=${originKey} engaged=${engaged} reason=ingest_error: ${diagnostic(error)}`,
+		);
+		throw error;
+	}
 }
 
 function diagnostic(error: unknown): string {

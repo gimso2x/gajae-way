@@ -13,6 +13,7 @@ import {
 	presenceMarkersFor,
 	presenceTransition,
 	type ReactionAction,
+	type SessionModelChoicesResult,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } from "discord.js";
@@ -172,6 +173,8 @@ export interface DiscordTypingChannelLike {
 
 export interface TypingPort {
 	begin(conversationId: string): void;
+	/** Re-sends the hint now for a running turn (a posted message clears it); no-op when none runs. */
+	refresh(conversationId: string): void;
 	end(conversationId: string): void;
 }
 
@@ -425,7 +428,7 @@ export function deliveryFailureIsAmbiguous(error: unknown): boolean {
  * because the typing hint is cosmetic and must never compete with delivery.
  */
 export class TypingIndicator implements TypingPort {
-	readonly #runs = new Map<string, { deadline: number; timer: ReturnType<typeof setTimeout> | undefined }>();
+	readonly #runs = new Map<string, TypingRun>();
 
 	constructor(
 		readonly discord: DiscordClientLike,
@@ -440,8 +443,22 @@ export class TypingIndicator implements TypingPort {
 			existing.deadline = Date.now() + this.maxMs;
 			return;
 		}
-		const run = { deadline: Date.now() + this.maxMs, timer: undefined };
+		const run: TypingRun = { deadline: Date.now() + this.maxMs, timer: undefined, pulsing: false, again: false };
 		this.#runs.set(conversationId, run);
+		void this.#pulse(conversationId, run);
+	}
+
+	refresh(conversationId: string): void {
+		const run = this.#runs.get(conversationId);
+		if (!run) return;
+		// A pulse already in flight may have landed before the message that
+		// cleared the hint; it re-pulses as soon as it settles.
+		if (run.pulsing) {
+			run.again = true;
+			return;
+		}
+		if (run.timer) clearTimeout(run.timer);
+		run.timer = undefined;
 		void this.#pulse(conversationId, run);
 	}
 
@@ -452,11 +469,10 @@ export class TypingIndicator implements TypingPort {
 		this.#runs.delete(conversationId);
 	}
 
-	async #pulse(
-		conversationId: string,
-		run: { deadline: number; timer: ReturnType<typeof setTimeout> | undefined },
-	): Promise<void> {
+	async #pulse(conversationId: string, run: TypingRun): Promise<void> {
 		if (this.#runs.get(conversationId) !== run) return;
+		run.pulsing = true;
+		run.again = false;
 		try {
 			const channel = await this.discord.channels.fetch(conversationId);
 			if (!isDiscordTypingChannel(channel)) {
@@ -470,15 +486,30 @@ export class TypingIndicator implements TypingPort {
 			);
 			this.#runs.delete(conversationId);
 			return;
+		} finally {
+			run.pulsing = false;
 		}
 		if (this.#runs.get(conversationId) !== run) return;
 		if (Date.now() >= run.deadline) {
 			this.#runs.delete(conversationId);
 			return;
 		}
+		if (run.again) {
+			void this.#pulse(conversationId, run);
+			return;
+		}
 		run.timer = setTimeout(() => void this.#pulse(conversationId, run), this.refreshMs);
 	}
 }
+
+type TypingRun = {
+	deadline: number;
+	timer: ReturnType<typeof setTimeout> | undefined;
+	/** A sendTyping round-trip is in flight. */
+	pulsing: boolean;
+	/** A refresh arrived mid-pulse; pulse again once it settles. */
+	again: boolean;
+};
 
 /** The slice of a fetched Discord message presence needs: react, and remove our own reaction. */
 export interface PresenceMessageLike {
@@ -727,25 +758,21 @@ export async function settleDiscordDelivery(
 		try {
 			await settleDiscordReaction(gateway, discord, message, reactions.resolver, reactions.limiter);
 		} finally {
-			await status?.clear(message.origin.conversationId);
-			typing?.end(message.origin.conversationId);
+			await settleTurnPresence(message, typing, status);
 		}
 		return;
 	}
 	try {
-		const channel = await discord.channels.fetch(message.origin.conversationId);
-		if (!isDiscordTextChannel(channel)) {
-			throw Object.assign(new Error(`Discord channel ${message.origin.conversationId} cannot receive messages`), {
-				code: 10003,
-			});
-		}
-		const text = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
+		const { channel, notice } = await resolveDeliveryChannel(discord, message.origin, deliveryId);
+		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
+		const text = notice ? `${notice}\n${body}` : body;
 		const chunks = chunkDiscordMessage(text);
 		for (let index = 0; index < chunks.length; index++) {
 			// Reply-threading applies to the first chunk only; failIfNotExists keeps a
 			// deleted target from failing the whole delivery.
 			const chunk = chunks[index] as string;
-			if (index === 0 && message.replyToMessageId)
+			// A reply reference points into the thread, so it is dropped on parent fallback.
+			if (index === 0 && message.replyToMessageId && !notice)
 				await channel.send({
 					content: chunk,
 					reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
@@ -765,8 +792,79 @@ export async function settleDiscordDelivery(
 			ambiguous: deliveryFailureIsAmbiguous(error),
 		});
 	} finally {
-		await status?.clear(message.origin.conversationId);
-		typing?.end(message.origin.conversationId);
+		await settleTurnPresence(message, typing, status);
+	}
+}
+
+/**
+ * Only the turn's final reply ends its working status. Mid-turn speech and
+ * reactions arrive with `final: false` while the persona is still streaming:
+ * tearing presence down on them left the room looking idle for the rest of the
+ * turn. Posting a message does clear Discord's typing hint, so it is re-sent
+ * at once instead of waiting for the next refresh tick.
+ */
+async function settleTurnPresence(
+	message: ChatMessagePayload,
+	typing: TypingPort | undefined,
+	status: WorkingStatus | undefined,
+): Promise<void> {
+	if (!message.final) {
+		if (!message.reaction) typing?.refresh(message.origin.conversationId);
+		return;
+	}
+	await status?.clear(message.origin.conversationId);
+	typing?.end(message.origin.conversationId);
+}
+
+interface ArchivableThreadLike {
+	readonly archived: boolean | null;
+	setArchived(archived: boolean): Promise<unknown>;
+}
+
+function isArchivedThread(value: unknown): value is ArchivableThreadLike {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"archived" in value &&
+		value.archived === true &&
+		"setArchived" in value &&
+		typeof value.setArchived === "function"
+	);
+}
+
+async function fetchTextChannel(discord: DiscordClientLike, id: string): Promise<DiscordTextChannelLike> {
+	const channel = await discord.channels.fetch(id);
+	if (!isDiscordTextChannel(channel))
+		throw Object.assign(new Error(`Discord channel ${id} cannot receive messages`), { code: 10003 });
+	return channel;
+}
+
+/**
+ * Resolves where a delivery is posted. A thread archives after inactivity, and
+ * posting into it only auto-unarchives when the bot holds the right permission,
+ * so an archived thread is explicitly unarchived first. When that fails the
+ * reply goes to the parent channel with a visible notice and a log line: a
+ * monitor result that silently vanishes behind an archived thread is the worst
+ * outcome, because its schedule still looks healthy.
+ */
+async function resolveDeliveryChannel(
+	discord: DiscordClientLike,
+	origin: ChatMessagePayload["origin"],
+	deliveryId: string,
+): Promise<{ readonly channel: DiscordTextChannelLike; readonly notice?: string }> {
+	const channel = await fetchTextChannel(discord, origin.conversationId);
+	if (origin.kind !== "thread" || !origin.parentId || !isArchivedThread(channel)) return { channel };
+	try {
+		await channel.setArchived(false);
+		return { channel };
+	} catch (error) {
+		const reason = `thread ${origin.conversationId} is archived and could not be unarchived (${errorMessage(error)})`;
+		const parent = await fetchTextChannel(discord, origin.parentId);
+		console.error(`Discord delivery ${deliveryId}: ${reason}; delivered to parent channel ${origin.parentId} instead.`);
+		return {
+			channel: parent,
+			notice: `[thread <#${origin.conversationId}> is archived and could not be unarchived (${errorMessage(error)}); posting here instead]`,
+		};
 	}
 }
 
@@ -972,19 +1070,16 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 		gateway.sendReaction(reaction, user, "remove", discord.user);
 	});
 	discord.on("interactionCreate", (interaction) => {
-		if (interaction.isChatInputCommand()) void handleSlashCommand(interaction, gateway);
+		if (interaction.isAutocomplete()) void handleModelAutocomplete(interaction, gateway);
+		else if (interaction.isChatInputCommand()) void handleSlashCommand(interaction, gateway);
 	});
 	discord.once("ready", () => {
 		console.log("Discord adapter connected.");
-		// Slash-command mapping: /new and /reset are first-class Discord commands
-		// that route into the gateway's session-reset verbs for the invoking
+		// Slash-command mapping: /new, /reset and /model are first-class Discord
+		// commands that route into the gateway's chat-command verbs for the invoking
 		// conversation (typing "/new" as chat text never reaches messageCreate).
 		void discord.application?.commands
-			.set([
-				{ name: "new", description: "Start a fresh persona session in this conversation" },
-				{ name: "reset", description: "Reset this conversation's persona session" },
-				{ name: "restart", description: "Restart the gateway process (owner only)" },
-			])
+			.set([...DISCORD_SLASH_COMMANDS])
 			.catch((error: unknown) =>
 				console.error(
 					`Discord slash-command registration failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -997,10 +1092,107 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 	await discord.login(config.token);
 }
 
+/** Discord application-command option types used by the registration below. */
+const SUBCOMMAND_OPTION = 1;
+const STRING_OPTION = 3;
+/** Discord caps an autocomplete response at 25 choices. */
+const AUTOCOMPLETE_LIMIT = 25;
+
+/**
+ * Every slash command the adapter registers. `/model` mirrors the gateway's
+ * `/model`, `/model set <choice>` and `/model clear` text commands; the
+ * choice autocompletes from the gateway's model catalog so nobody has to
+ * remember preset names, but free text is still accepted.
+ */
+export const DISCORD_SLASH_COMMANDS = [
+	{ name: "new", description: "Start a fresh persona session in this conversation" },
+	{ name: "reset", description: "Reset this conversation's persona session" },
+	{ name: "restart", description: "Restart the gateway process (owner only)" },
+	{
+		name: "model",
+		description: "Show or change the model for this conversation",
+		options: [
+			{ type: SUBCOMMAND_OPTION, name: "show", description: "Show the effective model and where it comes from" },
+			{
+				type: SUBCOMMAND_OPTION,
+				name: "set",
+				description: "Use a gjc preset or model selector for this conversation",
+				options: [
+					{
+						type: STRING_OPTION,
+						name: "choice",
+						description: "Preset name, provider/model selector, or preset:/model: prefixed name",
+						required: true,
+						autocomplete: true,
+					},
+				],
+			},
+			{ type: SUBCOMMAND_OPTION, name: "clear", description: "Drop this conversation's override" },
+		],
+	},
+] as const satisfies ReadonlyArray<{
+	readonly name: string;
+	readonly description: string;
+	readonly options?: ReadonlyArray<{
+		readonly type: number;
+		readonly name: string;
+		readonly description: string;
+		readonly options?: ReadonlyArray<{
+			readonly type: number;
+			readonly name: string;
+			readonly description: string;
+			readonly required?: boolean;
+			readonly autocomplete?: boolean;
+		}>;
+	}>;
+}>;
+
+/** Duck-typed slice of a Discord autocomplete interaction. */
+export interface AutocompleteInteractionLike {
+	isAutocomplete?(): boolean;
+	readonly commandName?: string;
+	readonly options: { getFocused(): string };
+	respond(choices: Array<{ name: string; value: string }>): Promise<unknown>;
+}
+
+/**
+ * Answers `/model set` autocomplete from the gateway's catalog. Fails soft: an
+ * unreachable gateway or unreadable catalog yields an empty list, which Discord
+ * shows as "no options" while still accepting a typed choice.
+ */
+export async function handleModelAutocomplete(
+	interaction: AutocompleteInteractionLike,
+	gateway: Pick<ReconnectingGateway, "modelChoices">,
+	log: Pick<Console, "error"> = console,
+): Promise<void> {
+	if (!interaction.isAutocomplete?.() || interaction.commandName !== "model") return;
+	let choices: readonly string[] = [];
+	try {
+		choices = await gateway.modelChoices();
+	} catch (error) {
+		log.error(`Discord /model autocomplete failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	const needle = interaction.options.getFocused().trim().toLowerCase();
+	const matches = choices
+		.filter((choice) => choice.toLowerCase().includes(needle))
+		.slice(0, AUTOCOMPLETE_LIMIT)
+		.map((choice) => ({ name: choice, value: choice }));
+	try {
+		await interaction.respond(matches);
+	} catch (error) {
+		log.error(`Discord /model autocomplete reply failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
 /** Duck-typed slice of a Discord chat-input command interaction. */
 export interface SlashInteractionLike {
 	isChatInputCommand?(): boolean;
 	readonly commandName?: string;
+	/** Present for commands with subcommands/options (`/model`). */
+	readonly options?: {
+		getSubcommand(required?: boolean): string | null;
+		getString(name: string, required?: boolean): string | null;
+	};
 	readonly id: string;
 	readonly user?: {
 		readonly id: string;
@@ -1035,12 +1227,27 @@ export async function handleSlashCommand(
 	log: Pick<Console, "error"> = console,
 ): Promise<void> {
 	if (!interaction.isChatInputCommand?.()) return;
-	if (interaction.commandName !== "new" && interaction.commandName !== "reset") return;
+	const command = interaction.commandName;
+	if (command !== "new" && command !== "reset" && command !== "model") return;
 	if (!interaction.channel || !interaction.user) return;
 	try {
+		let text = `/${command}`;
+		if (command === "model") {
+			const subcommand = interaction.options?.getSubcommand(false) ?? "show";
+			if (subcommand === "set") {
+				const choice = interaction.options?.getString("choice")?.trim() ?? "";
+				// An empty choice would reach the gateway as a bare `/model` read and
+				// look like an accepted change that did nothing.
+				if (!choice) {
+					await interaction.reply({ content: "choose a model: `/model set <choice>`", ephemeral: true });
+					return;
+				}
+				text = `/model set ${choice}`;
+			} else if (subcommand === "clear") text = "/model clear";
+		}
 		const origin = discordMessageOrigin({ author: { id: interaction.user.id }, channel: interaction.channel });
 		const interactionServerTag = resolveServerTag(interaction.user);
-		const result = await gateway.requestInbound(`slash-${interaction.id}`, origin, `/${interaction.commandName}`, {
+		const result = await gateway.requestInbound(`slash-${interaction.id}`, origin, text, {
 			mentioned: true,
 			group: origin.kind !== "dm",
 			authorId: interaction.user.id,
@@ -1051,10 +1258,11 @@ export async function handleSlashCommand(
 			...(interactionServerTag ? { authorServerTag: interactionServerTag } : {}),
 		});
 		// Honest ack: the gateway allowlist may decline the command (non-owner in a
-		// group surface) — never claim a reset that did not happen.
+		// group surface) — never claim a reset that did not happen. `/model` never
+		// resets the session; the gateway posts the resulting selection itself.
 		await interaction.reply(
 			result?.engaged
-				? { content: "🦞 session reset", ephemeral: true }
+				? { content: command === "model" ? "🦞 model command accepted" : "🦞 session reset", ephemeral: true }
 				: { content: "not authorized for session commands here", ephemeral: true },
 		);
 	} catch (error) {
@@ -1629,6 +1837,14 @@ export class ReconnectingGateway {
 		});
 	}
 
+	/** `/model set` autocomplete source; throws when the gateway link is down. */
+	async modelChoices(): Promise<readonly string[]> {
+		const client = this.#client;
+		if (!client) throw new Error("gateway link not connected");
+		const result = await client.request<SessionModelChoicesResult>("session.modelChoices");
+		return result.choices;
+	}
+
 	/** Like sendInbound but reports the gateway's engagement decision to the caller. */
 	async requestInbound(
 		messageId: string,
@@ -1672,7 +1888,13 @@ export class ReconnectingGateway {
 					this.typing?.begin(origin.conversationId);
 				}
 				return "acked";
-			} catch {
+			} catch (error) {
+				// Never silent (#176): a live message the gateway did not accept is only
+				// recovered by the next backfill pass, so the drop must be traceable to
+				// the message and conversation it belongs to.
+				console.error(
+					`Discord chat.send failed message=${messageId} channel=${origin.conversationId}: ${summarizeRecoveryFailure(error)}; left for recovery.`,
+				);
 				this.scheduleReconnect();
 				return "unavailable";
 			}

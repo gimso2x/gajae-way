@@ -293,21 +293,58 @@ export class ScriptedSessionPort implements SessionPort {
 	/** When set, status omits startedAt (older gjc reports), exercising the batch acceptedAt floor. */
 	omitStartedAt = false;
 
-	readonly failureEvidence = new Map<string, { reason: "unsupported_input_status" | "context_exhausted" }>();
+	readonly failureEvidence = new Map<
+		string,
+		{ reason: "unsupported_input_status" | "context_exhausted" | "provider_quota_exhausted" }
+	>();
 	readonly failureEvidenceProbes: Array<{
 		sessionId: string;
 		repo: string;
 		startedAtMs: number;
 		terminalAtMs: number;
 	}> = [];
+	readonly failedTransportCauseMap = new Map<
+		string,
+		{
+			kind: string;
+			nativeErrorCode?: string;
+			http2RstCode?: number;
+			status?: number;
+			requestBytes?: number;
+			retryMaxAttempts?: number;
+			endpointClass?: string;
+		}
+	>();
 
-	setFailedTurnEvidence(sessionId: string, reason: "unsupported_input_status" | "context_exhausted"): void {
+	setFailedTurnEvidence(
+		sessionId: string,
+		reason: "unsupported_input_status" | "context_exhausted" | "provider_quota_exhausted",
+	): void {
 		this.failureEvidence.set(sessionId, { reason });
+	}
+
+	setFailedTransportCause(
+		sessionId: string,
+		cause: {
+			kind: string;
+			nativeErrorCode?: string;
+			http2RstCode?: number;
+			status?: number;
+			requestBytes?: number;
+			retryMaxAttempts?: number;
+			endpointClass?: string;
+		},
+	): void {
+		this.failedTransportCauseMap.set(sessionId, cause);
 	}
 
 	async failedTurnEvidence(input: { sessionId: string; repo: string; startedAtMs: number; terminalAtMs: number }) {
 		this.failureEvidenceProbes.push(input);
 		return this.failureEvidence.get(input.sessionId);
+	}
+
+	async failedTransportCause(input: { sessionId: string; repo: string; startedAtMs: number; terminalAtMs: number }) {
+		return this.failedTransportCauseMap.get(input.sessionId);
 	}
 
 	async status(input: { sessionId: string; repo: string; opRef: string }): Promise<StatusReport> {

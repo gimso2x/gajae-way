@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { type ConfigOverrides, loadConfig } from "./config";
 import { seedDefaultMonitors } from "./monitors/defaults";
 import { MonitorRegistry } from "./monitors/registry";
-import { GlobalGjcClient, type GlobalGjcClientDependencies } from "./orchestrator/broker";
+import { GjcCliUnavailableError, GlobalGjcClient, type GlobalGjcClientDependencies } from "./orchestrator/broker";
 import { sanitizeDiagnostic } from "./orchestrator/rebind";
 import { BrokerSessionPort } from "./orchestrator/session-port";
 import { TailRunner } from "./orchestrator/tail-runner";
@@ -30,9 +30,62 @@ export interface BootGatewayOptions {
 	readonly onlyNew?: boolean;
 	/** Test seam for the pid-record/liveness ports; production reads the process table. */
 	readonly takeover?: TakeoverPorts;
+	/** How long boot waits for an unavailable shared broker before exiting; see {@link waitForBroker}. */
+	readonly brokerWait?: BrokerWaitOptions;
 }
 
-export async function bootGateway(options: BootGatewayOptions = {}): Promise<GatewayServer> {
+export interface BrokerWaitOptions {
+	readonly initialMs?: number;
+	readonly maxMs?: number;
+	/** Total time boot keeps retrying before the failure is fatal. */
+	readonly deadlineMs?: number;
+	readonly sleep?: (ms: number) => Promise<void>;
+	readonly now?: () => number;
+	readonly log?: (line: string) => void;
+}
+
+export const BROKER_WAIT_DEFAULTS = { initialMs: 1_000, maxMs: 30_000, deadlineMs: 10 * 60_000 } as const;
+
+/**
+ * Runs one broker boot step, waiting out a broker that is not up yet.
+ *
+ * After a host reboot the shared broker needs minutes to clear a stale lock and
+ * come back; a gateway that exits 1 on the first failed probe spins its service
+ * manager's fixed-delay restart loop until then (#182: 9 exits in 5 minutes,
+ * 131 in 72). Only {@link GjcCliUnavailableError} is waited on — a wrong gjc
+ * version or a rejected argv will not heal and still fails immediately. Every
+ * retry logs one line naming the cause, and the wait is bounded so a broker that
+ * never returns still ends in a supervised exit.
+ */
+export async function waitForBroker<T>(
+	step: string,
+	run: () => Promise<T>,
+	options: BrokerWaitOptions = {},
+): Promise<T> {
+	const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+	const now = options.now ?? Date.now;
+	const log = options.log ?? console.error;
+	const maxMs = options.maxMs ?? BROKER_WAIT_DEFAULTS.maxMs;
+	const deadline = now() + (options.deadlineMs ?? BROKER_WAIT_DEFAULTS.deadlineMs);
+	let wait = options.initialMs ?? BROKER_WAIT_DEFAULTS.initialMs;
+	for (let attempt = 1; ; attempt++) {
+		try {
+			return await run();
+		} catch (error) {
+			if (!(error instanceof GjcCliUnavailableError) || now() + wait > deadline) throw error;
+			log(`gateway_boot_waiting_for_broker step=${step} attempt=${attempt} retry_in_ms=${wait} ${diagnostic(error)}`);
+			await sleep(wait);
+			wait = Math.min(wait * 2, maxMs);
+		}
+	}
+}
+
+export interface BootedGateway extends GatewayServer {
+	/** The shared-broker client, so the daemon can report its outage state. */
+	readonly broker: GlobalGjcClient;
+}
+
+export async function bootGateway(options: BootGatewayOptions = {}): Promise<BootedGateway> {
 	const config = await loadConfig({ home: options.home, overrides: options.overrides });
 	await mkdir(config.home, { recursive: true, mode: 0o700 });
 	await chmod(config.home, 0o700);
@@ -58,7 +111,8 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 			const authority = { canonicalAgentDir: broker.agentDir, identity: `gjc:${broker.agentDir}` };
 			database.assertBrokerAuthority(authority, { initializeEmpty: true });
 			// F92-C-P1-005: the Stage 0 floor is a boot gate, never an offline config check.
-			await broker.preflight();
+			const client = broker;
+			await waitForBroker("preflight", () => client.preflight(), options.brokerWait);
 			const persona = new PersonaLoader(config.home);
 			await persona.ensureWorkspace();
 			// Generic product default: memory maintenance crons exist on every fresh
@@ -76,7 +130,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 			// checks and broker preflight made an adapter that systemd restarted
 			// together with this gateway (PartOf) read as the previous generation.
 			const startedAt = new Date(Date.now() - process.uptime() * 1000).toISOString();
-			await broker.start();
+			await waitForBroker("start", () => client.start(), options.brokerWait);
 			const supervisor = broker;
 			const tailRunner = new TailRunner({
 				// One resident `gjc sdk serve --stdio` relay per session: commands go
@@ -122,7 +176,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 						overrides: options.overrides,
 					});
 			console.error(JSON.stringify({ recovery: { recovered: pending, pending, pruned } }));
-			return server;
+			return { stop: (reason) => server.stop(reason), broker: supervisor };
 		} catch (error) {
 			try {
 				await broker?.stop();

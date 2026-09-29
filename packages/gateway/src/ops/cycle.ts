@@ -1,4 +1,6 @@
+import { statfsSync } from "node:fs";
 import {
+	type AgentDiskView,
 	type CycleGateReason,
 	type CyclePhase,
 	type CycleSessionView,
@@ -40,6 +42,44 @@ const SETTLED_JOB_STATES = new Set(["attempt_ended", "done", "aborted"]);
  * moving has only ever meant a stuck actor.
  */
 export const INBOUND_STARVATION_MS = 10 * 60_000;
+/**
+
+ * Monitor authoring loss (#160): scheduled events exhausting retries with no
+ * authored output while chat delivery stays healthy. Only the latest window
+ * counts, so a loss that has since aged out stops gating without operator
+ * action. One lost slot of one type is noise; this many distinct types whose
+ * latest slot was lost, or this many consecutive lost slots of one type, is an
+ * authoring-lane outage (observed: 19h of 100% loss with every other gate green).
+ */
+export const MONITOR_AUTHORING_LOSS_WINDOW_MS = 24 * 60 * 60_000;
+export const MONITOR_AUTHORING_LOSS_TYPES = 2;
+export const MONITOR_AUTHORING_LOSS_CONSECUTIVE = 2;
+/**
+ * Agent-directory headroom floor (issue #15). GJC keeps sessions, blobs and
+ * recovery snapshots under its agent directory with no retention or reaper
+ * (measured 8.9 GB of `.gjc-recovery`, later 70+ GB total), and the gateway may
+ * not scan or delete GJC-owned state. The gateway's share of the fix is to
+ * gate the cycle before that growth reaches the disk-full cliff where session
+ * creation fails: under 10% of the volume or 5 GiB available, whichever trips
+ * first.
+ */
+export const AGENT_DISK_MIN_FREE_RATIO = 0.1;
+export const AGENT_DISK_MIN_FREE_BYTES = 5 * 1024 ** 3;
+
+/** Filesystem headroom for the agent directory; a failed probe reports null bytes, never a guess. */
+export function observeAgentDisk(path: string): AgentDiskView {
+	try {
+		const stats = statfsSync(path);
+		return { path, freeBytes: stats.bavail * stats.bsize, totalBytes: stats.blocks * stats.bsize };
+	} catch {
+		return { path, freeBytes: null, totalBytes: null };
+	}
+}
+
+function agentDiskLow(disk: AgentDiskView): boolean {
+	if (disk.freeBytes === null || disk.totalBytes === null) return true;
+	return disk.freeBytes < AGENT_DISK_MIN_FREE_BYTES || disk.freeBytes < disk.totalBytes * AGENT_DISK_MIN_FREE_RATIO;
+}
 
 export interface RuntimeCycleSources {
 	readonly sessionRows: Array<{
@@ -70,6 +110,8 @@ export interface RuntimeCycleSources {
 	readonly unsettledByOrigin: ReadonlyMap<string, { n: number; oldestMs: number }>;
 	readonly memoryIntents: ReadonlyMap<string, number>;
 	readonly monitorStages: ReadonlyMap<string, number>;
+	/** Event types whose latest terminal slots in the loss window were lost before authoring. */
+	readonly monitorAuthoringLost: ReturnType<GatewayDatabase["monitorAuthoringLossStreaks"]>;
 	readonly memoryClosing: boolean;
 	readonly instanceId: string;
 	/** Bound `work.run` lanes and the configured admission cap. */
@@ -83,21 +125,25 @@ export interface RuntimeCycleSources {
 	 * `awaiting_operator`, or `stalled` job is a crash-left or held worker.
 	 */
 	readonly settledWorkOrigins: ReadonlySet<string>;
+	/** Headroom of the broker-bound GJC agent directory; null when none is bound. */
+	readonly agentDisk: AgentDiskView | null;
 }
 
 export class RuntimeCycleProjector {
 	readonly #database: GatewayDatabase;
 	readonly #memory: { readonly queueDepth: number };
 	readonly #maxLanes: number;
+	readonly #agentDir: string | undefined;
 
 	constructor(
 		database: GatewayDatabase,
 		memory: { readonly queueDepth: number },
-		options: { readonly maxLanes?: number } = {},
+		options: { readonly maxLanes?: number; readonly agentDir?: string } = {},
 	) {
 		this.#database = database;
 		this.#memory = memory;
 		this.#maxLanes = options.maxLanes ?? DEFAULT_WORK_MAX_LANES;
+		this.#agentDir = options.agentDir;
 	}
 
 	/** Snapshots durable state and projects the runtime cycle. Read-only; no writes. */
@@ -141,6 +187,9 @@ export class RuntimeCycleProjector {
 			unsettledByOrigin: unsettled,
 			memoryIntents: new Map(memory.map((r) => [r.state, r.n])),
 			monitorStages: new Map(monitors.map((r) => [r.stage, r.n])),
+			monitorAuthoringLost: this.#database.monitorAuthoringLossStreaks(
+				new Date(nowMs - MONITOR_AUTHORING_LOSS_WINDOW_MS).toISOString(),
+			),
 			inboundPendingByOrigin: pendingByOrigin,
 			oldestStarvedPendingMs,
 			contextByOrigin,
@@ -155,6 +204,7 @@ export class RuntimeCycleProjector {
 					.filter((row) => SETTLED_JOB_STATES.has(row.state))
 					.map((row) => `${WORK_LANE_PREFIX}${row.lane_key.slice("work-".length)}`),
 			),
+			agentDisk: this.#agentDir === undefined ? null : observeAgentDisk(this.#agentDir),
 		};
 	}
 }
@@ -220,6 +270,13 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 	// `batched` rows used to strand forever while the projection stayed green).
 	if (sources.monitorStages.get("batched") || sources.monitorStages.get("dispatched"))
 		gates.add("monitor_settlement_stuck");
+	// Terminal pre-author loss is invisible to the stage census gates above
+	// (`failed_no_retry` is terminal), so a dead authoring lane read as healthy.
+	if (
+		sources.monitorAuthoringLost.length >= MONITOR_AUTHORING_LOSS_TYPES ||
+		sources.monitorAuthoringLost.some((lost) => lost.consecutive >= MONITOR_AUTHORING_LOSS_CONSECUTIVE)
+	)
+		gates.add("monitor_authoring_lost");
 	// Lane saturation is an operator condition: every further work.run is
 	// refused until a lane is retired, so it must not read as a healthy idle.
 	if (sources.activeLanes >= sources.maxLanes) gates.add("lane_capacity_exhausted");
@@ -229,6 +286,7 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 	// bricked on a disowned tail. Automation must read that as degraded.
 	if (sources.oldestStarvedPendingMs !== null && sources.oldestStarvedPendingMs >= INBOUND_STARVATION_MS)
 		gates.add("inbound_starved");
+	if (sources.agentDisk && agentDiskLow(sources.agentDisk)) gates.add("agent_disk_headroom");
 
 	const pendingInbound = sources.pendingInbound;
 	const unsettled = totalUnsettled(sources);
@@ -259,6 +317,7 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 		monitorEvents: [...sources.monitorStages.entries()]
 			.map(([stage, count]) => ({ stage, count }))
 			.sort((a, b) => a.stage.localeCompare(b.stage)),
+		monitorAuthoringLost: sources.monitorAuthoringLost,
 		deliveries: {
 			pending: sources.deliveryCounts.get("pending") ?? 0,
 			inflight: sources.deliveryCounts.get("inflight") ?? 0,
@@ -270,6 +329,7 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 		pendingInbound,
 		contextDiff: sources.contextDiff,
 		lanes: { active: sources.activeLanes, max: sources.maxLanes },
+		agentDisk: sources.agentDisk,
 	};
 }
 

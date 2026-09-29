@@ -23,8 +23,14 @@ import {
 } from "@gajae-gateway/subsession";
 import type { GjcModelSelection, GjcServiceTier } from "../config";
 import { type BrokerAuthority, BrokerAuthorityError, type GatewayDatabase } from "../store/db";
-import { type FailedTurnEvidence, type FailedTurnEvidenceInput, readFailedTurnEvidence } from "./failed-turn-evidence";
-import { sanitizeDiagnostic } from "./rebind";
+import {
+	type FailedTransportCause,
+	type FailedTurnEvidence,
+	type FailedTurnEvidenceInput,
+	readFailedTransportCause,
+	readFailedTurnEvidence,
+} from "./failed-turn-evidence";
+import { isRebindableCode, sanitizeDiagnostic } from "./rebind";
 import {
 	isRelayTransportFailure,
 	type RelayResponse,
@@ -62,6 +68,8 @@ export interface SessionPort {
 	terminateHost?(input: { sessionId: string; repo: string }): Promise<TerminateHostOutcome>;
 	/** Recognized current-session provider failure, never authorization to replay an operation. */
 	failedTurnEvidence?(input: FailedTurnEvidenceInput): Promise<FailedTurnEvidence | undefined>;
+	/** Transport failure cause from the same session transcript. */
+	failedTransportCause?(input: FailedTurnEvidenceInput): Promise<FailedTransportCause | undefined>;
 	/** Restores a saved, non-deleted session through `session.resume`; it never creates a replacement. */
 	resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding>;
 	send(input: SessionSendInput): Promise<SendReceipt>;
@@ -207,6 +215,11 @@ export type WorkerOutputResult =
 export interface SessionRequestInput extends SessionSendInput {
 	/** Stable caller identity carried into tail observability. */
 	readonly originKey?: string;
+	/**
+	 * Inactivity lease, not a wall-clock cap: the wait gives up only after this
+	 * long without a frame attributed to the turn. A turn that keeps emitting
+	 * (tool calls, deltas) is observed for as long as it progresses (issue #9).
+	 */
 	readonly waitTimeoutMs?: number;
 	readonly pollMs?: number;
 }
@@ -223,7 +236,7 @@ export class SessionRequestTimeoutError extends Error {
 	readonly lastStatus: StatusReport;
 
 	constructor(sessionId: string, opRef: string, lastStatus: StatusReport) {
-		super(`session operation ${opRef} did not reach a terminal status before the bounded request wait elapsed`);
+		super(`session operation ${opRef} emitted no attributable activity within the bounded request wait`);
 		this.name = "SessionRequestTimeoutError";
 		this.sessionId = sessionId;
 		this.opRef = opRef;
@@ -379,7 +392,7 @@ export class BrokerSessionPort implements SessionPort {
 			created = await this.#createSession(input.repo, idempotencyKey, input.model);
 		} catch (error) {
 			if (error instanceof BrokerAuthorityError) throw error;
-			if (input.epochRecovery === false) throw error;
+			if (input.epochRecovery === false || !isRebindableCode(sdkErrorCode(error))) throw error;
 			const rotations = this.#createRotations(input.originKey);
 			if (rotations >= MAX_POISONED_CREATE_ROTATIONS) {
 				console.error(
@@ -1080,12 +1093,16 @@ export class BrokerSessionPort implements SessionPort {
 		this.#assertOwned(input);
 		// One relay owns the whole request: the send, the terminal wait, and the
 		// final read. Monitor/batch authoring consumes no mid-turn content, so
-		// the handle's frames are only used for the stall alarm.
+		// the handle's frames only feed the stall alarm and the activity lease.
+		let lastActivityAt = this.#now();
 		const relay = await this.attachTail({
 			sessionId: input.sessionId,
 			brokerGeneration: 0,
 			repo: input.repo,
 			...(input.originKey ? { originKey: input.originKey } : {}),
+			onFrame: () => {
+				lastActivityAt = this.#now();
+			},
 			onStall: ({ elapsedMs }) =>
 				console.error(`session stall sessionId=${input.sessionId} opRef=${input.opRef} silentMs=${elapsedMs}`),
 		});
@@ -1126,10 +1143,14 @@ export class BrokerSessionPort implements SessionPort {
 				if (status.status.status === "unknown") throw sendError;
 				receipt = { sessionId: input.sessionId, operationRef: input.opRef } as SendReceipt;
 			}
-			const deadline = this.#now() + (input.waitTimeoutMs ?? DEFAULT_REQUEST_WAIT_MS);
+			// The wait leases on the turn's own activity: every frame the relay
+			// attributes to this op moves the deadline forward. A fixed 1800 s cap
+			// sat inside the ordinary duration of long monitor turns and killed the
+			// request record while the work was still landing (issue #9).
+			const leaseMs = input.waitTimeoutMs ?? DEFAULT_REQUEST_WAIT_MS;
 			const pollMs = input.pollMs ?? DEFAULT_STATUS_POLL_MS;
 			status ??= await readStatus();
-			while (!isTerminalStatus(status.status.status) && this.#now() < deadline) {
+			while (!isTerminalStatus(status.status.status) && this.#now() < lastActivityAt + leaseMs) {
 				this.checkStalls();
 				await this.#sleep(pollMs);
 				status = await readStatus();
@@ -1233,7 +1254,11 @@ export function parseWorkerOutputResponse(
 	if (!content) {
 		if (result.content !== undefined || result.textSummary !== undefined)
 			return { status: "unavailable", code: "invalid_evidence" };
-		return result.receiptState === "missing" || result.receiptState === "absent"
+		// The SDK's receipt state is monotonic missing -> present: a late agent_end
+		// can still attach the final body to this terminal op (#248), so `missing`
+		// is retryable within the bounded read budget. A terminal op whose receipt
+		// is `absent` contradicts the SDK contract and is not.
+		return result.receiptState === "absent"
 			? { status: "unavailable", code: "output_unavailable" }
 			: { status: "absent", code: "output_pending" };
 	}

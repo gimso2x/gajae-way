@@ -6,10 +6,11 @@ import { originKey } from "@gajae-gateway/protocol";
 import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { memoryRoot } from "../src/memory/doctrine";
+import { MonitorRegistry } from "../src/monitors/registry";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
-import { DeliveryLedger } from "../src/store/ledger";
+import { ACK_TIMEOUT_MS, DeliveryLedger } from "../src/store/ledger";
 import {
 	attachTestBrokerOwnership,
 	ScriptedSessionPort,
@@ -144,7 +145,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(22);
+	expect(client.frames[2].result.schemaVersion).toBe(24);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	expect(client.frames[2].result.contextDiff).toEqual({
 		unread: 0,
@@ -239,6 +240,57 @@ test("a connected adapter receives a failed delivery again on the periodic sweep
 	client.close();
 });
 
+test("inflight rows are not re-broadcast by the timed sweep within ack timeout", async () => {
+	const { client, database } = await startDeliveryServer({ deliverySweepIntervalMs: 50 });
+	const origin = { platform: "discord", kind: "dm", conversationId: "inflight-test", peerId: "owner" };
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "create-inflight",
+		verb: "chat.send",
+		params: { origin, text: "test inflight", engagement: { mentioned: false, group: false, authorId: "owner" } },
+	});
+	await waitFrame(client.frames, "create-inflight");
+	// Wait for the delivery to arrive
+	for (let attempt = 0; attempt < 400 && !client.frames.some((frame) => frame.event === "chat.message"); attempt++)
+		await Bun.sleep(5);
+	const initial = client.frames.find(
+		(frame) => frame.event === "chat.message" && frame.payload?.text === "the single reply body",
+	);
+	expect(initial).toBeDefined();
+	const deliveryId = initial.payload.deliveryId as string;
+
+	// Manually mark the delivery as inflight (simulating an in-flight state)
+	const ledger = new DeliveryLedger(database);
+	ledger.markInflight(deliveryId);
+	const row = ledger.get(deliveryId);
+	const updatedAt = Date.parse(row!.updatedAt);
+
+	// Count chat.message frames with this deliveryId before the sweep
+	const messagesBeforeSweep = client.frames.filter(
+		(frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId,
+	).length;
+
+	// Wait for multiple sweep cycles (timed sweep runs every 50ms)
+	await Bun.sleep(250);
+
+	// Verify no duplicate was broadcast during the ack timeout window
+	const messagesAfterWait = client.frames.filter(
+		(frame) => frame.event === "chat.message" && frame.payload?.deliveryId === deliveryId,
+	).length;
+	expect(messagesAfterWait).toBe(messagesBeforeSweep);
+
+	// Manually advance time to after the ack timeout in the ledger
+	const nowAfterTimeout = updatedAt + ACK_TIMEOUT_MS + 100;
+	const undelivered = ledger.listUndelivered(24 * 60 * 60_000, nowAfterTimeout, false);
+
+	// After ack timeout, the inflight row should be returned
+	expect(undelivered).toHaveLength(1);
+	expect(undelivered[0]).toMatchObject({ deliveryId, state: "inflight" });
+
+	client.close();
+});
+
 test("expiry logs and notifies the owner once, while status exposes metadata without payload", async () => {
 	const logs: string[] = [];
 	const originalError = console.error;
@@ -325,6 +377,68 @@ test("expiry logs and notifies the owner once, while status exposes metadata wit
 	} finally {
 		console.error = originalError;
 	}
+});
+
+test("an expired monitor delivery fails its authored events with evidence; a confirmed redrive delivers them (#94)", async () => {
+	const { client, database } = await startDeliveryServer();
+	const monitor = new MonitorRegistry(database).add({
+		name: "watch",
+		trigger: { kind: "cron", schedule: "0 */2 * * *" },
+		eventTypes: ["memory.canonicalize"],
+		burstPolicy: "dedupe",
+		enabled: false,
+	});
+	const batchId = crypto.randomUUID();
+	const eventId = crypto.randomUUID();
+	database.monitorEventCreate({
+		eventId,
+		monitorId: monitor.monitorId,
+		eventType: "memory.canonicalize",
+		payloadJson: "{}",
+		firedAt: new Date().toISOString(),
+	});
+	database.monitorEventUpdate(eventId, "authored", batchId);
+	database.authoredOutputCreate(eventId, "report");
+	const origin = { platform: "loopback", kind: "loopback", conversationId: "loopback" } as const;
+	const deliveryId = "monitor-delivery";
+	new DeliveryLedger(database).createPending({
+		deliveryId,
+		turnId: batchId,
+		originKey: originKey(origin),
+		payloadJson: JSON.stringify({
+			turnId: batchId,
+			origin,
+			role: "assistant",
+			text: "report",
+			final: true,
+			deliveryId,
+		}),
+	});
+	for (let attempt = 1; attempt <= 5; attempt++) {
+		const id = `monitor-fail-${attempt}`;
+		client.send({
+			v: "0.1",
+			type: "request",
+			id,
+			verb: "delivery.fail",
+			params: { deliveryId, reason: "discord 503", ambiguous: false },
+		});
+		await waitFrame(client.frames, id);
+	}
+	const eventStage = () => database.monitorEventRows().find((row) => row.event_id === eventId)?.stage;
+	expect(eventStage()).toBe("failed_no_retry");
+	expect(database.monitorFailure(eventId)).toMatchObject({
+		code: "delivery_expired",
+		detail: `delivery ${deliveryId} expired after 5 attempts: discord_503`,
+	});
+	expect(database.authoredOutput(eventId)).toBe("report");
+
+	client.send({ v: "0.1", type: "request", id: "redrive", verb: "ops.redeliver", params: { deliveryId } });
+	await waitFrame(client.frames, "redrive");
+	client.send({ v: "0.1", type: "request", id: "confirm", verb: "delivery.confirm", params: { deliveryId } });
+	await waitFrame(client.frames, "confirm");
+	expect(eventStage()).toBe("delivered");
+	client.close();
 });
 
 test("ops.redeliver requeues expired rows by id or since and immediately publishes them", async () => {
@@ -1084,6 +1198,66 @@ test("an open-channel burst from several authors: the first is the turn, later o
 	client.close();
 });
 
+test("an inbound ledger write failure fails the mention closed and logs a drop naming the message (#176)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		channels: { townhall: { engagement: "mention-open" } },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const turns: string[] = [];
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async (_session, text) => {
+			turns.push(text);
+			return "ok";
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	database.inboundEnqueue = () => {
+		throw new Error("database is locked");
+	};
+	const origin = { platform: "discord", kind: "channel", conversationId: "townhall" };
+	const logs: string[] = [];
+	const original = console.error;
+	console.error = (...args: unknown[]) => logs.push(args.map(String).join(" "));
+	try {
+		server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+		const client = await connect(config.socketPath);
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		client.send({
+			v: "0.1",
+			type: "request",
+			id: "mention",
+			verb: "chat.send",
+			params: {
+				origin,
+				messageId: "1546123517383286824",
+				text: "<@bot> daily handoff",
+				engagement: { mentioned: true, group: true, authorId: "quant-gajae" },
+			},
+		});
+		await waitFrame(client.frames, "mention");
+		// Fail closed: the adapter sees an error, so the message stays eligible for recovery.
+		expect(client.frames.find((frame) => frame.id === "mention")?.type).toBe("error");
+		await Bun.sleep(50);
+		expect(turns).toEqual([]);
+		// And never silent: the drop names the message, the origin, and the reason.
+		expect(logs).toContain(
+			"inbound_dropped message=1546123517383286824 origin=discord/channel/townhall engaged=true reason=ingest_error: database is locked",
+		);
+		client.close();
+	} finally {
+		console.error = original;
+	}
+});
+
 test("a backlog left pending across an outage is answered on boot, never expired", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
@@ -1399,6 +1573,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	expect(jobs.result.jobs).toHaveLength(1);
 	expect(jobs.result.jobs[0].job_id).toBe(jobId);
 	expect(jobs.result.jobs[0].lane_key).toBe("work-Repo.Fix-2");
+	expect(jobs.result.jobs[0].reports).toEqual({ pending: 0, claimed: 0, held: 0, undeliverable: 0 });
 	// The completed ATTEMPT closed; the JOB stays continuable (attempt_ended),
 	// never a terminal work-failure.
 	expect(jobs.result.jobs[0].state).toBe("attempt_ended");
@@ -1444,6 +1619,95 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	}
 	expect(database.laneJobJson(jobId)).toBe(damaged);
 	expect(sessionPort.sends).toHaveLength(1);
+	client.close();
+});
+
+test("work.jobs projects each lane's last commit, accept time and current attempt (issue #67)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const repo = join(directory, "lane-repo");
+	await mkdir(repo);
+	const git = (...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", repo, ...args], {
+			stdout: "pipe",
+			stderr: "pipe",
+			env: {
+				...process.env,
+				GIT_AUTHOR_NAME: "lane",
+				GIT_AUTHOR_EMAIL: "lane@example.invalid",
+				GIT_COMMITTER_NAME: "lane",
+				GIT_COMMITTER_EMAIL: "lane@example.invalid",
+				GIT_COMMITTER_DATE: "2026-09-01T00:00:00Z",
+			},
+		});
+		expect(result.exitCode).toBe(0);
+		return result.stdout.toString().trim();
+	};
+	git("init", "--quiet");
+	git("commit", "--allow-empty", "--quiet", "-m", "baseline");
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	let committed = false;
+	const sessionPort = sessionPortFromResponder({
+		bind: async (key, epoch) => ({ sessionId: bindWorkFixture(key, epoch) }),
+		respond: async () => {
+			// The first worker commits; that HEAD move is the progress signal the row must show.
+			if (!committed) git("commit", "--allow-empty", "--quiet", "-m", "lane: land the fix");
+			committed = true;
+			return "worker result";
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "w",
+		verb: "work.run",
+		params: { name: "row", text: "fix it", cwd: repo },
+	});
+	await waitFrame(client.frames, "w");
+	const run = client.frames.find((frame) => frame.id === "w");
+	expect(run.type).toBe("response");
+	// A second lane whose worktree has since been removed (Q5: manual cleanup).
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "gone",
+		verb: "work.run",
+		params: { name: "gone", text: "x", cwd: join(directory, "missing-worktree") },
+	});
+	await waitFrame(client.frames, "gone");
+
+	client.send({ v: "0.1", type: "request", id: "jobs", verb: "work.jobs" });
+	await waitFrame(client.frames, "jobs");
+	const jobs = client.frames.find((frame) => frame.id === "jobs").result.jobs;
+	const row = jobs.find((job: { lane_key: string }) => job.lane_key === "work-row");
+	const record = parseLaneJobRecord(database.laneJobJson(row.job_id) as string);
+	expect(row.accepted_at).toBe(record.createdAt);
+	expect(row.attempt).toEqual({
+		op_ref: run.result.opRef,
+		started_at: record.attempts[0].startedAt,
+		ended_at: record.attempts[0].endedAt,
+	});
+	expect(row.last_commit).toEqual({
+		sha: git("rev-parse", "HEAD"),
+		subject: "lane: land the fix",
+		committed_at: "2026-09-01T00:00:00.000Z",
+	});
+	// No repository evidence is reported as absent, never invented.
+	const gone = jobs.find((job: { lane_key: string }) => job.lane_key === "work-gone");
+	expect(gone.last_commit).toBeNull();
 	client.close();
 });
 
@@ -2061,6 +2325,7 @@ test("control tokens never leak: a silence token inside a preamble silences, and
 });
 async function workSocketFixture() {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-async-socket-"));
+	const target = { platform: "discord" as const, kind: "channel" as const, conversationId: "results" };
 	const config: GatewayConfig = {
 		schemaVersion: 1,
 		home: directory,
@@ -2069,6 +2334,7 @@ async function workSocketFixture() {
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		work: { maxLanes: 2 },
+		ownerTarget: { origin: target },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
 	const port = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
@@ -2099,13 +2365,12 @@ async function workSocketFixture() {
 
 test("socket work.start accepts before terminal, status/steer stay available, one completion notice", async () => {
 	const f = await workSocketFixture();
-	const target = { platform: "discord", kind: "channel", conversationId: "results" };
 	f.client.send({
 		v: "0.1",
 		type: "request",
 		id: "start",
 		verb: "work.start",
-		params: { name: "a", text: "work", cwd: directory, notify: target },
+		params: { name: "a", text: "work", cwd: directory },
 	});
 	await waitFrame(f.client.frames, "start");
 	const receipt = f.client.frames.find((frame) => frame.id === "start").result;
@@ -2138,7 +2403,7 @@ test("socket work.start accepts before terminal, status/steer stay available, on
 	expect(notices).toHaveLength(1);
 	expect(notices[0].payload).toMatchObject({
 		turnId: receipt.opRef,
-		origin: target,
+		origin: { platform: "discord", kind: "channel", conversationId: "results" },
 		text: "[lane a] completed: socket result",
 	});
 	expect(f.port.sends).toHaveLength(1);

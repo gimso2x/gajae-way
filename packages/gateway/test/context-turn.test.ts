@@ -205,6 +205,43 @@ test("a chatty turn past the mid-work part budget still delivers its final answe
 	client.close();
 });
 
+test("#247: every done trigger names the delivery that closed it or why none did", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text, _preamble, _progress, options) => {
+			if (text.includes("interim then silent")) {
+				options?.onAssistantText?.("visible interim answer");
+				return "[SILENT]";
+			}
+			if (text.includes("react only")) return "[REACT:👍]";
+			if (text.includes("stay quiet")) return "[SILENT]";
+			throw new Error("runtime failed before reply");
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	const settle = async (id: string, text: string) => {
+		const turn = sessionPort.sends.length;
+		send(client, id, text);
+		await waitUntil(() => sessionPort.sends.length > turn);
+		const opRef = sessionPort.sends[turn]?.opRef ?? "";
+		await waitUntil(() => database.inboundTurnRow(opRef)?.turn_state === "done");
+		return database.inboundTurnRow(opRef)?.terminal_delivery_id ?? null;
+	};
+	const deliveryIdOf = (body: string) =>
+		client.frames.find((frame) => frame.event === "chat.message" && frame.payload.text === body)?.payload.deliveryId;
+
+	const interim = await settle("interim-silent", "interim then silent");
+	expect(JSON.parse(interim ?? "null")).toEqual({ 0: deliveryIdOf("visible interim answer") });
+	const reaction = await settle("react-only", "react only");
+	expect(JSON.parse(reaction ?? "null")).toEqual({ 0: deliveryIdOf("👍") });
+	expect(JSON.parse((await settle("silent", "stay quiet")) ?? "null")).toEqual({ none: "silent" });
+	expect(JSON.parse((await settle("failed", "fail please")) ?? "null")).toEqual({ none: "turn_failed" });
+	expect(database.inboundTerminalLinkAudit(new Date(0).toISOString())).toEqual({ done: 4, unlinked: 0 });
+	client.close();
+});
+
 test("a delivered intermediate reaction followed by runtime failure consumes the selected context", async () => {
 	const gatewayConfig = await config();
 	const database = await GatewayDatabase.open(gatewayConfig.dbPath);

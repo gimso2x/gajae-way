@@ -8,9 +8,11 @@ import { DiscordAdapterStartupError, loadDiscordAdapterConfig } from "../src/con
 import {
 	addressedTurn,
 	chunkDiscordMessage,
+	DISCORD_SLASH_COMMANDS,
 	type DiscordClientLike,
 	engagementForMessage,
 	type GatewayClientLike,
+	handleModelAutocomplete,
 	handleSlashCommand,
 	isPresenceReaction,
 	LruSet,
@@ -205,6 +207,90 @@ test("prefixes ambiguous redelivery and records failed settlement", async () => 
 	expect(requests).toEqual([
 		{ verb: "delivery.fail", params: { deliveryId: "delivery-1", reason: "timeout after dispatch", ambiguous: true } },
 	]);
+});
+
+const threadDelivery = (text: string): ChatMessagePayload => ({
+	...delivery(text),
+	origin: { platform: "discord", kind: "thread", conversationId: "thread-1", parentId: "channel-1" },
+});
+
+test("an archived thread is unarchived before delivery and the reply lands in the thread", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: Array<[string, unknown]> = [];
+	const thread = {
+		archived: true,
+		setArchived: async (archived: boolean) => {
+			thread.archived = archived;
+		},
+		send: async (payload: unknown) => void sent.push(["thread-1", payload]),
+	};
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async (id: string) =>
+				id === "thread-1" ? thread : { send: async (payload: unknown) => void sent.push([id, payload]) },
+		},
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, threadDelivery("monitor result"));
+	expect(thread.archived).toBe(false);
+	expect(sent).toEqual([["thread-1", "monitor result"]]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("an archived thread that cannot be unarchived falls back to its parent channel and says why", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: Array<[string, unknown]> = [];
+	const errors: string[] = [];
+	const thread = {
+		archived: true,
+		setArchived: async () => Promise.reject(Object.assign(new Error("Missing Permissions"), { code: 50013 })),
+		send: async (payload: unknown) => void sent.push(["thread-1", payload]),
+	};
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async (id: string) =>
+				id === "thread-1" ? thread : { send: async (payload: unknown) => void sent.push([id, payload]) },
+		},
+	};
+	const original = console.error;
+	console.error = (line: string) => void errors.push(line);
+	try {
+		await settleDiscordDelivery(mockGateway(requests), discord, threadDelivery("monitor result"));
+	} finally {
+		console.error = original;
+	}
+	expect(sent).toEqual([
+		[
+			"channel-1",
+			"[thread <#thread-1> is archived and could not be unarchived (Missing Permissions); posting here instead]\nmonitor result",
+		],
+	]);
+	expect(errors).toEqual([
+		"Discord delivery delivery-1: thread thread-1 is archived and could not be unarchived (Missing Permissions); delivered to parent channel channel-1 instead.",
+	]);
+	expect(requests).toEqual([{ verb: "delivery.confirm", params: { deliveryId: "delivery-1" } }]);
+});
+
+test("an active thread and a plain channel deliver exactly as before", async () => {
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	const sent: Array<[string, unknown]> = [];
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async (id: string) => ({
+				archived: false,
+				setArchived: async () => {
+					throw new Error("must not unarchive an active thread");
+				},
+				send: async (payload: unknown) => void sent.push([id, payload]),
+			}),
+		},
+	};
+	await settleDiscordDelivery(mockGateway(requests), discord, threadDelivery("in thread"));
+	await settleDiscordDelivery(mockGateway(requests), discord, delivery("in channel"));
+	expect(sent).toEqual([
+		["thread-1", "in thread"],
+		["channel-1", "in channel"],
+	]);
+	expect(requests.map((request) => request.verb)).toEqual(["delivery.confirm", "delivery.confirm"]);
 });
 
 // The merge seam between this lane's reaction wiring and the reply-metadata lane
@@ -433,6 +519,46 @@ test("working status is a reaction gradient on the triggering message and clears
 	expect(removed).toHaveLength(before);
 });
 
+test("an interim delivery keeps the working status and re-pulses typing; only the final reply clears", async () => {
+	const { discord, removed } = presenceDiscord();
+	let typingCount = 0;
+	const typingDiscord: DiscordClientLike = {
+		channels: { fetch: async () => ({ send: async () => {}, sendTyping: async () => void typingCount++ }) },
+	};
+	const typing = new TypingIndicator(typingDiscord, 10_000, 60_000, { error: () => {} });
+	const status = new WorkingStatus(discord, { error: () => {} }, () => ({ id: "bot-1" }));
+	status.arm("channel-1", "m-1");
+	typing.begin("channel-1");
+	await Bun.sleep(5);
+	const beforeInterim = typingCount;
+	const requests: Array<{ verb: string; params: unknown }> = [];
+	await settleDiscordDelivery(
+		mockGateway(requests),
+		discord,
+		{ ...delivery("still working"), final: false },
+		typing,
+		status,
+	);
+	await Bun.sleep(5);
+	// Posting cleared Discord's hint; it was re-sent at once, not after the 10s tick.
+	expect(typingCount).toBe(beforeInterim + 1);
+	expect(removed).toEqual([]);
+	await settleDiscordDelivery(
+		mockGateway(requests),
+		discord,
+		{ ...delivery("👍"), final: false, reaction: { targetMessageId: "m-1", emoji: "👍", emojiName: "thumbsup" } },
+		typing,
+		status,
+	);
+	expect(removed).toEqual([]);
+	await settleDiscordDelivery(mockGateway(requests), discord, delivery("done"), typing, status);
+	expect(removed).toEqual(["⏳:bot-1"]);
+	const settled = typingCount;
+	typing.refresh("channel-1");
+	await Bun.sleep(5);
+	expect(typingCount).toBe(settled);
+});
+
 test("working status ignores non-discord progress and survives channel failures", async () => {
 	const failing: DiscordClientLike = {
 		channels: {
@@ -494,6 +620,76 @@ test("slash commands /new and /reset map to gateway session resets with the invo
 		error: () => {},
 	});
 	expect(sent).toHaveLength(1);
+});
+
+test("/model is registered with show/set/clear and set autocompletes its choice", () => {
+	const model = DISCORD_SLASH_COMMANDS.find((command) => command.name === "model");
+	expect(model?.options?.map((option) => option.name)).toEqual(["show", "set", "clear"]);
+	const set = model?.options?.find((option) => option.name === "set");
+	expect(set?.options?.[0]).toMatchObject({ name: "choice", required: true, autocomplete: true });
+});
+
+test("/model subcommands map to the gateway's /model text verbs, not to a session reset", async () => {
+	const sent: string[] = [];
+	const gateway = {
+		requestInbound: async (_messageId: string, _origin: unknown, text: string) => {
+			sent.push(text);
+			return { engaged: true };
+		},
+	};
+	const replies: string[] = [];
+	const invoke = (subcommand: string, choice: string | null) =>
+		handleSlashCommand(
+			{
+				isChatInputCommand: () => true,
+				commandName: "model",
+				id: `itx-${subcommand}`,
+				user: { id: "owner-1", username: "bellman" },
+				channel: { id: "channel-9", type: 0 },
+				options: { getSubcommand: () => subcommand, getString: () => choice },
+				reply: async (options: { content: string }) => {
+					replies.push(options.content);
+				},
+			} as never,
+			gateway as never,
+			{ error: () => {} },
+		);
+	await invoke("show", null);
+	await invoke("set", " gpt-heavy ");
+	await invoke("clear", null);
+	// A set with no usable choice is refused locally instead of turning into a bare read.
+	await invoke("set", "  ");
+	expect(sent).toEqual(["/model", "/model set gpt-heavy", "/model clear"]);
+	expect(replies.slice(0, 3).every((reply) => !reply.includes("session reset"))).toBe(true);
+	expect(replies[3]).toContain("choose a model");
+});
+
+test("/model autocomplete filters gateway choices and fails soft to an empty list", async () => {
+	const responded: Array<Array<{ name: string; value: string }>> = [];
+	const interaction = (focused: string) => ({
+		isAutocomplete: () => true,
+		commandName: "model",
+		options: { getFocused: () => focused },
+		respond: async (choices: Array<{ name: string; value: string }>) => {
+			responded.push(choices);
+		},
+	});
+	const many = Array.from({ length: 40 }, (_, index) => `preset-${index}`);
+	await handleModelAutocomplete(interaction("HEAVY") as never, {
+		modelChoices: async () => ["frontier-heavy", "gpt-heavy", "glm-gpt"],
+	});
+	await handleModelAutocomplete(interaction("") as never, { modelChoices: async () => many });
+	await handleModelAutocomplete(interaction("x") as never, {
+		modelChoices: async () => {
+			throw new Error("gateway down");
+		},
+	});
+	expect(responded[0]).toEqual([
+		{ name: "frontier-heavy", value: "frontier-heavy" },
+		{ name: "gpt-heavy", value: "gpt-heavy" },
+	]);
+	expect(responded[1]).toHaveLength(25);
+	expect(responded[2]).toEqual([]);
 });
 
 test("a declined slash command answers not-authorized instead of claiming a reset", async () => {

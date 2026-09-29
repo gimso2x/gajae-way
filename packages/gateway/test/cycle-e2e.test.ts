@@ -50,6 +50,17 @@ test("projector reads durable rows through the database and stays fail-closed", 
 		expect(bound.gates).toEqual([]);
 		expect(bound.phase).toBe("idle");
 		expect(bound.instanceId).toBeString();
+		expect(bound.agentDisk).toBeNull();
+		// Broker-bound: the projector observes the agent directory's filesystem (issue #15).
+		const observed = new RuntimeCycleProjector(database, { queueDepth: 0 }, { agentDir: directory }).project();
+		expect(observed.agentDisk?.path).toBe(directory);
+		expect(observed.agentDisk?.freeBytes).toBeGreaterThan(0);
+		const missing = new RuntimeCycleProjector(
+			database,
+			{ queueDepth: 0 },
+			{ agentDir: join(directory, "missing-agent") },
+		).project();
+		expect(missing.gates).toContain("agent_disk_headroom");
 
 		// A durable pending inbound message projects dispatching and attaches to its origin.
 		database.inboundEnqueue({
@@ -71,7 +82,7 @@ test("projector reads durable rows through the database and stays fail-closed", 
 
 		// A quarantined memory intent is a gate, not silence.
 		database.memoryIntentCreate({ id: "mi1", kind: "daily_capture", payloadJson: "{}" });
-		database.memoryIntentUpdate("mi1", "quarantined");
+		database.memoryIntentQuarantine("mi1", "Error: test quarantine");
 		const gated = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
 		expect(gated.gates).toContain("memory_closure_blocked");
 		expect(gated.phase).toBe("degraded");
@@ -140,6 +151,57 @@ test("starvation is judged per origin from turn_state: an old accepted trigger i
 		});
 		const starved = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
 		expect(starved.gates).toEqual(["inbound_starved"]);
+	} finally {
+		database.close();
+	}
+});
+
+test("monitor authoring loss gates ops.cycle while delivery stays healthy, and clears on recovery (#160)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-cycle-monitor-loss-"));
+	const database = await GatewayDatabase.open(join(directory, "gateway.db"));
+	try {
+		const at = (minutesAgo: number) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
+		const seed = (eventType: string, stage: string, minutesAgo: number, authored = false) => {
+			const eventId = crypto.randomUUID();
+			database.monitorEventCreate({
+				eventId,
+				monitorId: "m1",
+				eventType,
+				payloadJson: "{}",
+				firedAt: at(minutesAgo),
+			});
+			database.monitorEventUpdate(eventId, stage as never, null);
+			if (authored) database.authoredOutputCreate(eventId, "note");
+			return eventId;
+		};
+		const project = () => new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
+		// One lost slot of one type after a delivered one is not yet an outage.
+		seed("backlog.watch", "delivered", 120, true);
+		seed("backlog.watch", "failed_no_retry", 60);
+		expect(project().gates).toEqual([]);
+		// Two monitor types whose latest slot was lost pre-author: a cross-type outage.
+		seed("memory.canonicalize", "failed_no_retry", 50);
+		const crossType = project();
+		expect(crossType.gates).toEqual(["monitor_authoring_lost"]);
+		expect(crossType.phase).toBe("degraded");
+		expect(crossType.monitorAuthoringLost).toEqual([
+			{ eventType: "backlog.watch", consecutive: 1, lastFiredAt: expect.any(String) },
+			{ eventType: "memory.canonicalize", consecutive: 1, lastFiredAt: expect.any(String) },
+		]);
+		// The canonicalize type recovers; backlog.watch then loses a second consecutive slot.
+		seed("memory.canonicalize", "delivered", 40, true);
+		expect(project().gates).toEqual([]);
+		seed("backlog.watch", "failed_no_retry", 30);
+		const streak = project();
+		expect(streak.gates).toEqual(["monitor_authoring_lost"]);
+		expect(streak.monitorAuthoringLost).toMatchObject([{ eventType: "backlog.watch", consecutive: 2 }]);
+		// A delivered slot of the lost type clears the gate again.
+		seed("backlog.watch", "delivered", 10, true);
+		expect(project().gates).toEqual([]);
+		// Losses older than the observation window age out instead of gating forever.
+		seed("retired.a", "failed_no_retry", 25 * 60);
+		seed("retired.b", "failed_no_retry", 25 * 60);
+		expect(project().gates).toEqual([]);
 	} finally {
 		database.close();
 	}

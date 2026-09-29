@@ -222,7 +222,9 @@ export function renderSystemdUnit(spec: ServiceSpec, binDir: string, home: strin
 		"RestartSec=2",
 		// Only the gateway: GJC daemon and session hosts share the gateway cgroup,
 		// so the default control-group kill would take unrelated sessions with it.
-		...(spec.dependsOnGateway ? [] : ["KillMode=process"]),
+		// The gateway exits on its own inside 25s (SHUTDOWN_DEADLINE_MS in the
+		// gateway main); the unit's stop window is pinned so that ceiling always fits.
+		...(spec.dependsOnGateway ? [] : ["KillMode=process", "TimeoutStopSec=30s"]),
 		"",
 		"[Install]",
 		// Enabling the gateway pulls the whole stack in; a dependent is never
@@ -233,9 +235,19 @@ export function renderSystemdUnit(spec: ServiceSpec, binDir: string, home: strin
 	return unit.join("\n");
 }
 
-function systemdUnitDir(env: NodeJS.ProcessEnv, userHome: string): string {
+export function systemdUnitDir(env: NodeJS.ProcessEnv, userHome: string): string {
 	const base = env.XDG_CONFIG_HOME || join(userHome, ".config");
 	return join(base, "systemd", "user");
+}
+
+/** Gets the path where a service's LaunchAgent plist is stored on darwin. */
+export function launchAgentPlistPath(spec: ServiceSpec, launchAgentsDir: string): string {
+	return join(launchAgentsDir, `dev.gajaeway.${spec.id}.plist`);
+}
+
+/** Gets the path where a service's systemd unit file is stored on linux. */
+export function systemdUnitPath(spec: ServiceSpec, unitDir: string): string {
+	return join(unitDir, systemdUnitName(spec));
 }
 
 /**
@@ -251,34 +263,17 @@ export function restartStackCommands(platform: ServicePlatform, uid?: number): r
 	if (platform === "linux") return [["systemctl", "--user", "restart", GATEWAY_UNIT]];
 	if (platform === "darwin") {
 		const target = uid ?? process.getuid?.() ?? 0;
-		const ordered = [
-			...SERVICE_SPECS.filter((spec) => !spec.dependsOnGateway),
-			...SERVICE_SPECS.filter((spec) => spec.dependsOnGateway),
-		];
-		return ordered.map((spec) => ["launchctl", "kickstart", "-k", `gui/${target}/${spec.label}`]);
+		return restartOrder().map((spec) => ["launchctl", "kickstart", "-k", `gui/${target}/${spec.label}`]);
 	}
 	throw new Error(`unsupported service platform: ${platform}`);
 }
 
-export type CommandRunner = (command: readonly string[]) => number | PromiseLike<number>;
-
-async function defaultCommandRunner(command: readonly string[]): Promise<number> {
-	const child = Bun.spawn([...command], { stdout: "inherit", stderr: "inherit" });
-	return await child.exited;
-}
-
-/** Runs {@link restartStackCommands} in order, stopping at the first failure. */
-export async function restartStack(
-	options: { readonly platform?: ServicePlatform; readonly uid?: number; readonly runner?: CommandRunner } = {},
-): Promise<readonly (readonly string[])[]> {
-	const platform = options.platform === undefined ? currentPlatform() : requirePlatform(options.platform);
-	const runner = options.runner ?? defaultCommandRunner;
-	const commands = restartStackCommands(platform, options.uid);
-	for (const command of commands) {
-		const status = await runner(command);
-		if (status !== 0) throw new Error(`restart-stack failed with status ${status}: ${command.join(" ")}`);
-	}
-	return commands;
+/** The gateway first, then every job that holds a connection to it. */
+export function restartOrder(): readonly ServiceSpec[] {
+	return [
+		...SERVICE_SPECS.filter((spec) => !spec.dependsOnGateway),
+		...SERVICE_SPECS.filter((spec) => spec.dependsOnGateway),
+	];
 }
 
 function requirePlatform(platform: string): ServicePlatform {
@@ -286,7 +281,7 @@ function requirePlatform(platform: string): ServicePlatform {
 	return platform;
 }
 
-function currentPlatform(): ServicePlatform {
+export function currentPlatform(): ServicePlatform {
 	if (process.platform === "darwin" || process.platform === "linux") return process.platform;
 	throw new Error(`unsupported service platform: ${process.platform}`);
 }

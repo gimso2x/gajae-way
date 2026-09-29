@@ -125,6 +125,11 @@ test("delivery.confirm on a monitor batch advances authored events to delivered 
 	const stages = ctx.db.monitorEventRows().filter((row) => ctx.eventIds.includes(row.event_id));
 	// The REAL handler settled both events — not a manual DB update.
 	expect(stages.map((row) => row.stage)).toEqual(["delivered", "delivered"]);
+	const deliveredEvents = ctx.frames
+		.filter((frame) => frame.type === "event" && frame.event === "monitor.event")
+		.map((frame) => frame.payload as { eventId: string; stage: string })
+		.filter((event) => ctx.eventIds.includes(event.eventId));
+	expect(deliveredEvents.map((event) => event.stage)).toEqual(["delivered", "delivered"]);
 });
 
 test("late delivery.fail cannot regress a delivered monitor event (server protocol)", async () => {
@@ -250,9 +255,11 @@ test("RT-29 ledger monotonicity: expired row cannot be resurrected by a late con
 	expect(lateConfirm.result).toEqual({ settled: true });
 	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("expired");
 	// Round-4 blocker 3: the late confirm on an EXPIRED delivery must NOT settle
-	// the batch's monitor events to delivered — they stay authored.
+	// the batch's monitor events to delivered — expiry already failed them
+	// terminally with delivery evidence (#94).
 	const stagesAfter = ctx.db.monitorEventRows().filter((row) => ctx.eventIds.includes(row.event_id));
-	expect(stagesAfter.map((row) => row.stage)).toEqual(["authored", "authored"]);
+	expect(stagesAfter.map((row) => row.stage)).toEqual(["failed_no_retry", "failed_no_retry"]);
+	for (const eventId of ctx.eventIds) expect(ctx.db.monitorFailure(eventId)?.code).toBe("delivery_expired");
 	// An UNKNOWN delivery id is still invalid_params (an error frame):
 	ctx.send({ v: "0.1", type: "request", id: "unknown-id", verb: "delivery.confirm", params: { deliveryId: "nope" } });
 	for (let attempt = 0; attempt < 400; attempt++) {

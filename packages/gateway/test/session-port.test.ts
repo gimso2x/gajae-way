@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import { isDefinitiveSteerRejection } from "../src/orchestrator/persona-session";
-import { BrokerSessionPort } from "../src/orchestrator/session-port";
+import { BrokerSessionPort, SessionRequestTimeoutError } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, GatewayDatabase } from "../src/store/db";
 import {
@@ -119,7 +119,7 @@ test("failed-turn evidence comes from the owned shared session file without expo
 	);
 });
 
-test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt, terminal status, and transcript body", async () => {
+test("AC-K rendered SDK prompt is notice + blank line + task; broker SessionPort preserves op-ref, model, terminal status, and transcript", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
@@ -260,6 +260,128 @@ test("broker SessionPort reuses the durable epoch binding and does not recreate 
 	await port.bind({ originKey: "discord/channel/c", epoch: 2, repo: "/tmp/repo" });
 	await port.bind({ originKey: "discord/channel/c", epoch: 2, repo: "/tmp/repo" });
 	expect(calls.filter((args) => args.includes("session.create"))).toHaveLength(1);
+});
+
+test("broker SessionPort rebinds a saved binding on an explicit session_unavailable envelope", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-public-error-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	const calls: string[][] = [];
+	const publicFailure = {
+		ok: false,
+		error: {
+			code: "session_unavailable",
+			message: "SDK session saved-1 is unavailable through the session Router.",
+		},
+	};
+	const run: CliRunner = async (args) => {
+		calls.push([...args]);
+		if (args.includes("inspect") && args.includes("saved-1"))
+			return { exitCode: 1, stdout: JSON.stringify(publicFailure), stderr: "" };
+		if (args.includes("session.create"))
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "fresh-1" } }), stderr: "" };
+		if (args.includes("inspect") && args.includes("fresh-1"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { session: { sessionId: "fresh-1", live: true } } }),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "saved-1",
+		repo,
+		originKey: "public-session-gone",
+		epoch: 0,
+	});
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: run,
+		instanceId: "public-error",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	await expect(port.bind({ originKey: "public-session-gone", epoch: 0, repo })).resolves.toMatchObject({
+		sessionId: "fresh-1",
+		epoch: 1,
+	});
+	expect(calls.filter((args) => args.includes("session.create"))).toHaveLength(1);
+});
+
+test("generic inspect errors preserve saved authority and do not trigger a replacement session", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-generic-error-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	const calls: string[][] = [];
+	const run: CliRunner = async (args) => {
+		calls.push([...args]);
+		return {
+			exitCode: 1,
+			stdout: JSON.stringify({
+				ok: false,
+				error: { code: "operation_failed", message: "The requested operation failed." },
+			}),
+			stderr: "",
+		};
+	};
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "saved-1",
+		repo,
+		originKey: "generic-inspect-error",
+		epoch: 0,
+	});
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: run,
+		instanceId: "generic-error",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	await expect(port.bind({ originKey: "generic-inspect-error", epoch: 0, repo })).resolves.toMatchObject({
+		sessionId: "saved-1",
+		epoch: 0,
+	});
+	expect(calls).toHaveLength(1);
+	expect(database.getSessionRecord("generic-inspect-error")).toMatchObject({ sessionId: "saved-1", epoch: 0 });
+});
+
+test("structured nonzero session failures survive normalization at the global lifecycle route", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-envelope-error-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	const publicFailure = {
+		ok: false,
+		error: {
+			code: "session_unavailable",
+			message: "SDK session saved-1 is unavailable through the session Router.",
+		},
+	};
+	const calls: string[][] = [];
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: async (args) => {
+			calls.push([...args]);
+			return { exitCode: 1, stdout: JSON.stringify(publicFailure), stderr: "" };
+		},
+		instanceId: "envelope-error",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "saved-1",
+		repo,
+		originKey: "global-close-error",
+		epoch: 0,
+	});
+	await expect(port.close({ sessionId: "saved-1", repo })).rejects.toMatchObject({
+		name: "GjcCliError",
+		details: publicFailure.error,
+	});
+	expect(calls).toHaveLength(1);
+	expect(calls[0]).toEqual(expect.arrayContaining(["raw", "global", "--op", "session.close"]));
 });
 
 test("broker SessionPort resumes saved dead authority through the SDK control before returning the same binding", async () => {
@@ -1084,3 +1206,78 @@ test("request keeps observing an accepted op on the CLI when its relay tears mid
 	expect(cliReports).toBe(2);
 	expect(relay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
 });
+
+// Issue #9: the bounded request wait was a fixed wall-clock cap. Long monitor
+// turns (canonicalize, townhall) legitimately run 25-40 minutes while emitting
+// tool activity the whole way, and were killed as SessionRequestTimeoutError
+// at the 1800 s mark with the work still landing. The wait is an inactivity
+// lease: frames attributed to the turn refresh it; silence still ends it.
+for (const progressing of [true, false]) {
+	test(`request wait is an activity lease: a turn that keeps emitting ${progressing ? "survives past" : "is not spared when silent for"} waitTimeoutMs`, async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+		const repo = join(home, "workspace");
+		await createOwnedSessionFixture(database, authority, { sessionId: "sdk-1", repo, originKey: "lease", epoch: 0 });
+		const run: CliRunner = async (args) => {
+			if (args.includes("session.last_assistant"))
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({ type: "query_response", ok: true, page: { items: ["landed"], complete: true } }),
+					stderr: "",
+				};
+			throw new Error(`unexpected command ${args.join(" ")}`);
+		};
+		let clock = 0;
+		let polls = 0;
+		const ids = { commandId: "cmd-lease", turnId: "turn-lease" };
+		const relay = scriptedRelay((request) => {
+			if (request.operation === "turn.prompt")
+				return { ok: true, result: { ...ids, accepted: true, clientRef: request.input.clientRef } };
+			polls += 1;
+			// Terminal only on the 6th poll (clock 5000 ms); the lease is 2500 ms.
+			return {
+				ok: true,
+				result: {
+					kind: "prompt",
+					status: polls >= 6 ? "terminal_ok" : "in_flight",
+					clientRef: request.input.clientRef,
+				},
+			};
+		});
+		const port = new BrokerSessionPort({
+			database,
+			authority,
+			cli: run,
+			instanceId: "instance-1",
+			tailRunner: new TailRunner({ stream: relay.spawn, repo, now: () => clock }),
+			now: () => clock,
+			sleep: async (ms) => {
+				clock += ms;
+				if (progressing)
+					relay.streams[0]!.host({ type: "event", kind: "tool_execution_update", ...ids, payload: { event: {} } });
+				// Let the pushed frame reach the handle before the next deadline check.
+				await Bun.sleep(1);
+			},
+		});
+		const attempt = port.request({
+			sessionId: "sdk-1",
+			repo,
+			text: "long work",
+			opRef: "gw-lease-1",
+			pollMs: 1000,
+			waitTimeoutMs: 2500,
+		});
+		if (progressing) {
+			const result = await attempt;
+			expect(result.status.status.status).toBe("terminal_ok");
+			expect(result.assistant.text).toBe("landed");
+			expect(clock).toBe(5000);
+		} else {
+			const failure = await attempt.catch((error: unknown) => error);
+			expect(failure).toBeInstanceOf(SessionRequestTimeoutError);
+			expect((failure as SessionRequestTimeoutError).lastStatus.status.status).toBe("in_flight");
+			expect(clock).toBe(3000);
+		}
+	});
+}
