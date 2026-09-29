@@ -38,7 +38,7 @@ function dateFields(date: Date, timezone?: string): [number, number, number, num
 }
 export function cronMatches(schedule: string, date: Date, timezone?: string): boolean {
 	const fields = schedule.trim().split(/\s+/);
-	if (fields.length !== 5) throw new Error("cron schedule must have five fields");
+	if (fields.length !== 5) throw new CronScheduleError("field_count", "cron schedule must have five fields");
 	const values = dateFields(date, timezone);
 	return fields.every((field, index) => {
 		const value = values[index];
@@ -141,6 +141,83 @@ export function nextCronFire(schedule: string, from: Date, timezone: string): Da
 		return null;
 	}
 	return null;
+}
+
+/**
+ * The complete cron-schedule contract shared by every entry point.
+ * `monitor.add` rejects invalid schedules up front (invalid_params) and the
+ * trigger runtime re-validates before starting a timer, so a bad persisted
+ * schedule can never reach `cronMatches` mid-tick and take the gateway down
+ * (2026-09-29 crash loop). Accepts exactly the grammar `cronFieldMatches`
+ * evaluates — five whitespace-separated fields of `*`, numbers, `a-b` ranges,
+ * `,` lists and `/n` steps — with per-field ranges: minute 0-59, hour 0-23,
+ * day-of-month 1-31, month 1-12, day-of-week 0-6. The engine compares
+ * day-of-week against `Date#getDay()` (0-6), so 7 would never fire and is
+ * rejected instead of registered as a silently dead monitor.
+ */
+export class CronScheduleError extends Error {
+	/** Stable machine reason, carried on the structured invalid-trigger line. */
+	readonly reason: string;
+	constructor(reason: string, message: string) {
+		super(message);
+		this.reason = reason;
+	}
+}
+
+/** [min, max, field name] for minute, hour, day-of-month, month, day-of-week. */
+const CRON_FIELD_BOUNDS: ReadonlyArray<readonly [number, number, string]> = [
+	[0, 59, "minute"],
+	[0, 23, "hour"],
+	[1, 31, "day-of-month"],
+	[1, 12, "month"],
+	[0, 6, "day-of-week"],
+];
+
+export function validateCronSchedule(schedule: unknown): void {
+	if (typeof schedule !== "string") throw new CronScheduleError("not_string", "cron schedule must be a string");
+	const fields = schedule.trim().split(/\s+/);
+	if (fields.length !== 5)
+		throw new CronScheduleError("field_count", `cron schedule must have five fields, got ${fields.length}`);
+	fields.forEach((field, index) => {
+		const [min, max, name] = CRON_FIELD_BOUNDS[index]!;
+		for (const part of field.split(",")) {
+			const slash = part.split("/");
+			if (slash.length > 2)
+				throw new CronScheduleError(
+					"unsupported_token",
+					`cron ${name} field has at most one step: ${JSON.stringify(part)}`,
+				);
+			const base = slash[0]!;
+			const stepText = slash.length === 2 ? slash[1] : undefined;
+			if (stepText !== undefined) {
+				const step = Number(stepText);
+				if (!/^\d+$/.test(stepText) || !Number.isInteger(step) || step < 1)
+					throw new CronScheduleError(
+						"invalid_step",
+						`cron ${name} step must be a positive integer: ${JSON.stringify(part)}`,
+					);
+				if (base !== "*" && !base.includes("-"))
+					throw new CronScheduleError(
+						"unsupported_token",
+						`cron ${name} step requires * or a range: ${JSON.stringify(part)}`,
+					);
+			}
+			if (base === "*") continue;
+			const bounds = base.split("-").map((value) => (/^\d+$/.test(value) ? Number(value) : Number.NaN));
+			if (bounds.length > 2 || bounds.some((value) => Number.isNaN(value)))
+				throw new CronScheduleError(
+					"unsupported_token",
+					`cron ${name} field supports *, numbers, a-b, comma lists and /n steps: ${JSON.stringify(part)}`,
+				);
+			if (bounds.some((value) => value < min || value > max))
+				throw new CronScheduleError("out_of_range", `cron ${name} must be ${min}-${max}: ${JSON.stringify(part)}`);
+			if (bounds.length === 2 && bounds[0]! > bounds[1]!)
+				throw new CronScheduleError(
+					"reversed_range",
+					`cron ${name} range start must not exceed its end: ${JSON.stringify(part)}`,
+				);
+		}
+	});
 }
 
 /** Absolute minute epoch — identical for the same wall-clock minute worldwide. */

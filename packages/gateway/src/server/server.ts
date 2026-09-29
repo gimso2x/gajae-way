@@ -59,7 +59,7 @@ import { validateMemory } from "../memory/validator";
 import { MonitorPropagator } from "../monitors/propagate";
 import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
-import { DEFAULT_CRON_CATCH_UP, nextCronFire } from "../monitors/triggers/cron";
+import { DEFAULT_CRON_CATCH_UP, nextCronFire, validateCronSchedule } from "../monitors/triggers/cron";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GlobalGjcClient } from "../orchestrator/broker";
@@ -1235,6 +1235,10 @@ async function handleRequest(
 		}
 		case "monitor.add": {
 			try {
+				const trigger = (request.params as { trigger?: { kind?: unknown; schedule?: unknown } } | undefined)?.trigger;
+				// Reject an invalid cron schedule BEFORE it reaches the registry: a saved
+				// bad schedule crashed every later trigger tick (2026-09-29 crash loop).
+				if (trigger?.kind === "cron") validateCronSchedule(trigger.schedule);
 				const monitor = runtime.registry.add(request.params as never);
 				connection.write({
 					v: PROFILE_VERSION,

@@ -932,11 +932,24 @@ function bindAgentDir(args: readonly string[], agentDir: string): readonly strin
 	bound.push("--agent-dir", agentDir);
 	return bound;
 }
+/**
+ * Environment for every spawned gjc child on both spawn paths (the CLI/relay
+ * client here and session.create in gjc-client.ts). GAJAEWAY_HOME is dropped:
+ * the gateway's own runtime home must not leak into the shared GJC broker and
+ * its session hosts, or a broker autostarted by one gateway (DEV, 2026-09-29)
+ * hands that home to every later default-socket `gajaeway` CLI call. HOME,
+ * PATH and GJC_* are kept so gjc keeps resolving the same user runtime.
+ */
+export function childEnvironment(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
+	return Object.fromEntries(
+		Object.entries(source).filter(
+			(entry): entry is [string, string] => entry[0] !== "GAJAEWAY_HOME" && entry[1] !== undefined,
+		),
+	);
+}
 /** Fail closed on project dotenv path declarations; do not promote Bun-loaded project values to user authority. */
 function trustedEnvironment(cwd: string): Record<string, string> {
-	const env = Object.fromEntries(
-		Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
-	);
+	const env = childEnvironment();
 	const sensitive = new Set([
 		"HOME",
 		"USERPROFILE",

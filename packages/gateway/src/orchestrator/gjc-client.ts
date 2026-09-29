@@ -1,4 +1,5 @@
 import type { GatewayDatabase } from "../store/db";
+import { childEnvironment } from "./broker";
 import {
 	DEFAULT_REBIND_CAP,
 	extractRuntimeError,
@@ -152,7 +153,7 @@ export class GjcClient {
 			stdin: new Response(JSON.stringify({ cwd })).body ?? "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
-			env: process.env as Record<string, string>,
+			env: childEnvironment(),
 		});
 		const [stdout, stderr, exitCode] = await this.#bounded(child, "session.create");
 		if (exitCode !== 0) {
