@@ -75,7 +75,7 @@ test("accepted start survives SIGKILL with same live unknown operation, then set
 	expect(snapshot.jobs[0].attempts[0].endState).toBe("completed");
 	expect(snapshot.deliveries).toHaveLength(1);
 	const event = await notice(client);
-	expect(event.payload.text).toBe("[lane crash] completed: same worker final answer");
+	expect(event.payload.text).toBe("[레인 crash] 완료: same worker final answer");
 	expect(event.payload.deliveryId).toBe(snapshot.runtimes[0].deliveryId);
 	singleEffect(f, receipt.opRef, receipt.sessionId);
 }, 30_000);
@@ -96,7 +96,7 @@ for (const [live, reason] of [
 		expect(snapshot.jobs[0].state).toBe("awaiting_operator");
 		expect(snapshot.jobs[0].attempts[0].endState).toBe("terminal_uncertain");
 		expect(snapshot.runtimes[0].terminal.reasonCode).toBe(reason);
-		expect((await notice(client)).payload.text).toContain(`[lane crash] attempt_ended: ${reason}`);
+		expect((await notice(client)).payload.text).toContain(`[레인 crash] 시도 종료: ${reason}`);
 		const held = await client.request("work.start", { name: "crash", text: "not a retry", cwd: f.home });
 		expect(held.result).toMatchObject({ started: false, held: true, state: "awaiting_operator" });
 		const retired = await client.request("work.retire", { name: "crash" });
@@ -189,7 +189,7 @@ for (const point of [
 		expect(after.runtimes[0].output.reads).toBeLessThanOrEqual(3);
 		expect(after.deliveries).toHaveLength(1);
 		expect(event.payload.deliveryId).toBe(before.runtimes[0].deliveryId);
-		expect(event.payload.text).toBe(`[lane crash] completed: answer at ${point}`);
+		expect(event.payload.text).toBe(`[레인 crash] 완료: answer at ${point}`);
 		singleEffect(f, receipt.opRef, receipt.sessionId);
 	}, 30_000);
 }
@@ -233,7 +233,7 @@ for (const point of ["settle-before", "settle-report", "settle-commit"] as const
 			priorPersonaSends + 1,
 		);
 		expect(
-			replay.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.text?.includes("[lane ")),
+			replay.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.text?.includes("[레인 ")),
 		).toHaveLength(0);
 		client.close();
 	}, 30_000);
@@ -274,7 +274,7 @@ test("lane parent crash after report claim replays the same deterministic wake o
 	});
 	expect(f.calls("send").filter((call) => call.input.opRef === wakeOpRef)).toHaveLength(1);
 	expect(
-		replay.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.text?.startsWith("[lane ")),
+		replay.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.text?.startsWith("[레인 ")),
 	).toHaveLength(0);
 }, 30_000);
 
@@ -325,7 +325,7 @@ for (const point of ["prepared", "accepted-before-save", "report-consume"] as co
 		}
 		expect(after.runtimes.filter((runtime) => runtime.opRef === wakeOpRef)).toHaveLength(1);
 		expect(
-			replay.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.text?.startsWith("[lane ")),
+			replay.frames.filter((frame) => frame.event === "chat.message" && frame.payload?.text?.startsWith("[레인 ")),
 		).toHaveLength(0);
 	}, 30_000);
 }
@@ -379,7 +379,7 @@ test("three claimed post-terminal reads stay consumed across three process crash
 	const snapshot = await settled(f);
 	expect(snapshot.runtimes[0].output).toMatchObject({ reads: 3, disposition: "unavailable" });
 	expect(snapshot.jobs[0].attempts[0].endState).toBe("completed");
-	expect((await notice(client)).payload.text).toBe("[lane crash] completed: output_unavailable");
+	expect((await notice(client)).payload.text).toBe("[레인 crash] 완료: output_unavailable");
 	// Each claim was killed before I/O, so recovery may not reset the counter
 	// and sneak in a fourth read merely because no earlier read returned.
 	expect(f.calls("output")).toHaveLength(0);

@@ -2924,7 +2924,7 @@ function reportDeliveryExpired(
 	const ownerTarget = runtime.config.ownerTarget?.origin;
 	if (!ownerTarget) return;
 	const noticeId = deterministicDeliveryExpiredNoticeId(expired.deliveryId);
-	const notice = `[delivery lost] ${sanitizeDiagnostic(expired.originKey).slice(0, 160)} 응답 전달이 ${attempts}회 실패해 만료됐습니다 (사유: ${safeDiagnosticField(reason)}). 재전송: gajaeway ops redeliver ${deliveryId}`;
+	const notice = `[전달 만료] ${sanitizeDiagnostic(expired.originKey).slice(0, 160)} 응답 전달이 ${attempts}회 실패해 만료됐습니다 (사유: ${safeDiagnosticField(reason)}). 재전송: gajaeway ops redeliver ${deliveryId}`;
 	const payload = runtime.delivery.prepare(noticeId, ownerTarget, notice, undefined, noticeId);
 	if (payload) broadcastDelivery(runtime, payload);
 }
@@ -2939,7 +2939,7 @@ export function reportRecoveryHold(
 	const noticeId = `gw-x-${createHash("sha256").update(`recovery-hold:${input.opRef}`).digest("hex").slice(0, 32)}`;
 	const minutes = input.sweeps;
 	const excerpt = input.trigger ? sanitizeDiagnostic(input.trigger.body).replace(/\s+/g, " ").slice(0, 80) : "";
-	const notice = `[recovery hold] ${sanitizeDiagnostic(input.originKey).slice(0, 160)} 메시지 처리가 약 ${minutes}분째 보류 중입니다 (사유: ${safeDiagnosticField(input.reason)}). 자동 재전송은 하지 않습니다.${excerpt ? ` 메시지: "${excerpt}"` : ""} 확인: journalctl --user -u <bot>-gateway | grep ${safeDiagnosticField(input.opRef)} — 새로 시작하려면 해당 대화에서 /new.`;
+	const notice = `[복구 보류] ${sanitizeDiagnostic(input.originKey).slice(0, 160)} 메시지 처리가 약 ${minutes}분째 보류 중입니다 (사유: ${safeDiagnosticField(input.reason)}). 자동 재전송은 하지 않습니다.${excerpt ? ` 메시지: "${excerpt}"` : ""} 확인: journalctl --user -u <bot>-gateway | grep ${safeDiagnosticField(input.opRef)} — 새로 시작하려면 해당 대화에서 /new.`;
 	const payload = runtime.delivery.prepare(noticeId, ownerTarget, notice, undefined, noticeId);
 	if (payload) broadcastDelivery(runtime, payload);
 }

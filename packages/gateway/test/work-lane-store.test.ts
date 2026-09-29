@@ -90,7 +90,7 @@ async function fixture() {
 	const payload = buildDeliveryPayload(
 		runtime.opRef,
 		LOOPBACK_ORIGIN,
-		"[lane a] completed: output_unavailable",
+		"[레인 a] 완료: output_unavailable",
 		runtime.deliveryId,
 	)!;
 	const admission: WorkAttemptAdmission = {
@@ -123,7 +123,7 @@ function seedLinkedWakeReport(
 			reportId,
 			childName,
 			childOpRef,
-			"[lane child] completed: child output",
+			"[레인 child] 완료: child output",
 			root === null ? null : JSON.stringify(root),
 			f.runtime.opRef,
 			START,

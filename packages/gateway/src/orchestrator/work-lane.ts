@@ -1951,9 +1951,10 @@ export function reportText(
 	opRef: string,
 	output: WorkAttemptRuntime["output"],
 ): string {
-	const label = endState === "completed" ? "completed" : endState === "failed" ? "failed" : "attempt_ended";
+	// Owner-facing Korean header labels; endState values stay machine tokens in the ledger.
+	const label = endState === "completed" ? "완료" : endState === "failed" ? "실패" : "시도 종료";
 	const lead = reason === "end_turn" ? "" : `${reason}: `;
-	const head = `[lane ${name}] ${label}: ${lead}`;
+	const head = `[레인 ${name}] ${label}: ${lead}`;
 	let body =
 		output.disposition === "unavailable"
 			? reason === "terminal_missing_receipt"

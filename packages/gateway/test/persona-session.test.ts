@@ -2209,11 +2209,11 @@ test("lane_report steer uses lane framing, not user framing", async () => {
 	enqueue("human-trigger", "first");
 	await manager!.notifyInbound(KEY);
 	await eventually(() => port.sends.length === 1, "initial persona turn did not start");
-	enqueue("lane-report-steer", "[lane child] completed: result", "lane_report");
+	enqueue("lane-report-steer", "[레인 child] 완료: result", "lane_report");
 	await manager!.notifyInbound(KEY);
 	await eventually(() => port.steers.length === 1, "lane report was not steered into the running turn");
 	expect(port.steers[0]?.text).toBe(
-		"[Internal lane report that arrived while you were working. Absorb it; mention it to the conversation only if useful.]\n\n[lane child] completed: result",
+		"[Internal lane report that arrived while you were working. Absorb it; mention it to the conversation only if useful.]\n\n[레인 child] 완료: result",
 	);
 	expect(port.steers[0]?.text).not.toContain("Additional message from the user");
 	expect(database!.inboundTurnRows(latestOpRef)).toEqual(
@@ -2227,7 +2227,7 @@ test("/new keeps pending lane_report rows while discarding platform rows", async
 	const port = new ScriptedSessionPort();
 	await harness(port);
 	enqueue("platform-before-new", "old human", "platform");
-	enqueue("internal-before-new", "[lane child] attempt_ended", "lane_report");
+	enqueue("internal-before-new", "[레인 child] 시도 종료", "lane_report");
 	await manager!.reset(KEY, JSON.stringify(ORIGIN), "2030-09-01T00:00:00.000Z");
 	await eventually(() => port.sends.length === 1, "pending lane report was not admitted after /new");
 	expect(database!.inboundTurnRow(latestOpRef)).toMatchObject({
@@ -2235,7 +2235,7 @@ test("/new keeps pending lane_report rows while discarding platform rows", async
 		source: "lane_report",
 		state: "pending",
 	});
-	expect(port.sends[0]?.text).toBe("[lane child] attempt_ended");
+	expect(port.sends[0]?.text).toBe("[레인 child] 시도 종료");
 });
 
 test("admissionHold reports a quarantined nonterminal persona turn", async () => {

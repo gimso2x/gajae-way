@@ -281,7 +281,7 @@ test("AC-C idle persona is woken with one send carrying the internal lane report
 		"persona wake send",
 	);
 	const reportSend = sends.find((send) => send.text.includes("[Internal lane report:"))!;
-	expect(reportSend.text).toContain("[lane idle-worker] completed: idle report");
+	expect(reportSend.text).toContain("[레인 idle-worker] 완료: idle report");
 	expect(reportSend.sessionId).toBe(personaSessionId);
 	expect(f.database.inboundTurnRows(reportSend.opRef)).toMatchObject([
 		expect.objectContaining({ message_id: reportId, source: "lane_report", origin_key: rootKey }),
@@ -406,7 +406,7 @@ test("AC-F no sessions row falls back with one ledger row and one chat.message",
 		(messages) => messages.length === 1,
 		"fallback post",
 	);
-	expect(chatMessages(f)[0]?.payload.text).toBe("[lane fallback-worker] completed: fallback body");
+	expect(chatMessages(f)[0]?.payload.text).toBe("[레인 fallback-worker] 완료: fallback body");
 	await f.client.request("work.status", { name: "fallback-worker" });
 	expect(f.database.deliveryRows()).toHaveLength(1);
 	expect(chatMessages(f)).toHaveLength(1);

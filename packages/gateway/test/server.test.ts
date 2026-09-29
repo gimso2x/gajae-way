@@ -2464,7 +2464,7 @@ test("socket work.start accepts before terminal, status/steer stay available, on
 	expect(notices[0].payload).toMatchObject({
 		turnId: receipt.opRef,
 		origin: { platform: "discord", kind: "channel", conversationId: "results" },
-		text: "[lane a] completed: socket result",
+		text: "[레인 a] 완료: socket result",
 	});
 	expect(f.port.sends).toHaveLength(1);
 	f.client.close();

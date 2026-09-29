@@ -193,7 +193,7 @@ test("start acknowledges before terminal, one observer survives caller-free comp
 	expect(f.job().attempts[0]?.endState).toBe("completed");
 	expect(f.db.workLaneRows()[0]!.last_activity_at! > activity!).toBe(true);
 	expect(f.notices).toHaveLength(1);
-	expect(f.notices[0]).toMatchObject({ turnId: result.opRef, origin, text: "[lane a] completed: done" });
+	expect(f.notices[0]).toMatchObject({ turnId: result.opRef, origin, text: "[레인 a] 완료: done" });
 	expect(f.db.deliveryRows()).toHaveLength(1);
 	await f.manager.recover();
 	expect(f.notices).toHaveLength(1);
@@ -472,7 +472,7 @@ test("three durable output read claims retain 1s/5s eligibility across restart",
 	now += 1;
 	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
 	expect(reads).toBe(3);
-	expect(f.notices[0]?.text).toBe("[lane a] completed: output_unavailable");
+	expect(f.notices[0]?.text).toBe("[레인 a] 완료: output_unavailable");
 });
 
 for (const [reason, state] of [
@@ -493,7 +493,7 @@ for (const [reason, state] of [
 		});
 		await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
 		expect(f.job().attempts[0]?.endState).toBe(state);
-		const suffix = f.notices[0]!.text.slice("[lane a] attempt_ended: ".length);
+		const suffix = f.notices[0]!.text.slice("[레인 a] 시도 종료: ".length);
 		expect(suffix.startsWith(`${reason === "unknown_reason" ? "stopped_incomplete" : reason}: `)).toBe(true);
 		expect(Buffer.byteLength(suffix)).toBeLessThanOrEqual(2048);
 	});
@@ -542,7 +542,7 @@ test("a rebound lane stops the observer and settles the attempt as session_disow
 	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("session_disowned");
 	expect(f.job().attempts[0]?.endState).toBe("terminal_uncertain");
 	expect(f.job().state).toBe("awaiting_operator");
-	expect(f.notices[0]?.text).toBe("[lane a] attempt_ended: session_disowned: output_unavailable");
+	expect(f.notices[0]?.text).toBe("[레인 a] 시도 종료: session_disowned: output_unavailable");
 	const settledQueries = queries;
 	await Bun.sleep(50);
 	expect(queries).toBe(settledQueries);
@@ -619,7 +619,7 @@ test("dead restart settles uncertainty into a sticky hold, never replacement bin
 		started: false,
 		held: true,
 	});
-	expect(f.notices[0]?.text).toBe("[lane a] attempt_ended: session_dead: output_unavailable");
+	expect(f.notices[0]?.text).toBe("[레인 a] 시도 종료: session_dead: output_unavailable");
 });
 
 test("force-retiring an open dead lane settles its runtime and permits later work", async () => {
@@ -758,7 +758,7 @@ test("saved terminal proof wins over dead liveness and output recovery consumes 
 	await f.restart();
 	await until(() => f.db.workAttemptOpen().length === 0);
 	expect(f.job().attempts[0]?.endState).toBe("completed");
-	expect(f.notices[0]?.text).toBe("[lane a] completed: durable result");
+	expect(f.notices[0]?.text).toBe("[레인 a] 완료: durable result");
 });
 
 test("historical open attempt recovery uses no current notification target and never replays", async () => {
@@ -964,7 +964,7 @@ for (const [receiptState, reasonCode, endState] of [["unknown", "terminal_uncert
 		await until(() => f.db.workAttemptOpen().length === 0);
 		expect(f.job().attempts[0]?.endState).toBe(endState);
 		expect(f.job().state).toBe("awaiting_operator");
-		expect(f.notices[0]?.text).toBe(`[lane a] attempt_ended: ${reasonCode}: partial answer`);
+		expect(f.notices[0]?.text).toBe(`[레인 a] 시도 종료: ${reasonCode}: partial answer`);
 	});
 }
 
@@ -1018,7 +1018,7 @@ test("late receipt after a missing-receipt terminal is reconciled once, without 
 	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("end_turn");
 	expect(f.job().attempts[0]?.endState).toBe("completed");
 	expect(f.job().state).not.toBe("awaiting_operator");
-	expect(f.notices.map((notice) => notice.text)).toEqual(["[lane a] completed: PR opened"]);
+	expect(f.notices.map((notice) => notice.text)).toEqual(["[레인 a] 완료: PR opened"]);
 	// Reprocessing the same terminal neither re-notifies nor re-runs the work.
 	await f.restart();
 	await Bun.sleep(20);
@@ -1068,7 +1068,7 @@ test("a receipt still missing after the output budget stays held with a non-loss
 	expect(f.job().attempts[0]?.endState).toBe("terminal_missing_receipt");
 	expect(f.job().state).toBe("awaiting_operator");
 	expect(f.notices.map((notice) => notice.text)).toEqual([
-		`[lane a] attempt_ended: terminal_missing_receipt: final_response_missing opRef=${result.opRef}`,
+		`[레인 a] 시도 종료: terminal_missing_receipt: final_response_missing opRef=${result.opRef}`,
 	]);
 	expect(f.port.sends).toHaveLength(1);
 });
@@ -1085,7 +1085,7 @@ test("broker deadline ends the attempt but caller timeout never does", async () 
 	await until(() => f.db.workAttemptOpen().length === 0);
 	expect(f.job().attempts[0]?.endState).toBe("attempt_ended");
 	expect(f.db.workAttemptGet(result.opRef)?.terminal?.status?.error).toEqual({ code: "prompt_deadline_exceeded" });
-	expect(f.notices[0]?.text).toBe("[lane a] attempt_ended: prompt_deadline_exceeded: output_unavailable");
+	expect(f.notices[0]?.text).toBe("[레인 a] 시도 종료: prompt_deadline_exceeded: output_unavailable");
 });
 
 test("torn send accepts only same-op status evidence; unknown remains open with no resend", async () => {
@@ -1123,7 +1123,7 @@ test("definitive send rejection atomically holds and enqueues one safe start-onl
 	await until(() => f.db.workAttemptOpen().length === 0);
 	expect(f.job().attempts[0]?.endState).toBe("failed");
 	expect(f.job().state).toBe("awaiting_operator");
-	expect(f.notices[0]?.text).toBe("[lane a] failed: send_rejected: output_unavailable");
+	expect(f.notices[0]?.text).toBe("[레인 a] 실패: send_rejected: output_unavailable");
 	expect(f.db.deliveryRows()).toHaveLength(1);
 });
 
@@ -1281,7 +1281,7 @@ test("completion excerpt retains the leading marker and scalar-safe prefix, not 
 	const source = "HEAD:" + "😀".repeat(1000) + ":TAIL";
 	f.port.complete(result.opRef, source);
 	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt != null);
-	const head = "[lane a] completed: ";
+	const head = "[레인 a] 완료: ";
 	const excerpt = utf8Prefix(source);
 	expect(f.db.workAttemptGet(result.opRef)?.output.excerpt).toBe(excerpt);
 	expect(f.notices[0]?.text).toBe(head + utf8Prefix(source, 2048 - Buffer.byteLength(head, "utf8")));
@@ -1299,7 +1299,7 @@ test("report and fallback text stay within 2048 UTF-8 bytes including the lane h
 			proof: null,
 			knownSilence: null,
 		};
-		const head = `[lane ${name}] attempt_ended: recovery_indeterminate: `;
+		const head = `[레인 ${name}] 시도 종료: recovery_indeterminate: `;
 		const text = reportText(name, "attempt_ended", "recovery_indeterminate", "op-ref", output);
 		expect(text).toBe(head + utf8Prefix(output.excerpt, 2048 - Buffer.byteLength(head, "utf8")));
 		expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(2048);
@@ -1422,7 +1422,7 @@ test("personaHold emitted hold reason selects fallback", async () => {
 	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
 	expect(f.db.workAttemptGet(result.opRef)?.decision).toBe("fallback");
 	expect(f.db.deliveryRows()).toHaveLength(1);
-	expect(f.notices[0]?.text).toBe("[lane a] completed: held persona result");
+	expect(f.notices[0]?.text).toBe("[레인 a] 완료: held persona result");
 });
 test("lane inbox steers an open nested parent and consumes only after acceptance", async () => {
 	const f = await fixture({ allowNested: () => true });
@@ -1442,7 +1442,7 @@ test("lane inbox steers an open nested parent and consumes only after acceptance
 	await until(() => f.db.laneReportsByParent("parent")[0]?.state === "consumed");
 	const report = f.db.laneReportsByParent("parent")[0]!;
 	expect(report).toMatchObject({ state: "consumed", claim_kind: "steer", consumed_op_ref: report.claim_ref });
-	expect(report.body).toBe("[lane child] completed: child result");
+	expect(report.body).toBe("[레인 child] 완료: child result");
 	expect(f.port.steers).toHaveLength(1);
 	expect(f.port.steers[0]?.clientRef).toBe(report.claim_ref!);
 	expect(f.port.steers[0]?.text).toContain("Report from child work lane child; not from a human.");
@@ -1842,7 +1842,7 @@ test("#308 host loss settles the open attempt as host_lost; resume and retire th
 	expect(f.job().attempts[0]?.endState).toBe("attempt_ended");
 	expect(f.job().attempts[0]?.errorCode).toBe("host_lost");
 	expect(f.job().state).toBe("attempt_ended");
-	expect(f.notices[0]?.text).toBe("[lane a] attempt_ended: host_lost: output_unavailable");
+	expect(f.notices[0]?.text).toBe("[레인 a] 시도 종료: host_lost: output_unavailable");
 	expect(await f.manager.status({ name: "a" })).toMatchObject({
 		attempt: { opRef: result.opRef, endState: "attempt_ended" },
 		op: null,

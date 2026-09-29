@@ -102,7 +102,7 @@ test("live CLI start/status/steer/jobs/retire: early receipt, open refusal, exac
 		"CLI start event",
 	);
 	expect(event.payload).toMatchObject({
-		text: "[lane cli] completed: CLI final answer",
+		text: "[레인 cli] 완료: CLI final answer",
 		origin: { platform: "discord", kind: "channel", conversationId: "fixture" },
 	});
 	expect(f.calls("send")).toHaveLength(1);

@@ -52,11 +52,13 @@ test("a persistent recovery hold reaches the owner DM once, deduplicated by op-r
 	expect(written[0]!.event).toBe("chat.message");
 	expect(payload.origin).toEqual(OWNER);
 	expect(payload.deliveryId).toMatch(/^gw-x-[0-9a-f]{32}$/);
-	expect(payload.text).toContain("[recovery hold] slack/channel/C1");
+	expect(payload.text).toContain("[복구 보류] slack/channel/C1");
 	expect(payload.text).toContain("약 5분째");
 	expect(payload.text).toContain('메시지: "@PM stuck question"');
 	expect(payload.text).toContain("gw-p-aaa");
 	expect(payload.text).toContain("자동 재전송은 하지 않습니다");
+	expect(payload.text).toContain("사유: operation_state_terminal_uncertain");
+	expect(payload.text).toContain("grep gw-p-aaa");
 	expect(ledger.get(payload.deliveryId)?.state).toBe("inflight");
 
 	// A restart re-counts sweeps and escalates again: the ledger id is the same, so nothing new is sent.
