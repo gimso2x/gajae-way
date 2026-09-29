@@ -1455,9 +1455,13 @@ test("startup recovery releases a bound turn whose tail attach is disowned inste
 /**
  * Live 2026-09-25 (BotFactory PM): a gateway restart outlived the session
  * hosts. The broker still indexed both ids (inspect: live=false, not deleted)
- * while `session status` answered `endpoint_stale`, so recovery logged
+ * while `session status` kept failing with an undecidable transport error, so
+ * recovery logged
  * `recovery_hold … reason=operation state terminal_uncertain is not decidable`
  * every sweep (sweeps=56) and the two triggers were never answered.
+ * (An `endpoint_stale` status read is now broker-disown evidence — see the
+ * ACCEPTED endpoint_stale tests above — so this scenario uses a transport
+ * failure that classifies as undecidable.)
  */
 test("startup recovery releases a bound turn on a not-live session after the hold persists, instead of holding it forever", async () => {
 	const port = new ScriptedSessionPort();
@@ -1476,8 +1480,8 @@ test("startup recovery releases a bound turn on a not-live session after the hol
 		override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
 			if (input.sessionId === stranded.sessionId)
 				throw new GjcCliError("gjc sdk session status reported failure", 1, "", {
-					code: "endpoint_stale",
-					message: "The SDK endpoint is stale or unavailable.",
+					code: "sdk_transport_failure",
+					message: "The SDK endpoint hit a transport failure.",
 				});
 			return await super.status(input);
 		}
@@ -1534,7 +1538,7 @@ test("startup recovery keeps holding a bound turn with undecidable status while 
 	class StaleEndpointPort extends ScriptedSessionPort {
 		override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
 			if (input.sessionId === running.sessionId)
-				throw new GjcCliError("gjc sdk session status reported failure", 1, "", { code: "endpoint_stale" });
+				throw new GjcCliError("gjc sdk session status reported failure", 1, "", { code: "sdk_transport_failure" });
 			return await super.status(input);
 		}
 	}
@@ -1571,7 +1575,7 @@ async function persistentHoldHarness(onRecoveryHold: (input: PersonaRecoveryHold
 	class StaleEndpointPort extends ScriptedSessionPort {
 		override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
 			if (input.sessionId === running.sessionId)
-				throw new GjcCliError("gjc sdk session status reported failure", 1, "", { code: "endpoint_stale" });
+				throw new GjcCliError("gjc sdk session status reported failure", 1, "", { code: "sdk_transport_failure" });
 			return await super.status(input);
 		}
 	}

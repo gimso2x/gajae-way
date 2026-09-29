@@ -780,6 +780,13 @@ class OriginActor {
 		const provablyDead =
 			raw?.live !== true &&
 			((first.session !== undefined && first.session.live === false) || raw?.live === false || raw?.disowned === true);
+		// Death evidence for the operator_hold arithmetic below (deadUnlanded): the
+		// same positive signals the early release above refuses to act on alone.
+		const sessionDead =
+			(first.session !== undefined && first.session.live === false) ||
+			(first.failed && second.failed) ||
+			raw?.live === false ||
+			raw?.disowned === true;
 		if (turn.state === "accepted" && provablyDead && status.status.status === "unknown" && disownedByBroker) {
 			const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true);
 			await this.#closeAcceptedOnDeadSession(bound, "session_gone_at_recovery");
