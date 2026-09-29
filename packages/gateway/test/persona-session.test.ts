@@ -1561,6 +1561,60 @@ test("startup recovery keeps holding a bound turn with undecidable status while 
 	expect(database?.getSessionRecord(KEY)?.epoch).toBe(0);
 });
 
+test("two failed inspects with a live liveness answer stay held, never re-sent (a transport outage is not death)", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	enqueue("m-1", "maybe running");
+	await manager?.notifyInbound(KEY);
+	await eventually(() => port.sends.length === 1, "turn did not start");
+	const running = port.sends[0]!;
+	const opRef = latestOpRef;
+	await manager?.stop();
+	database?.inboundTurnRequeue(opRef);
+	database?.inboundBindTurn({ messageId: "m-1", originKey: KEY, epoch: 0, opRef, sessionId: running.sessionId });
+
+	class OutagePort extends ScriptedSessionPort {
+		override async inspect(input: Parameters<ScriptedSessionPort["inspect"]>[0]) {
+			if (input.sessionId === running.sessionId)
+				throw new GjcCliError("gjc sdk session inspect reported failure", 1, "", { code: "transport_failure" });
+			return await super.inspect(input);
+		}
+		override async status(input: Parameters<ScriptedSessionPort["status"]>[0]) {
+			if (input.sessionId === running.sessionId)
+				throw new GjcCliError("gjc sdk session status reported failure", 1, "", { code: "sdk_transport_failure" });
+			return await super.status(input);
+		}
+	}
+	const outage = new OutagePort({ onBind: (input) => `fresh-e${input.epoch}` });
+	registerFixtureBindings(outage);
+	// The broker's liveness transport still answers live: neither the early
+	// bound release nor the operator_hold death arithmetic may treat the
+	// inspect/status outage as death and re-fire the turn.
+	outage.setSessionState(running.sessionId, { repo: join(home, "workspace"), live: true, deleted: false });
+	const logs: string[] = [];
+	manager = new PersonaSessionManager({
+		database: database!,
+		port: outage,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		log: (line) => logs.push(line),
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+	});
+	for (let sweep = 0; sweep < 3; sweep++) await manager.recover();
+	expect(outage.sends).toEqual([]);
+	expect(outage.resumes).toEqual([]);
+	expect(logs.some((line) => line.includes("recovery_requeue_unaccepted") && line.includes(`opRef=${opRef}`))).toBe(
+		false,
+	);
+	expect(database?.inboundTurnRow(opRef)).toMatchObject({ turn_state: "bound" });
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(
+		logs.some(
+			(line) => line.startsWith(`recovery_hold origin=${KEY} epoch=0 opRef=${opRef}`) && line.includes("sweeps=3"),
+		),
+	).toBe(true);
+});
+
 async function persistentHoldHarness(onRecoveryHold: (input: PersonaRecoveryHoldInput) => void) {
 	const port = new ScriptedSessionPort();
 	await harness(port);

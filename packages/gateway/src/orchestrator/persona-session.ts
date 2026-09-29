@@ -749,18 +749,21 @@ class OriginActor {
 		// runtime could be holding, so releasing its trigger back to pending is
 		// exactly-once-safe: the next dispatch binds a live session. A reachable
 		// runtime, even with an unknown status, keeps the hold: it may have
-		// accepted the send.
+		// accepted the send. A live liveness answer vetoes the both-inspects-failed
+		// inference: an outage on one transport is not death when the broker's
+		// liveness still answers. The broker's explicit session_unavailable disown
+		// is positive evidence and needs no veto.
+		const raw = this.#manager.port.liveness
+			? await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo })
+			: undefined;
 		const disownedByBroker =
 			status.unreachable === true &&
-			(status.unreachableCode === "session_unavailable" || (first.failed && second.failed));
+			(status.unreachableCode === "session_unavailable" || (first.failed && second.failed && raw?.live !== true));
 		// An ACCEPTED op may have run and acted, so it is NEVER requeued. When the
 		// broker disowns the id AND the session is provably not live (inspect
 		// answered live=false, or is gone), nothing can still be running there:
 		// the turn is closed (the owner told it was cut off). A merely
 		// unreachable but possibly-live session holds.
-		const raw = this.#manager.port.liveness
-			? await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo })
-			: undefined;
 		if (turn.state === "bound" && status.status.status === "unknown" && disownedByBroker) {
 			const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
 			// The binding itself is unusable: recreate through the existing rebind
@@ -781,12 +784,15 @@ class OriginActor {
 			raw?.live !== true &&
 			((first.session !== undefined && first.session.live === false) || raw?.live === false || raw?.disowned === true);
 		// Death evidence for the operator_hold arithmetic below (deadUnlanded): the
-		// same positive signals the early release above refuses to act on alone.
+		// same positive not-live/disowned evidence upstream's provablyDead requires,
+		// with a live liveness answer vetoing the whole determination — two failed
+		// inspects are a transport outage, not death, when liveness still answers.
 		const sessionDead =
-			(first.session !== undefined && first.session.live === false) ||
-			(first.failed && second.failed) ||
-			raw?.live === false ||
-			raw?.disowned === true;
+			raw?.live !== true &&
+			((first.session !== undefined && first.session.live === false) ||
+				(first.failed && second.failed) ||
+				raw?.live === false ||
+				raw?.disowned === true);
 		if (turn.state === "accepted" && provablyDead && status.status.status === "unknown" && disownedByBroker) {
 			const bound = await this.#adoptRecoveredTurn(turn, sessionId, retired, true);
 			await this.#closeAcceptedOnDeadSession(bound, "session_gone_at_recovery");
