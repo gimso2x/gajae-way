@@ -179,10 +179,14 @@ test("a message arriving while a persistent turn is in flight is steered into th
 
 	client.send(chatSend("one", "msg-1", "first"));
 	await waitFor(client.frames, 2);
+	// The ingest ack is not the dispatch: the actor sends asynchronously behind
+	// it, and under full-suite load the send may still be in flight here.
+	await eventually(() => sessionPort.sends.length === 1, "the first turn was never dispatched");
 	// The actor sends the correction through operator-gated turn.steer instead of
 	// waiting for a second legacy CLI turn.
 	client.send(chatSend("two", "msg-2", "second"));
 	await waitFor(client.frames, 3);
+	await eventually(() => sessionPort.steers.length === 1, "the correction was never steered");
 	expect(sessionPort.sends.map((send) => send.text)).toEqual(["first"]);
 	expect(sessionPort.steers.map((steer) => steer.text.replace(/^\[Additional message[^\n]*\]\n/, ""))).toEqual([
 		"second",

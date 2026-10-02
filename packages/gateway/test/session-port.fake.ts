@@ -23,6 +23,7 @@ import type {
 } from "../src/orchestrator/session-port";
 import { BrokerSessionPort, parseWorkerOutputResponse } from "../src/orchestrator/session-port";
 import {
+	decodeStreamLine,
 	RelayClosedError,
 	type RelayRequestOptions,
 	type RelayResponse,
@@ -583,6 +584,15 @@ export class ScriptedSessionPort implements SessionPort {
 			steerEcho: false,
 			idle: false,
 		});
+	}
+	/**
+	 * A raw host stdout line, exactly as `gjc sdk serve --stdio` prints it: the
+	 * production `decodeStreamLine` decodes it (the real interimSuppressBody flag
+	 * producer) before the frame reaches the relay. Never hand-assemble frames.
+	 */
+	emitHostLine(sessionId: string, line: string, opRef?: string): void {
+		const ref = opRef ?? this.#inFlightOpRef(sessionId);
+		for (const frame of decodeStreamLine(line)) this.#emit(sessionId, ref, frame);
 	}
 
 	/** Marks the operation terminal_ok with `text` as its durable answer, then emits only the lifecycle end frame. */

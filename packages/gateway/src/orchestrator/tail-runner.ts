@@ -75,6 +75,12 @@ export interface TailFrame {
 	/** True for user/tool/custom rows: attribution evidence, never chat output. */
 	readonly steerEcho: boolean;
 	readonly idle: boolean;
+	/**
+	 * A `message_end` whose content array carries a tool call block: the mid-work
+	 * speech riding a tool call is not channel output. The interim path withholds
+	 * the body (reactions in the same message still claim) and logs the omission.
+	 */
+	readonly interimSuppressBody?: boolean;
 }
 
 export interface TurnCorrelation {
@@ -799,6 +805,7 @@ function decodeEvent(kind: string, event: Record<string, unknown>, correlation: 
 		const role = typeof message.role === "string" ? message.role : "";
 		const text = role === "assistant" ? contentText(message.content) : undefined;
 		const id = typeof message.id === "string" ? message.id : undefined;
+		const assistant = role === "assistant";
 		return {
 			kind: "message_end",
 			rawKind: "message_end",
@@ -806,7 +813,8 @@ function decodeEvent(kind: string, event: Record<string, unknown>, correlation: 
 			...(id ? { eventId: id } : {}),
 			payload: { role, ...(message.content === undefined ? {} : { content: message.content }) },
 			...(text ? { assistantText: text } : {}),
-			steerEcho: role !== "assistant",
+			...(assistant && contentHasToolCall(message.content) ? { interimSuppressBody: true } : {}),
+			steerEcho: !assistant,
 			idle: false,
 		};
 	}
@@ -855,6 +863,17 @@ function contentText(content: unknown): string | undefined {
 		return record.type === undefined || record.type === "text" ? [record.text] : [];
 	});
 	return parts.join("");
+}
+
+/**
+ * True when the content array carries at least one tool call block. The block
+ * type name is the host's own (`toolCall`, keys type/id/name/arguments), as
+ * captured live from `gjc sdk serve --stdio` (20261002 gate 0): an assistant
+ * message that contains one is calling a tool, and its text is mid-work speech.
+ */
+function contentHasToolCall(content: unknown): boolean {
+	if (!Array.isArray(content)) return false;
+	return content.some((block) => recordOf(block)?.type === "toolCall");
 }
 
 function messageOf(error: unknown): string {

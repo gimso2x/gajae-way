@@ -121,6 +121,8 @@ test("an edit during the running turn is steered into it as a [MESSAGE POINTER] 
 	expect(port.sends).toHaveLength(1);
 	expect(port.steers[0]!.text).toContain("[MESSAGE POINTER: m-1]");
 	expect(port.steers[0]!.text).toContain("book a table for 4");
+	// The socket frame can lag the in-process steer under load: wait for it.
+	await eventually(() => client.response("e1") !== undefined, "no response to the edit");
 	expect(client.response("e1")?.result).toMatchObject({ engaged: true });
 	expect(client.response("e1")?.result.turnId).toBeString();
 	// The edit is attributed to the running turn, and the context ledger now
@@ -149,6 +151,8 @@ test("an edit while idle is sent as the next turn, pointing at the original mess
 	// The speaker header is prepended like any DM turn; the body is the pointer update.
 	expect(turns[1]).toEndWith(renderMessageEdit("m-1", "what is 2+3"));
 	expect(turns[1]).toContain("[MESSAGE POINTER: m-1]");
+	// Same socket-lag wait as the steered-edit test above.
+	await eventually(() => client.response("e1") !== undefined, "no response to the edit");
 	expect(client.response("e1")?.result).toMatchObject({ engaged: true });
 	client.close();
 });

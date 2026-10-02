@@ -2292,7 +2292,11 @@ async function createInboundTurnLifecycle(
 		}
 		deliverTerminalLine(renderHandoffPointer(handoff.target));
 	};
-	const deliverAssistantText = async (rawMessage: string, source: "interim" | "terminal") => {
+	const deliverAssistantText = async (
+		rawMessage: string,
+		source: "interim" | "terminal",
+		delivery: { readonly suppressBody?: boolean } = {},
+	) => {
 		if (!nonLoopback) return;
 		const handoff = parseHandoffReply(rawMessage);
 		if (handoff) {
@@ -2352,6 +2356,16 @@ async function createInboundTurnLifecycle(
 			}
 			message = reactionReply.body;
 			if (!message) return;
+		}
+		// A message_end that carries a tool call block is mid-work speech riding a
+		// tool call, not channel output (20261002-suppress-midturn-text). The
+		// reaction directives above were already parsed and claimed; only the body
+		// is withheld. The turn's final answer never passes here (terminal source).
+		if (source === "interim" && delivery.suppressBody === true) {
+			console.error(
+				`gateway_interim_suppressed origin=${key} turnId=${turnId} toolCall=true body=${sanitizeDiagnostic(rawMessage.slice(0, 80)).replace(/\s+/g, " ") || "empty"}`,
+			);
+			return;
 		}
 		// A standalone final marker also suppresses a reasoning preamble, but a
 		// marker quoted inside an ordinary answer must not swallow that answer.
@@ -2512,17 +2526,25 @@ async function createInboundTurnLifecycle(
 		tailActivitySeen = true;
 		// Every assistant message the owned relay delivers before the final answer
 		// is mid-work speech. The persona's own instructions decide what it says
-		// mid-turn; the gateway delivers it. The stream delivers each message
-		// once, so there is nothing to de-duplicate here.
+		// mid-turn; the gateway delivers it — except a message that carries a tool
+		// call block: its body is withheld (interimSuppressBody), reactions in it
+		// still claim. The stream delivers each message once, so there is nothing
+		// to de-duplicate here.
 		if (frame.assistantText?.trim() && !frame.steerEcho) {
 			lastKnown = {
 				toolCalls: lastKnown.toolCalls,
 				outputTokens: lastKnown.outputTokens + Math.ceil(frame.assistantText.length / 4),
 			};
 			try {
-				const decision = interimSpeech.admit(frame.assistantText, Date.now());
-				if (decision.deliver) await deliverAssistantText(frame.assistantText, "interim");
-				else console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
+				if (frame.interimSuppressBody === true) {
+					// Structural gate: text riding a tool call is never channel output.
+					// Reactions in it still claim; it does not spend the pacing budget.
+					await deliverAssistantText(frame.assistantText, "interim", { suppressBody: true });
+				} else {
+					const decision = interimSpeech.admit(frame.assistantText, Date.now());
+					if (decision.deliver) await deliverAssistantText(frame.assistantText, "interim");
+					else console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
+				}
 			} catch (error) {
 				console.error(`gateway intermediate delivery failed (${turnId}): ${diagnostic(error)}`);
 			}
