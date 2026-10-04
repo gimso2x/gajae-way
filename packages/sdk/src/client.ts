@@ -4,6 +4,7 @@ import type {
 	ChatSendResult,
 	GatewayStatusResult,
 	OpsCycleResult,
+	OpsRecoverOriginResult,
 	WorkRunParams,
 	WorkRunResult,
 } from "@gajae-gateway/protocol";
@@ -181,6 +182,9 @@ export class GajaewayClient {
 	}
 	opsCycle(): Promise<OpsCycleResult> {
 		return this.request("ops.cycle");
+	}
+	opsRecoverOrigin(originKey: string): Promise<OpsRecoverOriginResult> {
+		return this.request("ops.recoverOrigin", { originKey });
 	}
 
 	async close(): Promise<void> {

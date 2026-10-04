@@ -20,7 +20,7 @@ import type { GatewayDatabase } from "../store/db";
  *
  * Fail-closed rules:
  * - A session row whose bound gjc session id is empty (mid-rebind after /new,
- *   or never created) is reported as stale identity, never as healthy.
+ *   or never created) is stale unless durable settled-worker or idle-cutover evidence proves intent.
  * - Any delivery row in a state outside the ledger's known set is an unknown
  *   settlement and gates the projection — it is never counted as healthy.
  * - Quarantined memory intents and failed monitor events are surfaced as gates;
@@ -83,6 +83,10 @@ export interface RuntimeCycleSources {
 	 * `awaiting_operator`, or `stalled` job is a crash-left or held worker.
 	 */
 	readonly settledWorkOrigins: ReadonlySet<string>;
+	/** Current-authority cutover evidence, vetoed by unfinished work including quarantined rows. */
+	readonly idleCutoverSessionEpochs: ReadonlyMap<string, number>;
+	/** Accepted retired operations remain unresolved even when the new epoch is idle. */
+	readonly recoveryHeld: boolean;
 }
 
 export class RuntimeCycleProjector {
@@ -132,6 +136,9 @@ export class RuntimeCycleProjector {
 		const unknownDeliveries = deliveries.map((r) => r.state).filter((state) => !KNOWN_DELIVERY_STATES.has(state));
 		return {
 			sessionRows: sessions,
+			recoveryHeld: sessions.some((session) =>
+				this.#database.inboundNonterminalTurns(session.origin_key).some((turn) => turn.state === "accepted" && turn.epoch < session.epoch),
+			),
 			inboundCounts: inboundMap,
 			inFlightInbound,
 			pendingInbound: inboundMap.get("pending") ?? 0,
@@ -149,6 +156,7 @@ export class RuntimeCycleProjector {
 			instanceId: this.#database.instanceId,
 			activeLanes: this.#database.workLaneRows().length,
 			maxLanes: this.#maxLanes,
+			idleCutoverSessionEpochs: this.#database.idleCutoverSessionEpochs(),
 			settledWorkOrigins: new Set(
 				this.#database
 					.laneJobRows()
@@ -162,6 +170,7 @@ export class RuntimeCycleProjector {
 /** Pure projection over already-snapshotted sources — independently unit-testable. */
 export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: string): OpsCycleResult {
 	const gates = new Set<CycleGateReason>();
+	if (sources.recoveryHeld) gates.add("recovery_hold");
 
 	const sessions: CycleSessionView[] = sources.sessionRows.map((row) => {
 		const origin = parseOriginRef(row.origin_ref_json);
@@ -174,7 +183,11 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 			row.origin_key.startsWith(WORK_LANE_PREFIX) &&
 			row.gjc_session_id === "" &&
 			sources.settledWorkOrigins.has(row.origin_key);
-		if ((row.gjc_session_id === "" && !retiredLane) || row.epoch < 0) gates.add("stale_session_identity");
+		const idleCutover =
+			!row.origin_key.startsWith(WORK_LANE_PREFIX) &&
+			sources.idleCutoverSessionEpochs.get(row.origin_key) === row.epoch;
+		if ((row.gjc_session_id === "" && !retiredLane && !idleCutover) || row.epoch < 0)
+			gates.add("stale_session_identity");
 		return {
 			originKey: row.origin_key,
 			origin,

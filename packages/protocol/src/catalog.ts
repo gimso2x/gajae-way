@@ -669,6 +669,7 @@ export type CyclePhase = "idle" | "dispatching" | "delivering" | "draining" | "d
  * must never guess an optimistic phase over missing evidence.
  */
 export type CycleGateReason =
+	| "recovery_hold"
 	| "stale_session_identity"
 	| "delivery_settlement_unknown"
 	| "memory_closure_blocked"
@@ -676,6 +677,14 @@ export type CycleGateReason =
 	| "monitor_settlement_stuck"
 	| "lane_capacity_exhausted"
 	| "inbound_starved";
+
+export interface OpsRecoverOriginResult {
+	readonly originKey: string;
+	readonly previousEpoch: number;
+	readonly epoch: number;
+	readonly heldOpRef: string;
+	readonly heldSessionId: string;
+}
 
 export interface CycleSessionView {
 	/** Canonical, opaque origin key (protocol originKey; never reparsed). */
@@ -786,6 +795,7 @@ export interface VerbCatalogV01 {
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
 	"ops.cycle": { params: undefined; result: OpsCycleResult };
+	"ops.recoverOrigin": { params: { readonly originKey: string }; result: OpsRecoverOriginResult };
 }
 
 /** Event catalog: event name -> payload. */
@@ -827,6 +837,7 @@ export const VERBS_V01 = [
 	"engagement.reaction",
 	"gateway.reloadConfig",
 	"ops.cycle",
+	"ops.recoverOrigin",
 ] as const;
 export const EVENTS_V01 = ["chat.message", "chat.progress", "gateway.stopping", "monitor.event"] as const;
 

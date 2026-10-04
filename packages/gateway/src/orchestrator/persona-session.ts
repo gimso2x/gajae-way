@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { OpsRecoverOriginResult } from "@gajae-gateway/protocol";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -321,6 +322,14 @@ export class PersonaSessionManager {
 	}
 
 	/** Recovers nonterminal turns, pending inputs, and terminal turns' unresolved held steers after restart. */
+	async recoverOrigin(originKey: string): Promise<OpsRecoverOriginResult> {
+		const actor = this.#actor(originKey);
+		const result = await actor.enqueue(() => actor.recoverOrigin());
+		if (!result) throw new Error("recover_origin_refused: manager stopped");
+		return result;
+	}
+
+	/** Recovers nonterminal turns, pending inputs, and terminal turns' unresolved held steers after restart. */
 	recover(): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
 		const origins = new Set<string>([
@@ -635,6 +644,69 @@ class OriginActor {
 	}
 
 	/** Mailbox-serialized live rebind. The caller supplies a verified concrete selection. */
+	async recoverOrigin(): Promise<OpsRecoverOriginResult> {
+		const database = this.#manager.database;
+		const session = database.getSessionRecord(this.originKey);
+		const turns = session ? database.inboundNonterminalTurns(this.originKey, session.epoch) : [];
+		const turn = turns[0];
+		if (!session?.sessionId || turns.length !== 1 || turn?.state !== "accepted" || turn.sessionId !== session.sessionId)
+			throw new Error("recover_origin_refused: no unique current accepted turn");
+		const authority = database.inspectBrokerAuthority().authority;
+		if (!authority) throw new Error("recover_origin_refused: missing broker authority");
+		const guard = () => {
+			const owned = database.assertOwnedSession(session.sessionId, this.#manager.repo, authority);
+			const current = database.getSessionRecord(this.originKey);
+			const rows = database.inboundNonterminalTurns(this.originKey, session.epoch);
+			if (
+				owned.originKey !== this.originKey || owned.epoch !== session.epoch ||
+				current?.epoch !== session.epoch || current.sessionId !== session.sessionId ||
+				rows.length !== 1 || rows[0]?.opRef !== turn.opRef || rows[0]?.state !== "accepted" ||
+				rows[0]?.sessionId !== session.sessionId ||
+				database.inboundTurnRows(turn.opRef).some((row) => database.isBrokerQuarantined("inbound", row.message_id))
+			) throw new Error("recover_origin_refused: identity changed or quarantined");
+		};
+		guard();
+		const raw = await this.#manager.port.liveness?.({ sessionId: session.sessionId, repo: this.#manager.repo });
+		if (raw?.live !== false || raw.disowned) throw new Error("recover_origin_refused: broker has not proven live=false");
+		const epoch = database.withTransaction(() => {
+			guard();
+			// Durable observation-only fence: a restart cannot resume, replay or settle this old operation.
+			database.metaSet(`operator-recovery-hold:${turn.opRef}`, String(session.epoch));
+			return database.rebindEpoch(this.originKey);
+		});
+		const previous = this.#current;
+		if (previous) {
+			previous.retired = true;
+			previous.answerWanted = false;
+			this.#retired.set(retiredKey(previous), previous);
+			this.#current = undefined;
+		}
+		this.#state = "idle";
+		this.#deferredSteerOpRef = undefined;
+		if (this.#dispatchRetry) {
+			this.#manager.cancel(this.#dispatchRetry);
+			this.#graceTimers.delete(this.#dispatchRetry);
+			this.#dispatchRetry = undefined;
+		}
+		this.#manager.log(`operator_recovery_hold origin=${this.originKey} epoch=${session.epoch} nextEpoch=${epoch} opRef=${turn.opRef} session=${session.sessionId}`);
+		// Rotation is already durable. A later bind failure must not undo it or make this command rotate twice.
+		try { await this.#dispatchNext(); } catch (error) {
+			this.#manager.log(`operator_recovery_dispatch_failed origin=${this.originKey} detail=${safeDiagnostic(error)}`);
+		}
+		return { originKey: this.originKey, previousEpoch: session.epoch, epoch, heldOpRef: turn.opRef, heldSessionId: session.sessionId };
+	}
+
+	#operatorHeld(opRef: string): boolean {
+		return this.#manager.database.metaGet(`operator-recovery-hold:${opRef}`) !== undefined;
+	}
+
+	async #observeOperatorHold(turn: InboundTurn): Promise<void> {
+		if (!turn.sessionId) return;
+		const status = await this.#statusForRecovery(turn.sessionId, turn.opRef);
+		this.#manager.log(`operator_recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} status=${status.status.status}`);
+	}
+
+	/** Mailbox-serialized live rebind. The caller supplies a verified concrete selection. */
 	async rebindModel(selection: GjcModelSelection): Promise<void> {
 		const binding = await this.#ensureSession(this.#epoch());
 		const receipt = await this.#manager.port.setModel({
@@ -693,6 +765,7 @@ class OriginActor {
 
 	async #recoverTurn(turn: InboundTurn): Promise<void> {
 		if (this.#quarantinedTurn(turn.opRef)) return;
+		if (this.#operatorHeld(turn.opRef)) return await this.#observeOperatorHold(turn);
 		const currentEpoch = this.#epoch();
 		const retired = turn.epoch < currentEpoch;
 		const sessionId = turn.sessionId;
@@ -733,7 +806,7 @@ class OriginActor {
 			(first.failed && second.failed) ||
 			raw?.live === false ||
 			raw?.disowned === true;
-		const releasable = turn.state === "bound" || (turn.state === "accepted" && sessionDead);
+		const releasable = turn.state === "bound";
 		if (releasable && status.status.status === "unknown" && disownedByBroker) {
 			const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
 			// The binding itself is unusable: recreate through the existing rebind
@@ -1079,6 +1152,7 @@ class OriginActor {
 	 */
 	async #dispatchNext(): Promise<void> {
 		if (this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
+		if (this.#manager.database.inboundNonterminalTurns(this.originKey, this.#epoch()).length > 0) return;
 		await this.#resolveStaleHolds();
 		const trigger = this.#manager.database.inboundPendingOldest(this.originKey);
 		if (!trigger) return;
@@ -1326,6 +1400,7 @@ class OriginActor {
 	async #resolveStaleHolds(): Promise<void> {
 		for (const held of this.#manager.database.inboundSteersHeldAfterTerminal(this.originKey)) {
 			const opRef = held.turn_op_ref;
+			if (opRef && this.#operatorHeld(opRef)) continue;
 			if (
 				this.#manager.database.isBrokerQuarantined("inbound", held.message_id) ||
 				(opRef && this.#quarantinedTurn(opRef))
@@ -1842,6 +1917,7 @@ class OriginActor {
 	async #reconcileBound(bound: BoundTurn): Promise<void> {
 		if (this.#stopped || this.#manager.stopped) return;
 		if (this.#quarantinedTurn(bound.turn.opRef)) return;
+		if (this.#operatorHeld(bound.turn.opRef)) return await this.#observeOperatorHold(bound.turn);
 		let report: StatusReport;
 		try {
 			report = await this.#statusOf(bound);
@@ -1862,8 +1938,7 @@ class OriginActor {
 				// released only on positive evidence that the session is dead
 				// (live=false or disowned); an unanswerable liveness probe holds it.
 				const state = this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state;
-				const dead = raw?.live === false || raw?.disowned === true;
-				if (state === "bound" ? raw?.live !== true : dead) {
+				if (state === "bound" && raw?.live !== true) {
 					await this.#releaseUnlanded(bound, "router_disowned");
 					return;
 				}

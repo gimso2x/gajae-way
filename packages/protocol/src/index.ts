@@ -34,6 +34,7 @@ export {
 	type MonitorSpec,
 	type MonitorTestParams,
 	type OpsCycleResult,
+	type OpsRecoverOriginResult,
 	type OpsRedeliverParams,
 	type PromptStatusBody,
 	type RecallSnippet,

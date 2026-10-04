@@ -1217,8 +1217,7 @@ export class GatewayDatabase {
 	}
 	/**
 	 * Cycle projection source (ops.cycle): full session identity including the bound
-	 * gjc session id. An empty gjc_session_id with a positive epoch is the mid-rebind
-	 * state after /new; the projection must report it as stale identity, never healthy.
+	 * gjc session id. Empty identities require separate positive retirement/cutover evidence.
 	 */
 	sessionIdentityRows(): Array<{
 		origin_key: string;
@@ -1252,6 +1251,30 @@ export class GatewayDatabase {
 			bootstrap_truncated: number;
 			bootstrap_diagnostics_json: string;
 		}>;
+	}
+
+	/** Idle identities deliberately cleared by the active authority's cutover, not a later reset. */
+	idleCutoverSessionEpochs(): ReadonlyMap<string, number> {
+		const rows = this.#database
+			.query<{ origin_key: string; epoch: number }, []>(
+				`SELECT s.origin_key, s.epoch FROM sessions s
+				JOIN broker_cutovers c ON c.target_authority = (SELECT authority_key FROM broker_authority WHERE singleton = 1)
+				JOIN json_each(CASE WHEN json_valid(c.snapshot_json) THEN c.snapshot_json ELSE '{}' END, '$.sessions') old
+				ON json_extract(CASE WHEN old.type = 'object' THEN old.value ELSE '{}' END, '$.origin_key') = s.origin_key
+				WHERE s.gjc_session_id = '' AND s.epoch > 0
+				AND json_type(CASE WHEN old.type = 'object' THEN old.value ELSE '{}' END, '$.epoch') = 'integer'
+				AND s.epoch = json_extract(CASE WHEN old.type = 'object' THEN old.value ELSE '{}' END, '$.epoch') + 1
+				AND json_type(CASE WHEN old.type = 'object' THEN old.value ELSE '{}' END, '$.gjc_session_id') = 'text'
+				AND NOT EXISTS (SELECT 1 FROM inbound_messages i WHERE i.origin_key = s.origin_key
+					AND (i.state <> 'done' OR (i.turn_state IS NOT NULL AND i.turn_state <> 'done')))
+				AND (s.origin_key NOT LIKE 'monitor/%' OR NOT EXISTS (
+					SELECT 1 FROM monitor_events WHERE stage NOT IN ('delivered', 'authored_no_delivery', 'failed_no_retry')
+					OR (stage = 'failed_no_retry' AND updated_at >= c.created_at)))`,
+			)
+			.all();
+		// No replayability filter: quarantined and retired work must still veto quiescence.
+		// Monitor routing can fall back to catch-all, so conservatively check every event.
+		return new Map(rows.map((row) => [row.origin_key, row.epoch]));
 	}
 
 	/** Cycle projection source: durable inbound queue state census across all origins. */

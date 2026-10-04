@@ -452,6 +452,8 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					break;
 				}
 				let redeliverParams: { deliveryId: string } | { since: string } | undefined;
+				if (command === "recover-origin" && (parsed.rest.length !== 2 || !path?.trim()))
+					throw new Error("usage: gajaeway ops recover-origin <originKey>");
 				if (command === "redeliver") {
 					if (parsed.rest.length === 2 && path && path !== "--since") redeliverParams = { deliveryId: path };
 					else if (
@@ -468,6 +470,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					if (command === "backup" && path) console.log(JSON.stringify(await client.request("ops.backup", { path })));
 					else if (redeliverParams) console.log(JSON.stringify(await client.request("ops.redeliver", redeliverParams)));
 					else if (command === "integrity") console.log(JSON.stringify(await client.request("ops.integrity")));
+					else if (command === "recover-origin" && path) console.log(JSON.stringify(await client.opsRecoverOrigin(path)));
 					else if (command === "cycle") {
 						const cycle = await client.opsCycle();
 						if (parsed.rest[1] === "--json") console.log(JSON.stringify(cycle));

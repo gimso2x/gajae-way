@@ -956,6 +956,14 @@ async function handleRequest(
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: outcome });
 			return;
 		}
+		case "ops.recoverOrigin": {
+			const params = request.params as { originKey?: unknown } | undefined;
+			if (typeof params?.originKey !== "string" || !params.originKey.trim() || params.originKey.startsWith("work/"))
+				throw new ProtocolError("invalid_params", "ops.recoverOrigin requires a persona originKey");
+			const result = await runtime.personaSessions.recoverOrigin(params.originKey);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
 		case "ops.cycle":
 			connection.write({
 				v: PROFILE_VERSION,

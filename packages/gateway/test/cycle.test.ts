@@ -31,6 +31,8 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		activeLanes: 0,
 		maxLanes: 8,
 		settledWorkOrigins: new Set(),
+		idleCutoverSessionEpochs: new Map(),
+		recoveryHeld: false,
 	};
 	const merged = { ...defaults, ...overrides };
 	// Mirror the DB snapshot seam: the census total derives from the counts.
@@ -53,6 +55,11 @@ const boundSession = {
 };
 
 describe("runtime cycle projection", () => {
+	test("retired accepted work stays gated after a new epoch becomes idle", () => {
+		const result = projectRuntimeCycle(sources({ recoveryHeld: true }), generatedAt);
+		expect(result.phase).toBe("degraded");
+		expect(result.gates).toContain("recovery_hold");
+	});
 	test("pending work with nothing in flight past the starvation window is a gate, not dispatching", () => {
 		const busy = projectRuntimeCycle(
 			sources({ inboundCounts: new Map([["pending", 159]]), oldestStarvedPendingMs: INBOUND_STARVATION_MS - 1 }),
@@ -135,6 +142,27 @@ describe("runtime cycle projection", () => {
 		expect(result.phase).toBe("degraded");
 		expect(result.sessions[0].sessionId).toBe("");
 		expect(result.sessions[0].epoch).toBe(4);
+	});
+
+	test("only same-epoch idle cutover evidence exempts a persona identity", () => {
+		const row = { ...boundSession, gjc_session_id: "", epoch: 4 };
+		for (const epoch of [3, 4, 5]) {
+			const result = projectRuntimeCycle(
+				sources({ sessionRows: [row], idleCutoverSessionEpochs: new Map([[row.origin_key, epoch]]) }),
+				generatedAt,
+			);
+			expect(result.phase).toBe(epoch === 4 ? "idle" : "degraded");
+		}
+		const worker = { ...row, origin_key: "work/task/failed" };
+		expect(
+			projectRuntimeCycle(
+				sources({
+					sessionRows: [worker],
+					idleCutoverSessionEpochs: new Map([[worker.origin_key, 4]]),
+				}),
+				generatedAt,
+			).phase,
+		).toBe("degraded");
 	});
 
 	test("claimed inbound message projects dispatching", () => {

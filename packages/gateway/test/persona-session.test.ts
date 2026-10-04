@@ -100,6 +100,58 @@ async function harness(
 	});
 }
 
+for (const evidence of [true, undefined, "disowned"] as const)
+	test(`operator recovery refuses live or unknown broker evidence: ${evidence}`, async () => {
+		class Port extends ScriptedSessionPort {
+			async liveness() { return { live: typeof evidence === "boolean" ? evidence : undefined, disowned: evidence === "disowned" }; }
+		}
+		const port = new Port();
+		await harness(port);
+		enqueue("original", "accepted work");
+		await manager!.notifyInbound(KEY);
+		const before = database!.inboundTurnRows(port.sends[0]!.opRef);
+		await expect(manager!.recoverOrigin(KEY)).rejects.toThrow("live=false");
+		expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+		expect(database!.inboundTurnRows(port.sends[0]!.opRef)).toEqual(before);
+		expect(port.sends).toHaveLength(1);
+	});
+
+test("operator recovery fences old accepted and ambiguous steer rows across restart and dispatches only unbound input", async () => {
+	class Port extends ScriptedSessionPort {
+		async liveness(input: { sessionId: string }) { return { live: input.sessionId !== "session-e0", disowned: false }; }
+	}
+	const port = new Port({ onBind: (input) => `session-e${input.epoch}`, onSteer: () => { throw new Error("torn transport"); } });
+	await harness(port);
+	enqueue("original", "accepted work");
+	await manager!.notifyInbound(KEY);
+	const original = port.sends[0]!;
+	enqueue("held", "ambiguous steer");
+	await manager!.notifyInbound(KEY);
+	const before = database!.inboundTurnRows(original.opRef);
+	const steers = port.steers.length;
+	const receipt = await manager!.recoverOrigin(KEY);
+	expect(receipt).toMatchObject({ previousEpoch: 0, epoch: 1, heldOpRef: original.opRef });
+	await expect(manager!.recoverOrigin(KEY)).rejects.toThrow("no unique current accepted turn");
+	enqueue("fresh", "new work");
+	await manager!.notifyInbound(KEY);
+	expect(port.sends.map((send) => send.text)).toEqual(["accepted work", "new work"]);
+	await manager!.tick(KEY);
+	expect(database!.inboundTurnRows(original.opRef)).toEqual(before);
+	expect(port.steers).toHaveLength(steers);
+	expect(port.closes).toHaveLength(0);
+	await manager!.stop();
+	database!.close();
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	manager = new PersonaSessionManager({ database, port, instanceId: "instance-test", repo: join(home, "workspace") });
+	await manager.recover();
+	await manager.tick(KEY);
+	expect(database.inboundTurnRows(original.opRef)).toEqual(before);
+	expect(port.sends).toHaveLength(2);
+	expect(port.steers).toHaveLength(steers);
+	expect(port.closes).toHaveLength(0);
+});
+
 test("actor immediately dispatches durable inbound with one deterministic caller op-ref, then completes on tail terminal", async () => {
 	const port = new ScriptedSessionPort({
 		onSend: (input, scripted) => scripted.complete(input.opRef, "persona reply"),
