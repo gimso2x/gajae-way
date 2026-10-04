@@ -106,11 +106,11 @@ test("a spoken turn in the same open channel does deliver", async () => {
 	expect(message.payload.text).toContain("국밥");
 });
 
-test("a quoted silence marker in an explanation is silent under the unified grammar", async () => {
+test("a silence marker quoted in markdown code is an explanation and is delivered (#368)", async () => {
 	const reply = "무음 결과가 `[SILENT]`이면 종료합니다. 다른 결과와 `[SILENT]`가 섞이면 답변을 보냅니다.";
 	const { frames, database } = await openChannelGateway(reply);
 	const messages = frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
-	expect(messages.map((frame) => frame.payload.text)).toEqual([]);
+	expect(messages.map((frame) => frame.payload.text)).toEqual([reply]);
 	expect(database.inboundPendingCount("discord/channel/chan-1")).toBe(0);
 });
 
