@@ -343,6 +343,34 @@ export class SlackWebApi {
 			return Promise.reject(new SlackApiError(0, "invalid_response", "Slack response URL must use HTTPS"));
 		return this.call(responseUrl, payload);
 	}
+	/**
+	 * Slack's external-upload flow (what filesUploadV2 does under the hood, with
+	 * no SDK): ask for a one-purpose upload URL sized to the file, POST the raw
+	 * bytes to it, then commit the finished upload into the channel/thread with
+	 * an optional leading comment. The upload URL is pre-authorized — like a
+	 * response URL, the bot token never goes near it — and `completeUploadExternal`
+	 * is the write Slack judges, so its errors are the definitive ones.
+	 */
+	async uploadExternalFile(request: {
+		readonly filename: string;
+		readonly bytes: Uint8Array;
+		readonly channelId: string;
+		readonly threadTs?: string;
+		readonly initialComment?: string;
+	}): Promise<void> {
+		const { upload_url: uploadUrl, file_id: fileId } = await this.call<{
+			readonly upload_url: string;
+			readonly file_id: string;
+		}>("files.getUploadURLExternal", { filename: request.filename, length: request.bytes.byteLength });
+		const response = await this.fetcher(uploadUrl, { method: "POST", body: request.bytes });
+		if (!response.ok) throw new SlackApiError(response.status, `http_${response.status}`);
+		await this.call("files.completeUploadExternal", {
+			files: [{ id: fileId }],
+			channel_id: request.channelId,
+			...(request.threadTs === undefined ? {} : { thread_ts: request.threadTs }),
+			...(request.initialComment === undefined ? {} : { initial_comment: request.initialComment }),
+		});
+	}
 }
 
 /** Transport failure cannot prove whether Slack accepted the write before disconnecting. */

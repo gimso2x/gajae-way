@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import { join } from "node:path";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import type {
@@ -276,7 +277,7 @@ export function replyThreadTs(message: Pick<ChatMessagePayload, "origin" | "repl
 
 export async function settleSlackDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
-	api: Pick<SlackWebApi, "postMessage" | "addReaction">,
+	api: Pick<SlackWebApi, "postMessage" | "addReaction" | "conversationsInfo" | "uploadExternalFile">,
 	message: ChatMessagePayload,
 	_log: Pick<Console, "error"> = console,
 	status?: Pick<WorkingStatus, "clear">,
@@ -293,11 +294,47 @@ export async function settleSlackDelivery(
 	}
 	const deliveryId = message.deliveryId;
 	try {
+		if (message.file) {
+			// A file delivery uploads and posts nothing: the caption rides on the
+			// upload itself (initial_comment). The path was validated by the gateway
+			// before the delivery existed; re-reading it at upload time keeps the
+			// adapter honest about what it actually sent.
+			const channel = deliveryChannel(message.origin);
+			// Routing is decided before any write, so a bad target never half-posts.
+			const threadTs = replyThreadTs(message);
+			const bytes = await fs.promises.readFile(message.file.path);
+			const caption = mentions ? repairMentions(message.file.caption ?? "", mentions) : (message.file.caption ?? "");
+			await api.uploadExternalFile({
+				filename: message.file.filename,
+				bytes,
+				channelId: channel,
+				threadTs,
+				...(caption ? { initialComment: markdownToMrkdwn(caption) } : {}),
+			});
+			await gateway.request("delivery.confirm", { deliveryId });
+			return;
+		}
+		if (message.sendTarget) {
+			// A redirected reply posts ONLY where the persona addressed it. The bot
+			// must already be a member of the target; anything else fails the
+			// delivery instead of falling back to the current thread.
+			const info = await api.conversationsInfo(message.sendTarget.channelId);
+			if (info.is_member !== true)
+				throw new SlackApiError(200, "not_in_channel", `Slack bot is not a member of ${message.sendTarget.channelId}`);
+			const repaired = mentions ? repairMentions(message.text, mentions) : message.text;
+			const text = markdownToMrkdwn(
+				message.duplicateWarning ? `[recovered - may be a duplicate] ${repaired}` : repaired,
+			);
+			for (const chunk of chunkSlackMessage(text))
+				await api.postMessage(message.sendTarget.channelId, chunk, message.sendTarget.threadTs);
+			await gateway.request("delivery.confirm", { deliveryId });
+			return;
+		}
 		const channel = deliveryChannel(message.origin);
 		// Routing is decided before any write, so a bad target never half-posts.
 		const threadTs = replyThreadTs(message);
-		// Mentions are repaired before Markdown \u2192 mrkdwn: a `<@U\u2026>` the model wrapped
-		// in backticks, a bare `@U\u2026`, or an `@handle` the directory knows, all become
+		// Mentions are repaired before Markdown → mrkdwn: a `<@U…>` the model wrapped
+		// in backticks, a bare `@U…`, or an `@handle` the directory knows, all become
 		// a real ping instead of literal text. Unknown or ambiguous names are left alone.
 		const repaired = mentions ? repairMentions(message.text, mentions) : message.text;
 		const text = markdownToMrkdwn(message.duplicateWarning ? `[recovered - may be a duplicate] ${repaired}` : repaired);
@@ -342,7 +379,7 @@ export async function settleSlackReaction(
 
 export function subscribeSlackDeliveries(
 	gateway: GatewayClientLike,
-	api: Pick<SlackWebApi, "postMessage" | "addReaction">,
+	api: Pick<SlackWebApi, "postMessage" | "addReaction" | "conversationsInfo" | "uploadExternalFile">,
 	log: Pick<Console, "error"> = console,
 	status?: Pick<WorkingStatus, "clear">,
 	mentions?: MentionDirectory,
@@ -405,7 +442,7 @@ export class ReconnectingGateway implements GatewayClientLike {
 
 	constructor(
 		readonly socketPath: string,
-		readonly api: Pick<SlackWebApi, "postMessage" | "addReaction">,
+		readonly api: Pick<SlackWebApi, "postMessage" | "addReaction" | "conversationsInfo" | "uploadExternalFile">,
 		initialClient?: GatewayClientLike,
 		readonly status?: WorkingStatus,
 		readonly mentions?: MentionDirectory,

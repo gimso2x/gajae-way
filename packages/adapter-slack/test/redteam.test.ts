@@ -334,6 +334,10 @@ test("RT-SLACK-09 transport failure ambiguous, Slack API failure definitive", as
 					throw error;
 				},
 				async addReaction() {},
+				async conversationsInfo(id: string) {
+					return { id, is_member: true };
+				},
+				async uploadExternalFile() {},
 			},
 			delivery(),
 		);

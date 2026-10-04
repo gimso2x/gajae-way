@@ -8,6 +8,8 @@ import {
 	containsSilenceToken,
 	describeChatPlatforms,
 	encodeFrame,
+	FILES_PER_TURN_CAP,
+	type FileSendRef,
 	type Frame,
 	FrameDecoder,
 	type HelloPayload,
@@ -20,7 +22,7 @@ import {
 	originKey,
 	PROFILE_VERSION,
 	ProtocolError,
-	parseReactionReply,
+	parseOutboundReply,
 	platformSupportsReaction,
 	REACTIONS_PER_MESSAGE_CAP,
 	REACTIONS_PER_TURN_CAP,
@@ -77,6 +79,7 @@ import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
 import { OrderedFrameWriter } from "./frame-writer";
 import { applyModelCommand } from "./model-command";
+import { resolveContainedFile } from "./send-tokens";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
 /** Persona tail stall heartbeat; well under the 120s stallTimeoutMs so alarms land within one interval of the threshold. */
@@ -1693,23 +1696,80 @@ async function createInboundTurnLifecycle(
 	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
 	/**
-	 * Raw messages whose reaction tokens have already been claimed this turn. The
+	 * Raw messages whose leading tokens have already been claimed this turn. The
 	 * terminal path re-runs over text the tail already shipped as interim (to
-	 * record the per-part terminal claim); its reactions were claimed on that
-	 * first pass and must not be claimed - or rejected as duplicates - again.
+	 * record the per-part terminal claim); its tokens were claimed on that first
+	 * pass and must not be claimed - or rejected as duplicates - again.
 	 */
-	const reactionsClaimedFor = new Set<string>();
+	const tokensClaimedFor = new Set<string>();
+	/**
+	 * Deterministic delivery identity for a `[FILE:]`/`[SEND:]` delivery, so the
+	 * ledger slot for (trigger, kind, ordinal) is the same however many times the
+	 * reply is prepared — the same doctrine as the terminal text slots.
+	 */
+	const sendDeliveryId = (kind: "file" | "send", ordinal: number) =>
+		`gw-s-${createHash("sha256").update(`${key}|${input.turn.triggerMessageId}|${kind}|${ordinal}`).digest("hex").slice(0, 32)}`;
+	/**
+	 * A refused reply is recorded where the TURN can see it: the daemon log for
+	 * the operator and the conversation context for the next turn. Nothing is
+	 * delivered anywhere — a token refusal must never degrade into a post.
+	 */
+	const refuseReplyTokens = (reason: string) => {
+		console.error(`gateway reply tokens refused (${key}): ${reason}`);
+		options.database.contextRecord({
+			messageId: `reply-token-refused/${turnId}/${crypto.randomUUID().slice(0, 8)}`,
+			originKey: key,
+			body: `[reply-token refused] ${reason}`.slice(0, 300),
+		});
+	};
 	const deliverAssistantText = (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
 		let message = rawMessage;
-		const reactionReply = parseReactionReply(message);
-		if (reactionReply && reactionsClaimedFor.has(rawMessage)) {
-			message = reactionReply.body;
+		const parsed = parseOutboundReply(message);
+		if (parsed && tokensClaimedFor.has(rawMessage)) {
+			message = parsed.body;
 			if (!message) return;
-		} else if (reactionReply) {
-			reactionsClaimedFor.add(rawMessage);
+		} else if (parsed) {
+			tokensClaimedFor.add(rawMessage);
+			if (parsed.refusal) {
+				refuseReplyTokens(parsed.refusal);
+				return;
+			}
+			// The tokens route Slack uploads and Slack threads; anywhere else they
+			// are refused with an error, never delivered as literal text.
+			if ((parsed.files.length > 0 || parsed.sendTarget) && origin.platform !== "slack") {
+				refuseReplyTokens(`[FILE]/[SEND] tokens are Slack-only, and this origin is ${origin.platform}`);
+				return;
+			}
+			// Egress boundary before anything else: a path that fails containment
+			// must never become a ledger delivery (redelivery would re-hand it).
+			const files: FileSendRef[] = [];
+			for (const [index, requested] of parsed.files.entries()) {
+				const contained = resolveContainedFile(join(runtime.config.home, "workspace"), requested);
+				if (!contained.ok) {
+					refuseReplyTokens(`[FILE:${requested}] rejected: ${contained.error}`);
+					return;
+				}
+				files.push({
+					path: contained.path,
+					filename: contained.filename,
+					sizeBytes: contained.sizeBytes,
+					...(index === 0 && parsed.body ? { caption: parsed.body } : {}),
+				});
+			}
+			// Redirecting a reply is an owner-only privilege: the triggering author
+			// must be the configured owner, or nothing is posted anywhere.
+			if (parsed.sendTarget) {
+				const ownerId = ownerPeerIdOf(runtime.config);
+				if (ownerId === undefined || engagement?.authorId !== ownerId) {
+					refuseReplyTokens(
+						`[SEND:${parsed.sendTarget.channelId}] rejected: only the configured owner may redirect a reply`,
+					);
+					return;
+				}
+			}
 			reactionTokensSeen = true;
-			for (const wanted of reactionReply.reactions) {
+			for (const wanted of parsed.reactions) {
 				if (!platformSupportsReaction(origin.platform, wanted.emojiName)) {
 					console.error(
 						`gateway reaction skipped for ${key}: ${origin.platform} cannot react with ${wanted.emoji} (${wanted.emojiName})`,
@@ -1732,7 +1792,29 @@ async function createInboundTurnLifecycle(
 				assistantDeliveryStarted = true;
 				broadcastDelivery(runtime, payload);
 			}
-			message = reactionReply.body;
+			files.forEach((file, index) => {
+				const payload = runtime.delivery.prepareFile(turnId, origin, file, sendDeliveryId("file", index));
+				if (!payload) return;
+				assistantDeliveryStarted = true;
+				broadcastDelivery(runtime, payload);
+			});
+			// The reply text is the first file's caption when files exist, and rides
+			// to the [SEND:] target only when no caption consumes it; either way it
+			// is NOT also posted as an ordinary message.
+			if (parsed.sendTarget && files.length === 0 && parsed.body) {
+				const payload = runtime.delivery.prepareSend(
+					turnId,
+					origin,
+					parsed.sendTarget,
+					parsed.body,
+					sendDeliveryId("send", 0),
+				);
+				if (payload) {
+					assistantDeliveryStarted = true;
+					broadcastDelivery(runtime, payload);
+				}
+			}
+			message = files.length === 0 && !parsed.sendTarget ? parsed.body : "";
 			if (!message) return;
 		}
 		// Control tokens are internal protocol, never user-visible. Models routinely
@@ -2188,6 +2270,14 @@ export function currentConversationNotice(origin: OriginRef): string {
 		...(isChatPlatform(origin.platform)
 			? [
 					`Reaction replies: start your reply with [REACT:<emoji>] to react to the message that triggered this turn, or [REACT:<emoji>@<message id>] to react to a specific message. With nothing after the token you acknowledge with a reaction and say nothing; text after the token is sent as well. Emoji ${origin.platform} can actually deliver: ${reactionAllowlistDescription(origin.platform)}. At most ${REACTIONS_PER_TURN_CAP} reactions per turn and ${REACTIONS_PER_MESSAGE_CAP} per message.`,
+				]
+			: []),
+		// File upload and channel redirect: Slack-only outbound powers. Named next
+		// to the reaction guidance so the persona sees all reply-token modes
+		// together, with the caps and the failure rule spelled out.
+		...(origin.platform === "slack"
+			? [
+					`Slack sends: start a reply with [FILE:<path>] to attach a file from your workspace to this thread — repeat the token for more files (at most ${FILES_PER_TURN_CAP} per turn); everything after the tokens becomes the first file's caption, and with no text nothing else is posted. Paths must resolve inside your workspace, be regular files up to 50 MiB, and are validated before anything is sent: a rejected file or a Slack upload error fails visibly, it never posts a fallback message. Or start a reply with [SEND:<channelId>] or [SEND:<channelId>/<threadTs>] to post the rest of the reply in that channel/thread instead of this one — owner-only, and only channels the bot has joined; elsewhere the reply is refused, not redirected. Do not combine [SEND:] with [FILE:] in one reply.`,
 				]
 			: []),
 	].join("\n");

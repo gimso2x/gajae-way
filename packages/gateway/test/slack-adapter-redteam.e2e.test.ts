@@ -64,6 +64,10 @@ async function fixture(channels: GatewayConfig["channels"], reply = "<script>&")
 		async addReaction(...args: [string, string, string]) {
 			reactions.push(args);
 		},
+		async conversationsInfo(id: string) {
+			return { id, is_member: true };
+		},
+		async uploadExternalFile() {},
 	});
 	await adapter.connect();
 	client = await GajaewayClient.connectSocket(config.socketPath);
@@ -377,6 +381,10 @@ for (const silent of [false, true])
 				posts.push([channel, text, threadTs]);
 				return { channel, ts: "9.0" };
 			},
+			async conversationsInfo(id: string) {
+				return { id, is_member: true };
+			},
+			async uploadExternalFile() {},
 		};
 		const status = new WorkingStatus(api);
 		const adapter = new ReconnectingGateway(config.socketPath, api, undefined, status);

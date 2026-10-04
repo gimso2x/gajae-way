@@ -11,6 +11,8 @@ export interface SlackConversationLike {
 	readonly name?: string | null;
 	readonly is_im?: boolean;
 	readonly is_mpim?: boolean;
+	/** True only when the bot is a member; the gate for any outbound send there. */
+	readonly is_member?: boolean;
 }
 
 /** Blank profile fields mean unset, not a name that should hide a useful fallback. */

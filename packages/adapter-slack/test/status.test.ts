@@ -47,6 +47,10 @@ function fixture() {
 			posts.push([channel, text, threadTs]);
 			return { channel, ts: "10.001" };
 		},
+		async conversationsInfo(id: string) {
+			return { id, is_member: true };
+		},
+		async uploadExternalFile() {},
 	};
 	const status = new WorkingStatus(
 		api,

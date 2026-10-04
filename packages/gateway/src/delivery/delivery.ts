@@ -1,9 +1,11 @@
 import {
 	type ChatMessagePayload,
+	type FileSendRef,
 	isSilenceToken,
 	type OriginRef,
 	originKey,
 	type ReactionRef,
+	type SendTargetRef,
 } from "@gajae-gateway/protocol";
 import type { DeliveryLedger, LedgerOutcome } from "../store/ledger";
 
@@ -103,6 +105,71 @@ export class DeliveryService {
 			originKey: originKey(origin),
 			payloadJson: JSON.stringify(payload),
 		});
+		return payload;
+	}
+	/**
+	 * A `[FILE:]` upload is a LEDGER DELIVERY like a reaction: `delivery.confirm`
+	 * / `delivery.fail` are how the adapter reports the upload outcome and the
+	 * ledger is what survives a restart. `text` mirrors the caption (or names the
+	 * file) so an adapter that ignores `file` degrades to a visible reference
+	 * instead of silently dropping the delivery.
+	 */
+	prepareFile(
+		turnId: string,
+		origin: OriginRef,
+		file: FileSendRef,
+		deliveryId: string = crypto.randomUUID(),
+	): ChatMessagePayload | undefined {
+		const payload: ChatMessagePayload = {
+			turnId,
+			origin,
+			role: "assistant",
+			text: file.caption || file.filename,
+			final: true,
+			deliveryId,
+			file,
+		};
+		if (
+			!this.#ledger.createPending({
+				deliveryId,
+				turnId,
+				originKey: originKey(origin),
+				payloadJson: JSON.stringify(payload),
+			})
+		)
+			return undefined;
+		return payload;
+	}
+	/**
+	 * A `[SEND:]` delivery IS the reply text, routed to another channel/thread;
+	 * the adapter must verify membership there and fail the delivery rather than
+	 * fall back to the current thread. Same ledger contract as ordinary text.
+	 */
+	prepareSend(
+		turnId: string,
+		origin: OriginRef,
+		sendTarget: SendTargetRef,
+		text: string,
+		deliveryId: string = crypto.randomUUID(),
+	): ChatMessagePayload | undefined {
+		const payload: ChatMessagePayload = {
+			turnId,
+			origin,
+			role: "assistant",
+			text,
+			final: true,
+			deliveryId,
+			sendTarget,
+		};
+		if (
+			!this.#ledger.createPending({
+				deliveryId,
+				turnId,
+				originKey: originKey(origin),
+				payloadJson: JSON.stringify(payload),
+			})
+		)
+			return undefined;
 		return payload;
 	}
 	markInflight(deliveryId: string): void {

@@ -1,5 +1,6 @@
 import type { OriginRef } from "./origin";
 import type { ReactionAction, ReactionRef } from "./reactions";
+import type { FileSendRef, SendTargetRef } from "./sends";
 
 /**
  * Typed verb + event catalogs for profile v0.1. Catalogs grow additively per
@@ -256,6 +257,20 @@ export interface ChatMessagePayload {
 	 * the safe direction to lose.
 	 */
 	readonly voiceText?: string;
+	/**
+	 * When present this delivery is a WORKSPACE FILE UPLOAD, not a message: the
+	 * adapter must upload `file.path` to the current thread (Slack external
+	 * upload flow) and post nothing. The gateway validated the path inside the
+	 * persona workspace root before preparing the delivery; `caption` rides only
+	 * on the first file of a reply.
+	 */
+	readonly file?: FileSendRef;
+	/**
+	 * When present the reply text must be posted to this channel/thread instead
+	 * of the current one — never in addition to it. The adapter must verify the
+	 * bot is a member of the channel and fail the delivery otherwise.
+	 */
+	readonly sendTarget?: SendTargetRef;
 }
 
 export interface DeliveryConfirmParams {

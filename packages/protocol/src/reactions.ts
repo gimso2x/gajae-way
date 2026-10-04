@@ -163,7 +163,7 @@ export function isPlatformMessageId(value: string): boolean {
 	return PLATFORM_MESSAGE_ID.test(value);
 }
 
-const REACT_TOKEN = /^\s*\[REACT:([^\]\n]*)\]/;
+export const REACT_TOKEN = /^\s*\[REACT:([^\]\n]*)\]/;
 
 /**
  * Parses leading reaction tokens. Returns undefined when the reply carries no

@@ -141,6 +141,13 @@ export {
 } from "./reactions";
 export { parseRuntimeConfig, type RuntimeConfig, RuntimeConfigError } from "./runtime-config";
 export {
+	FILES_PER_TURN_CAP,
+	type FileSendRef,
+	type OutboundReply,
+	parseOutboundReply,
+	type SendTargetRef,
+} from "./sends";
+export {
 	CAPABILITIES,
 	type Capability,
 	compareProfileVersions,

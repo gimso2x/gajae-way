@@ -34,7 +34,7 @@ async function settle(): Promise<void> {
 
 /** Records every Slack Web API call the delivery path makes; never talks to Slack. */
 function fakeSlackApi(): {
-	readonly api: Pick<SlackWebApi, "postMessage" | "addReaction">;
+	readonly api: Pick<SlackWebApi, "postMessage" | "addReaction" | "conversationsInfo" | "uploadExternalFile">;
 	readonly posts: Array<{ channel: string; text: string; threadTs?: string }>;
 	readonly reactions: Array<{ channel: string; ts: string; name: string }>;
 } {
@@ -51,6 +51,10 @@ function fakeSlackApi(): {
 			async addReaction(channel, ts, name) {
 				reactions.push({ channel, ts, name });
 			},
+			async conversationsInfo(id: string) {
+				return { id, is_member: true };
+			},
+			async uploadExternalFile() {},
 		},
 	};
 }
@@ -179,8 +183,10 @@ test("a delivery the adapter cannot settle is a failed ledger row, not a silent 
 	const slack = fakeSlackApi();
 	// The gateway hands the adapter a reaction whose target is not a channel:ts id;
 	// the adapter must refuse it definitively rather than guess a channel.
-	const failing: Pick<SlackWebApi, "postMessage" | "addReaction"> = {
+	const failing: Pick<SlackWebApi, "postMessage" | "addReaction" | "conversationsInfo" | "uploadExternalFile"> = {
 		postMessage: slack.api.postMessage,
+		conversationsInfo: slack.api.conversationsInfo,
+		uploadExternalFile: slack.api.uploadExternalFile,
 		addReaction: async () => {
 			throw new TypeError("fetch failed");
 		},
@@ -239,6 +245,8 @@ test("a delivery pending in the ledger before the adapter connects is replayed a
 			throw new TypeError("link died mid-post");
 		},
 		addReaction: seedApi.api.addReaction,
+		conversationsInfo: seedApi.api.conversationsInfo,
+		uploadExternalFile: seedApi.api.uploadExternalFile,
 	});
 	await seedAdapter.connect();
 	await seedAdapter.requestInbound(slackMessageId("C1", "1726543210.000600"), CHANNEL_ORIGIN, "hello?", {
