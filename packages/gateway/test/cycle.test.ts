@@ -19,6 +19,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 			floorAt: null,
 		},
 		inFlightInbound: 0,
+		inboundTurns: [],
 		pendingInbound: 0,
 		unknownInboundStates: [],
 		deliveryCounts: new Map(),
@@ -30,6 +31,10 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		instanceId: "test-instance",
 		activeLanes: 0,
 		maxLanes: 8,
+		awaitingOperatorLanes: 0,
+		stalledLanes: 0,
+		uncertainWorkerAttempts: 0,
+		workerIssues: [],
 		settledWorkOrigins: new Set(),
 	};
 	const merged = { ...defaults, ...overrides };
@@ -53,6 +58,16 @@ const boundSession = {
 };
 
 describe("runtime cycle projection", () => {
+	test("invalid worker evidence gates independently of holds and capacity", () => {
+		const workerIssues = [
+			{ jobId: "lanejob-a", laneKey: "work-a", sessionId: null, opRef: null, reason: "job_record_invalid" as const },
+		];
+		const result = projectRuntimeCycle(sources({ workerIssues }), generatedAt);
+		expect(result.gates).toEqual(["worker_evidence_invalid"]);
+		expect(result.phase).toBe("degraded");
+		expect(result.lanes.workerIssues).toEqual(workerIssues);
+	});
+
 	test("pending work with nothing in flight past the starvation window is a gate, not dispatching", () => {
 		const busy = projectRuntimeCycle(
 			sources({ inboundCounts: new Map([["pending", 159]]), oldestStarvedPendingMs: INBOUND_STARVATION_MS - 1 }),
@@ -81,10 +96,38 @@ describe("runtime cycle projection", () => {
 		const result = projectRuntimeCycle(sources({ activeLanes: 8, maxLanes: 8 }), generatedAt);
 		expect(result.gates).toContain("lane_capacity_exhausted");
 		expect(result.phase).toBe("degraded");
-		expect(result.lanes).toEqual({ active: 8, max: 8 });
+		expect(result.lanes).toMatchObject({ active: 8, max: 8 });
 		const below = projectRuntimeCycle(sources({ activeLanes: 7, maxLanes: 8 }), generatedAt);
 		expect(below.gates).toEqual([]);
-		expect(below.lanes).toEqual({ active: 7, max: 8 });
+		expect(below.lanes).toMatchObject({ active: 7, max: 8 });
+	});
+
+	for (const [field, gate] of [
+		["awaitingOperatorLanes", "worker_awaiting_operator"],
+		["stalledLanes", "worker_stalled"],
+		["uncertainWorkerAttempts", "worker_send_uncertain"],
+	] as const) {
+		test(`${field} gates even below capacity and while inbound is dispatching`, () => {
+			const result = projectRuntimeCycle(sources({ [field]: 1, activeLanes: 1, inFlightInbound: 1 }), generatedAt);
+			expect(result.phase).toBe("degraded");
+			expect(result.gates).toEqual([gate]);
+		});
+	}
+
+	test("long accepted and bound turn ages remain diagnostic, never failure proof", () => {
+		const inboundTurns = ["accepted", "bound"].map((state) => ({
+			originKey: boundSession.origin_key,
+			epoch: state === "accepted" ? 2 : 3,
+			sessionId: boundSession.gjc_session_id,
+			opRef: `gw-p-${state}`,
+			state: state as "accepted" | "bound",
+			startedAt: "2026-08-24T00:00:00.000Z",
+			ageMs: 48 * 60 * 60_000,
+		}));
+		const result = projectRuntimeCycle(sources({ inboundTurns, inFlightInbound: 2 }), generatedAt);
+		expect(result.phase).toBe("dispatching");
+		expect(result.gates).toEqual([]);
+		expect(result.inboundTurns).toEqual(inboundTurns);
 	});
 
 	test("an unbound worker lane is retired only on positive settled-job evidence", () => {
@@ -125,9 +168,12 @@ describe("runtime cycle projection", () => {
 		expect(result.sessions[0].origin).toMatchObject({ platform: "discord", kind: "dm" });
 	});
 
-	test("mid-rebind session (empty gjc session id) gates as stale identity, never healthy", () => {
+	test("unbound persona with pending work gates, idle epoch placeholder does not", () => {
 		const result = projectRuntimeCycle(
-			sources({ sessionRows: [{ ...boundSession, gjc_session_id: "", epoch: 4 }] }),
+			sources({
+				sessionRows: [{ ...boundSession, gjc_session_id: "", epoch: 4 }],
+				inboundPendingByOrigin: new Map([[boundSession.origin_key, 1]]),
+			}),
 			generatedAt,
 		);
 		// Fail-closed: epoch is visible but identity is unbound; the operator must see it.
@@ -135,6 +181,12 @@ describe("runtime cycle projection", () => {
 		expect(result.phase).toBe("degraded");
 		expect(result.sessions[0].sessionId).toBe("");
 		expect(result.sessions[0].epoch).toBe(4);
+		const idle = projectRuntimeCycle(
+			sources({ sessionRows: [{ ...boundSession, gjc_session_id: "", epoch: 4 }] }),
+			generatedAt,
+		);
+		expect(idle.gates).toEqual([]);
+		expect(idle.phase).toBe("idle");
 	});
 
 	test("claimed inbound message projects dispatching", () => {

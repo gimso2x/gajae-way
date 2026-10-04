@@ -1,4 +1,4 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,11 +10,7 @@ import {
 	judgeBrokerLiveness,
 } from "../src/orchestrator/broker";
 import { BIND_WEDGE_PROBE_STRIKES, PersonaSessionManager } from "../src/orchestrator/persona-session";
-import {
-	BrokerSessionPort,
-	MAX_POISONED_CREATE_ROTATIONS,
-	type SessionBindInput,
-} from "../src/orchestrator/session-port";
+import { BrokerSessionPort, type SessionBindInput } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";
 import { initializeTestBrokerAuthority, noRelay, ScriptedSessionPort } from "./session-port.fake";
@@ -124,22 +120,22 @@ test("bind hold descriptions identify the wedge cause instead of reporting a bar
 	expect(hold.notice).not.toContain("Prompt submission failed");
 });
 
-test("poisoned create-key rotation stops at exactly three rotations and rethrows on the fourth", async () => {
+test("repeated uncertain creates preserve one epoch and deterministic key without a rotation counter", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-wedge-rotation-"));
 	directories.push(home);
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
 	databases.push(database);
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
-	const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+	const keys: string[] = [];
 	const run = async (args: readonly string[]) => {
-		if (args.includes("session.create"))
+		if (args.includes("session.create")) {
+			keys.push(args[args.indexOf("--idempotency-key") + 1]!);
 			return {
 				exitCode: 1,
 				stdout: JSON.stringify({ ok: false, error: { code: "terminal_uncertain", message: "startup pending" } }),
 				stderr: "",
 			};
-		if (args.includes("inspect"))
-			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { session: { live: true } } }), stderr: "" };
+		}
 		throw new Error(`unexpected command: ${args.join(" ")}`);
 	};
 	const port = new BrokerSessionPort({
@@ -150,26 +146,17 @@ test("poisoned create-key rotation stops at exactly three rotations and rethrows
 		tailRunner: new TailRunner({ stream: noRelay, repo: REPO }),
 		sleep: async () => {},
 	});
-	try {
-		for (let rotation = 0; rotation < MAX_POISONED_CREATE_ROTATIONS; rotation++) {
-			const epoch = database.getSessionRecord(ORIGIN)?.epoch ?? 0;
-			await expect(port.bind({ originKey: ORIGIN, epoch, repo: REPO })).rejects.toThrow("terminal_uncertain");
-		}
-		const cappedEpoch = database.getSessionRecord(ORIGIN)?.epoch ?? 0;
-		await expect(port.bind({ originKey: ORIGIN, epoch: cappedEpoch, repo: REPO })).rejects.toThrow(
-			"terminal_uncertain",
-		);
-		expect(database.getSessionRecord(ORIGIN)?.epoch).toBe(cappedEpoch);
-		expect(
-			errorSpy.mock.calls.filter(([line]) => String(line).includes("session_create_rotation_capped")),
-		).toHaveLength(1);
-		expect(String(errorSpy.mock.calls.at(-1)?.[0])).toContain("reason=poisoned_create_key_capped");
-	} finally {
-		errorSpy.mockRestore();
+	const epoch = database.bumpEpoch(ORIGIN, "{}");
+	for (let attempt = 0; attempt < 4; attempt++) {
+		await expect(port.bind({ originKey: ORIGIN, epoch, repo: REPO })).rejects.toThrow("terminal_uncertain");
+		expect(database.getSessionRecord(ORIGIN)).toMatchObject({ epoch, sessionId: "" });
 	}
+	expect(keys).toHaveLength(20);
+	expect(new Set(keys).size).toBe(1);
+	expect(database.metaGet(`create_rotation:${ORIGIN}`)).toBeUndefined();
 });
 
-test("a successful bind resets the durable poisoned-create rotation counter", async () => {
+test("create recovery and resume retain the original epoch and binding", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-broker-wedge-reset-"));
 	directories.push(home);
 	const database = await GatewayDatabase.open(join(home, "gateway.db"));
@@ -177,8 +164,10 @@ test("a successful bind resets the durable poisoned-create rotation counter", as
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	let fail = true;
 	let live = true;
+	const keys: string[] = [];
 	const run = async (args: readonly string[]) => {
-		if (args.includes("session.create"))
+		if (args.includes("session.create")) {
+			keys.push(args[args.indexOf("--idempotency-key") + 1]!);
 			return fail
 				? {
 						exitCode: 1,
@@ -186,16 +175,26 @@ test("a successful bind resets the durable poisoned-create rotation counter", as
 						stderr: "",
 					}
 				: { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "recovered" } }), stderr: "" };
+		}
 		if (args.includes("session.resume")) {
 			live = true;
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: {} }), stderr: "" };
 		}
+		if (args.includes("session.list"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: { savedSession: { id: "recovered", path: "/saved/recovered.jsonl" } },
+				}),
+				stderr: "",
+			};
 		if (args.includes("inspect"))
 			return {
 				exitCode: 0,
 				stdout: JSON.stringify({
 					ok: true,
-					result: { session: { sessionId: "recovered", live, deleted: false, locator: { repo: REPO } } },
+					result: { session: { sessionId: "recovered", live, deleted: false, locator: { cwd: REPO } } },
 				}),
 				stderr: "",
 			};
@@ -210,23 +209,18 @@ test("a successful bind resets the durable poisoned-create rotation counter", as
 		sleep: async () => {},
 	});
 	await expect(port.bind({ originKey: ORIGIN, epoch: 0, repo: REPO })).rejects.toThrow();
-	expect(database.metaGet(`create_rotation:${ORIGIN}`)).toBe("1");
 	fail = false;
-	const recoveredEpoch = database.getSessionRecord(ORIGIN)?.epoch ?? 0;
-	await expect(port.bind({ originKey: ORIGIN, epoch: recoveredEpoch, repo: REPO })).resolves.toMatchObject({
+	await expect(port.bind({ originKey: ORIGIN, epoch: 0, repo: REPO })).resolves.toMatchObject({
 		sessionId: "recovered",
+		epoch: 0,
 	});
-	expect(database.metaGet(`create_rotation:${ORIGIN}`)).toBe("0");
-	database.metaSet(`create_rotation:${ORIGIN}`, String(MAX_POISONED_CREATE_ROTATIONS));
+	expect(new Set(keys).size).toBe(1);
 	live = false;
-	await expect(
-		port.resume({ sessionId: "recovered", repo: REPO, originKey: ORIGIN, epoch: recoveredEpoch }),
-	).resolves.toMatchObject({ sessionId: "recovered" });
-	expect(database.metaGet(`create_rotation:${ORIGIN}`)).toBe("0");
-	fail = true;
-	const laterEpoch = database.rebindEpoch(ORIGIN);
-	await expect(port.bind({ originKey: ORIGIN, epoch: laterEpoch, repo: REPO })).rejects.toThrow();
-	expect(database.metaGet(`create_rotation:${ORIGIN}`)).toBe("1");
+	await expect(port.resume({ sessionId: "recovered", repo: REPO, originKey: ORIGIN, epoch: 0 })).resolves.toMatchObject(
+		{ sessionId: "recovered" },
+	);
+	expect(database.getSessionRecord(ORIGIN)).toMatchObject({ sessionId: "recovered", epoch: 0 });
+	expect(database.metaGet(`create_rotation:${ORIGIN}`)).toBeUndefined();
 });
 
 class FailingBindPort extends ScriptedSessionPort {

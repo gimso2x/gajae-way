@@ -542,6 +542,7 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 		deliveries: { pending: 0, inflight: 0, confirmed: 0, failedAmbiguous: 0, expired: 0 },
 		inFlightInbound: 0,
 		pendingInbound: 0,
+		inboundTurns: [],
 		contextDiff: {
 			unread: 0,
 			expired: 0,
@@ -550,12 +551,42 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 			omittedNewestAt: null,
 			floorAt: null,
 		},
-		lanes: { active: 0, max: 8 },
+		lanes: { active: 0, max: 8, awaitingOperator: 0, stalled: 0, uncertainAttempts: 0, workerIssues: [] },
 		...overrides,
 	};
 }
 
 describe("cycle rendering", () => {
+	test("worker issues render exact operator identity and nullable corruption subjects", () => {
+		const lines = renderCycle(
+			cycleResult({
+				lanes: {
+					active: 1,
+					max: 8,
+					awaitingOperator: 1,
+					stalled: 0,
+					uncertainAttempts: 0,
+					workerIssues: [
+						{
+							jobId: "lanejob-held",
+							laneKey: "work-a",
+							sessionId: "saved-session",
+							opRef: "gw-work-saved",
+							reason: "awaiting_operator",
+						},
+						{ jobId: "lanejob-broken", laneKey: "work-b", sessionId: null, opRef: null, reason: "job_record_invalid" },
+					],
+				},
+			}),
+		).join("\n");
+		expect(lines).toContain(
+			"worker: job=lanejob-held lane=work-a session=saved-session op=gw-work-saved reason=awaiting_operator",
+		);
+		expect(lines).toContain(
+			"worker: job=lanejob-broken lane=work-b session=unknown op=unknown reason=job_record_invalid",
+		);
+	});
+
 	test("healthy cycle renders phase and explicit none-gate, no sessions block", () => {
 		const lines = renderCycle(cycleResult());
 		expect(lines[0]).toBe("phase: idle");
@@ -614,10 +645,32 @@ describe("cycle rendering", () => {
 	test("census lines always render so an empty subsystem is distinguishable from a missing one", () => {
 		const lines = renderCycle(cycleResult()).join("\n");
 		expect(lines).toContain("inbound: pending=0 inflight=0");
+		expect(lines).toContain("workers: active=0/8 awaiting_operator=0 stalled=0 send_uncertain=0");
 		expect(lines).toContain("context: unread=0 expired=0 truncated=0 omitted_oldest=- omitted_newest=-");
 		expect(lines).toContain("deliveries: pending=0 inflight=0 confirmed=0 failed_ambiguous=0 expired=0");
 		expect(lines).toContain("memory: queued=0 written=0 committed=0 receipted=0 quarantined=0");
 		expect(lines).toContain("monitors: none");
+	});
+
+	test("turn diagnostics preserve exact recovery identity and expose elapsed age", () => {
+		const lines = renderCycle(
+			cycleResult({
+				inboundTurns: [
+					{
+						originKey: "discord/dm/c1/peer=p1",
+						epoch: 2,
+						sessionId: "saved-session",
+						opRef: "gw-p-saved",
+						state: "accepted",
+						startedAt: "2026-08-24T00:00:00.000Z",
+						ageMs: 172800000,
+					},
+				],
+			}),
+		).join("\n");
+		expect(lines).toContain(
+			"turn: origin=discord/dm/c1/peer=p1 epoch=2 session=saved-session op=gw-p-saved state=accepted age=172800s",
+		);
 	});
 
 	test("exit-code contract: gates force exit 1, healthy is exit 0", () => {
@@ -627,6 +680,9 @@ describe("cycle rendering", () => {
 			"delivery_settlement_unknown",
 			"memory_closure_blocked",
 			"monitor_settlement_failed",
+			"worker_awaiting_operator",
+			"worker_stalled",
+			"worker_send_uncertain",
 		])
 			expect(cycleExitCode(cycleResult({ gates: [gate as OpsCycleResult["gates"][number]] }))).toBe(1);
 	});

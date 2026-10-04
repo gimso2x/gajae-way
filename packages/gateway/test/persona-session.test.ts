@@ -8,6 +8,7 @@ import {
 	HOLD_ESCALATE_SWEEPS,
 	type PersonaRecoveryHoldInput,
 	PersonaSessionManager,
+	type PersonaSessionManagerOptions,
 	personaTurnOpRef,
 } from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
@@ -72,7 +73,7 @@ async function harness(
 		failureError?: (error: Error) => void;
 	} = {},
 	log?: (line: string) => void,
-	extra: { brokerGeneration?: () => number } = {},
+	extra: Pick<PersonaSessionManagerOptions, "brokerGeneration" | "now" | "onRecoveryHold"> = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-session-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
@@ -99,6 +100,163 @@ async function harness(
 		},
 	});
 }
+
+for (const evidence of ["dead", "unavailable"] as const) {
+	test(`idle ${evidence} inspection preserves a pending trigger when authority cannot be recovered`, async () => {
+		const port = new ScriptedSessionPort({
+			onBind: ({ epoch }) => `owned-${epoch}`,
+			onSend: (input, scripted) => scripted.complete(input.opRef, "done"),
+		});
+		const terminals: string[] = [];
+		await harness(port, { terminal: (text) => terminals.push(text) });
+		enqueue("old", "old prompt");
+		await manager!.notifyInbound(KEY);
+		await eventually(() => terminals.length === 1, "old turn did not settle");
+		port.setSessionState("owned-0", { live: false });
+		if (evidence === "unavailable") port.inspect = async () => undefined;
+		let recoveries = 0;
+		port.bind = async () => {
+			recoveries++;
+			throw new Error("session_readiness_uncertain");
+		};
+		port.resume = async () => {
+			recoveries++;
+			throw new Error("session.resume failed");
+		};
+		enqueue("future", "future prompt");
+		await manager!.notifyInbound(KEY);
+		expect(recoveries).toBe(1);
+		expect(port.sends.map(({ text }) => text)).toEqual(["old prompt"]);
+		expect(terminals).toEqual(["done"]);
+		expect(database!.getSessionRecord(KEY)).toMatchObject({ epoch: 0, sessionId: "owned-0" });
+		expect(database!.inboundPendingOldest(KEY)).toMatchObject({ message_id: "future", turn_state: null });
+		expect(database!.inboundTurnRow(personaTurnOpRef("instance-test", KEY, 0, "future"))).toBeUndefined();
+	});
+}
+
+test("accepted endpoint failure holds without replay, bounds queries and escalates once", async () => {
+	let now = Date.now();
+	const notices: PersonaRecoveryHoldInput[] = [];
+	const logs: string[] = [];
+	const port = new ScriptedSessionPort();
+	await harness(port, {}, (line) => logs.push(line), {
+		now: () => now,
+		onRecoveryHold: (input) => {
+			notices.push(input);
+		},
+	});
+	enqueue("held", "accepted work");
+	await manager!.notifyInbound(KEY);
+	const send = port.sends[0]!;
+	let queries = 0;
+	const firstObservedAt = new Date(now).toISOString();
+	const normalStatus = port.status.bind(port);
+	port.status = async () => {
+		queries++;
+		throw new GjcCliError("status failed", 1, "", {
+			code: "endpoint_stale",
+			category: "unavailable",
+			outcomeCertainty: "unknown",
+		});
+	};
+	port.setSessionState(send.sessionId, { live: false });
+	await manager!.reconcile(KEY);
+	for (let i = 0; i < 20; i++) await manager!.reconcile(KEY);
+	expect(queries).toBe(1);
+	for (const delay of [30_000, 60_000, 120_000, 240_000, 300_000]) {
+		now += delay;
+		await manager!.reconcile(KEY);
+	}
+	expect(queries).toBe(6);
+	expect(notices).toHaveLength(1);
+	expect(notices[0]!.reason).toBe("status_endpoint_unavailable:endpoint_stale");
+	expect(logs.some((line) => line.includes("retryMs=300000") && line.includes("action=retain"))).toBe(true);
+	expect(database!.inboundTurnRow(send.opRef)).toMatchObject({
+		turn_state: "accepted",
+		bound_session_id: send.sessionId,
+	});
+	expect(port.sends).toHaveLength(1);
+	expect(port.binds).toHaveLength(1);
+	expect(database!.getSessionRecord(KEY)?.epoch).toBe(0);
+	const evidenceKey = `persona-recovery-hold:${send.opRef}`;
+	const evidence = () => JSON.parse(database!.metaGet(evidenceKey)!);
+	expect(evidence()).toEqual({
+		epoch: 0,
+		reason: "status_endpoint_unavailable:endpoint_stale",
+		firstObservedAt,
+		observedAt: new Date(now).toISOString(),
+	});
+	// A successful transport returning unknown is NOT a recovery: preserve both
+	// the escalation counter and its original first observation timestamp.
+	now += 300_000;
+	port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: { status: "unknown" },
+		summaryCompleted: false,
+	});
+	await manager!.reconcile(KEY);
+	expect(evidence()).toEqual({
+		epoch: 0,
+		reason: "operation_state_unknown",
+		firstObservedAt,
+		observedAt: new Date(now).toISOString(),
+	});
+	expect(notices).toHaveLength(1);
+	expect(port.sends).toHaveLength(1);
+	port.status = normalStatus;
+	await manager!.reconcile(KEY);
+	expect(database!.metaGet(evidenceKey)).toBeUndefined();
+	expect(database!.inboundTurnRow(send.opRef)?.turn_state).toBe("accepted");
+});
+
+test("unknown status after restart preserves a persisted hold's first observation and never replays", async () => {
+	let now = Date.now();
+	const firstObservedAt = new Date(now - 60_000).toISOString();
+	const port = new ScriptedSessionPort();
+	await harness(port);
+	enqueue("restart-held", "work");
+	await manager!.notifyInbound(KEY);
+	const send = port.sends[0]!;
+	await manager!.stop();
+	const key = `persona-recovery-hold:${send.opRef}`;
+	database!.metaSet(
+		key,
+		JSON.stringify({
+			epoch: 0,
+			reason: "operation_state_unknown",
+			firstObservedAt,
+			observedAt: new Date(now).toISOString(),
+		}),
+	);
+	database!.close();
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: { status: "unknown" },
+		summaryCompleted: false,
+	});
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		now: () => now,
+		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
+	});
+	await manager.recover();
+	for (let i = 0; i < HOLD_ESCALATE_SWEEPS + 1; i++) {
+		now += 1000;
+		await manager.recover();
+	}
+	expect(JSON.parse(database.metaGet(key)!)).toMatchObject({
+		firstObservedAt,
+		observedAt: new Date(now).toISOString(),
+	});
+	expect(database.inboundTurnRow(send.opRef)?.turn_state).toBe("accepted");
+	expect(port.sends).toHaveLength(1);
+	expect(port.binds).toHaveLength(1);
+});
 
 test("actor immediately dispatches durable inbound with one deterministic caller op-ref, then completes on tail terminal", async () => {
 	const port = new ScriptedSessionPort({
@@ -1128,7 +1286,7 @@ test("startup recovery releases a bound turn whose tail attach is disowned inste
  * `recovery_hold … reason=operation state terminal_uncertain is not decidable`
  * every sweep (sweeps=56) and the two triggers were never answered.
  */
-test("startup recovery releases a bound turn on a not-live session after the hold persists, instead of holding it forever", async () => {
+test("startup recovery keeps a bound turn held when a dead endpoint gives no acceptance proof", async () => {
 	const port = new ScriptedSessionPort();
 	await harness(port);
 	enqueue("m-1", "stranded by restart");
@@ -1163,29 +1321,24 @@ test("startup recovery releases a bound turn on a not-live session after the hol
 		log: (line) => logs.push(line),
 		onTurnStart: ({ trigger }) => ({ text: trigger.body }),
 	});
-	// First sweep: a single undecidable read is held, never released.
-	await manager.recover();
-	expect(
-		logs.some((line) => line.includes(`opRef=${opRef}`) && line.includes("not decidable") && line.includes("sweeps=1")),
-	).toBe(true);
-	expect(stale.sends).toEqual([]);
-	expect(database?.inboundTurnRow(opRef)).toMatchObject({ turn_state: "bound" });
-
-	// Second sweep: still not live, so nothing can be running it.
+	// Endpoint unavailability is not an affirmative unaccepted receipt.
 	await manager.recover();
 	expect(
 		logs.some(
 			(line) =>
-				line.startsWith("recovery_requeue_unaccepted") &&
 				line.includes(`opRef=${opRef}`) &&
-				line.includes("reason=unknown_op_on_dead_session sweeps=2"),
+				line.includes("status_endpoint_unavailable:endpoint_stale") &&
+				line.includes("sweeps=1"),
 		),
 	).toBe(true);
-	await eventually(() => stale.sends.length === 1, "released trigger was not re-dispatched");
-	expect(stale.sends[0]!.text).toBe("stranded by restart");
-	expect(stale.sends[0]!.opRef).not.toBe(opRef);
-	expect(stale.sends[0]!.sessionId).not.toBe(stranded.sessionId);
-	expect(database?.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(stale.sends).toEqual([]);
+	expect(database?.inboundTurnRow(opRef)).toMatchObject({ turn_state: "bound" });
+
+	// Sweeps inside backoff neither query nor rotate/replay the trigger.
+	await manager.recover();
+	expect(stale.sends).toEqual([]);
+	expect(database?.getSessionRecord(KEY)?.epoch).toBe(0);
+	expect(database?.inboundTurnRow(opRef)).toMatchObject({ turn_state: "bound" });
 });
 
 test("startup recovery keeps holding a bound turn with undecidable status while its session is still live", async () => {
@@ -1227,6 +1380,7 @@ test("startup recovery keeps holding a bound turn with undecidable status while 
 });
 
 async function persistentHoldHarness(onRecoveryHold: (input: PersonaRecoveryHoldInput) => void) {
+	let now = Date.now();
 	const port = new ScriptedSessionPort();
 	await harness(port);
 	enqueue("m-1", "held indefinitely");
@@ -1256,6 +1410,10 @@ async function persistentHoldHarness(onRecoveryHold: (input: PersonaRecoveryHold
 			instanceId: "instance-test",
 			repo: join(home, "workspace"),
 			log: (line) => logs.push(line),
+			now: () => {
+				now += 300_000;
+				return now;
+			},
 			onRecoveryHold,
 			onTurnStart: ({ trigger }) => ({ text: trigger.body }),
 		});
@@ -1274,7 +1432,7 @@ test("a recovery hold that persists escalates to the operator exactly once, and 
 	await manager!.recover();
 	expect(escalations).toHaveLength(1);
 	expect(escalations[0]).toMatchObject({ originKey: KEY, opRef, epoch: 0, sweeps: HOLD_ESCALATE_SWEEPS });
-	expect(escalations[0]!.reason).toContain("not decidable");
+	expect(escalations[0]!.reason).toBe("status_endpoint_unavailable:endpoint_stale");
 	expect(escalations[0]!.trigger?.body).toBe("held indefinitely");
 	expect(logs.some((line) => line.startsWith(`recovery_hold_escalated origin=${KEY} epoch=0 opRef=${opRef}`))).toBe(
 		true,

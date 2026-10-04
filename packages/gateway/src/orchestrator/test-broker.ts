@@ -245,7 +245,7 @@ export function testOnlyBrokerDependencies(): GlobalGjcClientDependencies {
 			const sessionId = args[3];
 			const repo = sessionId ? repositories.get(sessionId) : undefined;
 			if (!repo) return failure("session_unavailable");
-			return success({ session: { sessionId, live: true, deleted: false, locator: { repo } } });
+			return success({ session: { sessionId, live: true, deleted: false, locator: { cwd: repo } } });
 		}
 		return failure("stub_unsupported");
 	};

@@ -1,12 +1,14 @@
+import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OriginRef } from "@gajae-gateway/protocol";
+import { appendAttempt, closeAttempt, createLaneJobRecord } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { RuntimeCycleProjector } from "../src/ops/cycle";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { GatewayDatabase } from "../src/store/db";
+import { GatewayDatabase, type WorkAttemptRuntime, workAttemptDeliveryId } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
 import { sessionPortFromResponder } from "./session-port.fake";
 
@@ -40,9 +42,25 @@ test("projector reads durable rows through the database and stays fail-closed", 
 		database.bumpEpoch(key, JSON.stringify(discordDm));
 		const projector = new RuntimeCycleProjector(database, { queueDepth: 0 });
 		const afterBump = projector.project();
-		expect(afterBump.gates).toContain("stale_session_identity");
-		expect(afterBump.phase).toBe("degraded");
+		expect(afterBump.gates).toEqual([]);
+		expect(afterBump.phase).toBe("idle");
 		expect(afterBump.sessions[0]).toMatchObject({ originKey: key, epoch: 1, sessionId: "" });
+		database.inboundEnqueue({
+			messageId: "waiting-bind",
+			originKey: key,
+			originRefJson: JSON.stringify(discordDm),
+			body: "bind next",
+		});
+		expect(projector.project().gates).toContain("stale_session_identity");
+		expect(projector.project().phase).toBe("degraded");
+		database.inboundBindTurn({
+			messageId: "waiting-bind",
+			originKey: key,
+			epoch: 1,
+			opRef: "gw-p-waiting-bind",
+			sessionId: "s1",
+		});
+		database.inboundTurnComplete("gw-p-waiting-bind");
 
 		// A bound session clears the stale-identity gate.
 		database.putSession(key, "sess-bound-000000000");
@@ -140,6 +158,254 @@ test("starvation is judged per origin from turn_state: an old accepted trigger i
 		});
 		const starved = new RuntimeCycleProjector(database, { queueDepth: 0 }).project();
 		expect(starved.gates).toEqual(["inbound_starved"]);
+	} finally {
+		database.close();
+	}
+});
+
+test("durable worker uncertainty and holds gate below capacity without projection writes", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gajaeway-cycle-worker-"));
+	const path = join(dir, "gateway.db");
+	let database = await GatewayDatabase.open(path);
+	const raw = new Database(path);
+	const startedAt = "2026-08-01T00:00:00.000Z";
+	const endedAt = "2026-08-01T00:01:00.000Z";
+	const now = new Date("2026-08-03T00:00:00.000Z");
+	const sessionId = "ad2f2494-2584-4d13-b7b6-c6ac24a1087f";
+	try {
+		database.putSession("work/task/a", sessionId);
+		const record = appendAttempt(
+			createLaneJobRecord({
+				jobId: "lanejob-cycle",
+				branch: "main",
+				worktreePath: "/work",
+				sessionId,
+				now: () => new Date(startedAt),
+			}),
+			{ opRef: "gw-work-cycle", sessionId, startedAt },
+		);
+		const runtime: WorkAttemptRuntime = {
+			opRef: "gw-work-cycle",
+			jobId: record.jobId,
+			laneKey: "work-a",
+			sessionKey: "work/task/a",
+			sessionId,
+			epoch: 0,
+			cwd: "/work",
+			startedAt,
+			mode: "run",
+			sendPhase: "prepared",
+			sendEvidence: null,
+			terminal: null,
+			output: { disposition: "pending", reads: 0, nextReadAt: null, excerpt: null, proof: null, knownSilence: null },
+			target: null,
+			deliveryId: workAttemptDeliveryId(database.instanceId, record.jobId, "gw-work-cycle"),
+			decision: "undecided",
+			settledAt: null,
+			version: 0,
+		};
+		database.workAttemptPrepare(runtime, record);
+		expect(new RuntimeCycleProjector(database, { queueDepth: 0 }).project(now).gates).toEqual([]);
+		database.workAttemptUpdate(runtime.opRef, 0, { sendPhase: "uncertain" });
+		database.close();
+		database = await GatewayDatabase.open(path);
+		for (const table of ["sessions", "lane_jobs", "work_attempt_runtime", "inbound_messages"]) {
+			for (const action of ["INSERT", "UPDATE", "DELETE"])
+				raw.exec(
+					`CREATE TRIGGER readonly_${table}_${action} BEFORE ${action} ON ${table} BEGIN SELECT RAISE(ABORT, 'projection wrote'); END`,
+				);
+		}
+		const before = database.workAttemptGet(runtime.opRef);
+		const result = new RuntimeCycleProjector(database, { queueDepth: 0 }).project(now);
+		expect(result.phase).toBe("degraded");
+		expect(result.gates).toEqual(["worker_send_uncertain"]);
+		expect(result.lanes).toMatchObject({ active: 1, max: 8, awaitingOperator: 0, stalled: 0, uncertainAttempts: 1 });
+		expect(result.lanes.workerIssues).toEqual([
+			{ jobId: record.jobId, laneKey: "work-a", sessionId, opRef: runtime.opRef, reason: "send_uncertain" },
+		]);
+		expect(database.workAttemptGet(runtime.opRef)).toEqual(before);
+		for (const table of ["sessions", "lane_jobs", "work_attempt_runtime", "inbound_messages"]) {
+			for (const action of ["INSERT", "UPDATE", "DELETE"]) raw.exec(`DROP TRIGGER readonly_${table}_${action}`);
+		}
+		const closed = closeAttempt({ record, opRef: runtime.opRef, endState: "terminal_uncertain", endedAt });
+		database.workAttemptSettle(runtime.opRef, 1, closed, {
+			terminal: { kind: "local", observedAt: endedAt, reasonCode: "recovery_indeterminate" },
+			output: { ...runtime.output, disposition: "unavailable" },
+			decision: "no_target",
+			settledAt: endedAt,
+		});
+		const held = new RuntimeCycleProjector(database, { queueDepth: 0 }).project(now);
+		expect(held.gates).toEqual(["worker_awaiting_operator"]);
+		expect(held.lanes.uncertainAttempts).toBe(0);
+		expect(held.lanes.workerIssues).toEqual([
+			{ jobId: record.jobId, laneKey: "work-a", sessionId, opRef: runtime.opRef, reason: "awaiting_operator" },
+		]);
+		const stalled = { ...closed, state: "stalled" as const };
+		database.putLaneJob({ ...stalled, laneKey: "work-a", json: JSON.stringify(stalled) });
+		expect(new RuntimeCycleProjector(database, { queueDepth: 0 }).project(now).gates).toEqual(["worker_stalled"]);
+	} finally {
+		raw.close();
+		database.close();
+	}
+});
+
+test("settled SQL state cannot retire a worker over corrupt, mismatched or open history", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gajaeway-cycle-corrupt-worker-"));
+	const path = join(dir, "gateway.db");
+	const database = await GatewayDatabase.open(path);
+	const raw = new Database(path);
+	const sessionId = "ad2f2494-2584-4d13-b7b6-c6ac24a1087f";
+	try {
+		database.bumpEpoch("work/task/a", JSON.stringify({ platform: "work", kind: "task", conversationId: "a" }));
+		const initial = createLaneJobRecord({
+			jobId: "lanejob-corrupt",
+			branch: "main",
+			worktreePath: "/private-repository",
+			sessionId,
+		});
+		const settled = { ...initial, state: "done" as const };
+		database.putLaneJob({ ...settled, laneKey: "work-a", json: JSON.stringify(settled) });
+		const projector = new RuntimeCycleProjector(database, { queueDepth: 0 });
+		expect(projector.project().gates).toEqual([]);
+		const cases = [
+			{ json: "{broken", reason: "job_record_invalid" },
+			{ json: JSON.stringify(initial), reason: "job_state_mismatch" },
+			{ json: JSON.stringify({ ...settled, jobId: "lanejob-wrong" }), reason: "job_identity_mismatch" },
+			{
+				json: JSON.stringify({
+					...appendAttempt(initial, { opRef: "gw-work-open", sessionId, startedAt: initial.createdAt }),
+					state: "done",
+				}),
+				reason: "settled_job_open_attempt",
+			},
+		];
+		for (const entry of cases) {
+			raw.query("UPDATE lane_jobs SET record_json = ? WHERE job_id = ?").run(entry.json, initial.jobId);
+			const result = projector.project();
+			expect(result.gates).toContain("worker_evidence_invalid");
+			expect(result.gates).toContain("stale_session_identity");
+			expect(result.phase).toBe("degraded");
+			expect(result.lanes.workerIssues).toMatchObject([
+				{ jobId: initial.jobId, laneKey: "work-a", reason: entry.reason },
+			]);
+			expect(JSON.stringify(result)).not.toContain("/private-repository");
+		}
+		raw.query("UPDATE lane_jobs SET record_json = ? WHERE job_id = ?").run(JSON.stringify(settled), initial.jobId);
+		raw
+			.query("INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES ('work', ?, 'test-cutover')")
+			.run(initial.jobId);
+		const quarantined = projector.project();
+		expect(quarantined.lanes.workerIssues).toEqual([]);
+		expect(quarantined.gates).toContain("stale_session_identity");
+	} finally {
+		raw.close();
+		database.close();
+	}
+});
+
+test("accepted and bound trigger identities expose age without body or age-based failure", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gajaeway-cycle-age-"));
+	const path = join(dir, "gateway.db");
+	const database = await GatewayDatabase.open(path);
+	const raw = new Database(path);
+	const old = "2026-08-01T00:00:00.000Z";
+	const now = new Date("2026-08-03T00:00:00.000Z");
+	try {
+		for (const [epoch, state] of ["accepted", "bound"].entries()) {
+			const key = `discord/dm/c${epoch}/peer=p1`;
+			database.putSession(key, `session-${state}`);
+			database.inboundEnqueue({
+				messageId: state,
+				originKey: key,
+				originRefJson: JSON.stringify(discordDm),
+				body: "private body",
+				receivedAt: old,
+			});
+			database.inboundBindTurn({
+				messageId: state,
+				originKey: key,
+				epoch,
+				opRef: `gw-p-${state}`,
+				sessionId: `session-${state}`,
+			});
+			if (state === "accepted") database.inboundTurnAccept(`gw-p-${state}`);
+		}
+		raw.query("UPDATE inbound_messages SET dispatched_at = ?").run(old);
+		const result = new RuntimeCycleProjector(database, { queueDepth: 0 }).project(now);
+		expect(result.phase).toBe("dispatching");
+		expect(result.gates).toEqual([]);
+		expect(result.inboundTurns).toHaveLength(2);
+		expect(result.inboundTurns[0]).toMatchObject({
+			opRef: "gw-p-accepted",
+			state: "accepted",
+			epoch: 0,
+			sessionId: "session-accepted",
+			ageMs: 48 * 60 * 60_000,
+		});
+		expect(result.inboundTurns[1]).toMatchObject({
+			opRef: "gw-p-bound",
+			state: "bound",
+			epoch: 1,
+			sessionId: "session-bound",
+			ageMs: 48 * 60 * 60_000,
+		});
+		expect(JSON.stringify(result)).not.toContain("private body");
+		database.inboundTurnComplete("gw-p-accepted");
+		expect(new RuntimeCycleProjector(database, { queueDepth: 0 }).project(now).inboundTurns).toHaveLength(1);
+	} finally {
+		raw.close();
+		database.close();
+	}
+});
+
+test("persistent persona hold survives restart, malformed evidence stays gated and completed tombstones do not gate", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "gajaeway-cycle-persona-hold-"));
+	const path = join(dir, "gateway.db");
+	let database = await GatewayDatabase.open(path);
+	const key = "discord/dm/c1/peer=p1";
+	try {
+		database.putSession(key, "session-held");
+		database.inboundEnqueue({
+			messageId: "held",
+			originKey: key,
+			originRefJson: JSON.stringify(discordDm),
+			body: "private",
+		});
+		database.inboundBindTurn({
+			messageId: "held",
+			originKey: key,
+			epoch: 0,
+			opRef: "gw-p-held",
+			sessionId: "session-held",
+		});
+		database.inboundTurnAccept("gw-p-held");
+		database.metaSet(
+			"persona-recovery-hold:gw-p-held",
+			JSON.stringify({
+				epoch: 0,
+				reason: "status_endpoint_unavailable:endpoint_stale",
+				firstObservedAt: "2026-08-02T00:00:00.000Z",
+				observedAt: "2026-08-03T00:00:00.000Z",
+			}),
+		);
+		database.close();
+		database = await GatewayDatabase.open(path);
+		const projector = new RuntimeCycleProjector(database, { queueDepth: 0 });
+		const held = projector.project();
+		expect(held.phase).toBe("degraded");
+		expect(held.gates).toEqual(["persona_recovery_hold"]);
+		expect(held.inboundTurns[0]?.recoveryHold).toEqual({
+			reason: "status_endpoint_unavailable:endpoint_stale",
+			firstObservedAt: "2026-08-02T00:00:00.000Z",
+			observedAt: "2026-08-03T00:00:00.000Z",
+		});
+		expect(database.inboundTurnRow("gw-p-held")?.turn_state).toBe("accepted");
+		database.metaSet("persona-recovery-hold:gw-p-held", "broken");
+		expect(projector.project().gates).toEqual(["persona_recovery_hold"]);
+		expect(projector.project().inboundTurns[0]?.recoveryHold?.reason).toBe("recovery_hold_evidence_invalid");
+		database.inboundTurnComplete("gw-p-held");
+		expect(projector.project().gates).toEqual([]);
+		expect(projector.project().phase).toBe("idle");
 	} finally {
 		database.close();
 	}

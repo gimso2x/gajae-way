@@ -277,7 +277,7 @@ test("red-team: a stale death notice from a finished turn's relay never detaches
 	}
 });
 
-test("red-team: a relay refused at attach (endpoint_stale) rebinds on a fresh epoch and never holds the message", async () => {
+test("red-team: endpoint_stale before any send retries without claiming Router disown or rotating the epoch", async () => {
 	class StaleFirstPort extends ScriptedSessionPort {
 		refusals = 0;
 		override async attachTail(input: Parameters<ScriptedSessionPort["attachTail"]>[0]) {
@@ -293,11 +293,11 @@ test("red-team: a relay refused at attach (endpoint_stale) rebinds on a fresh ep
 	try {
 		enqueue(target, "stale-attach-trigger", "hello after a stale endpoint");
 		await target.manager.notifyInbound(ORIGIN_KEY);
+		await Bun.sleep(2_050);
 		await eventually(() => port.sends.length === 1, "the message was not dispatched after the stale relay");
 		expect(port.refusals).toBe(1);
-		expect(target.logs.some((line) => line.startsWith("persona_attach_session_gone"))).toBe(true);
-		// The stale session's binding was rotated: the send rode a NEW session.
-		expect(port.sends[0]!.sessionId).toBe(`${ORIGIN_KEY}-session-1`);
+		expect(target.logs.some((line) => line.startsWith("persona_attach_session_gone"))).toBe(false);
+		expect(port.sends[0]!.sessionId).toBe(`${ORIGIN_KEY}-session-0`);
 		port.complete(port.sends[0]!.opRef, "answer on the fresh session");
 		await eventually(() => target.database.inboundPendingCount(ORIGIN_KEY) === 0, "turn did not settle");
 		expect(target.terminal).toEqual(["answer on the fresh session"]);

@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -237,6 +237,136 @@ test("status unknown, malformed and changed-binding edges never rewrite durable 
 	await expect(f.manager.status({ name: "missing" })).rejects.toMatchObject({
 		detail: { reasonCode: "unknown_work_lane" },
 	});
+});
+
+test("long uncertain status holds durably at the boundary without ending or replaying the attempt", async () => {
+	let now = Date.now();
+	const beginning = now;
+	const f = await fixture({ now: () => now });
+	const status = f.port.status.bind(f.port);
+	const send = f.port.send.bind(f.port);
+	let queries = 0;
+	f.port.status = async (input) => {
+		queries++;
+		return { operationRef: input.opRef, status: { status: "unknown" }, summaryCompleted: false };
+	};
+	f.port.send = async (input) => {
+		await send(input);
+		throw new Error("transport lost");
+	};
+	await expect(started(f)).rejects.toMatchObject({ detail: { reasonCode: "send_acceptance_uncertain" } });
+	const opRef = f.job().attempts[0]!.opRef;
+	await until(() => queries >= 2);
+	const receipt = f.db.workAttemptGet(opRef)!;
+	now = beginning + 599_999;
+	await f.restart();
+	const before = queries;
+	await until(() => queries > before);
+	expect(f.job().state).toBe("running");
+	now = beginning + 600_000;
+	await f.restart();
+	await until(() => f.job().state === "awaiting_operator");
+	expect(f.job().escalations).toHaveLength(1);
+	expect(f.job().escalations[0]).toContain("status_unknown");
+	expect(f.job().attempts[0]?.endedAt).toBeUndefined();
+	expect(f.job().attempts[0]?.endState).toBeUndefined();
+	expect(f.db.workAttemptGet(opRef)).toEqual(receipt);
+	await expect(f.manager.start({ name: "a", cwd: f.directory, text: "retry", resume: true })).rejects.toMatchObject({
+		detail: { reasonCode: "attempt_open" },
+	});
+	await f.restart();
+	expect(f.job().escalations).toHaveLength(1);
+	expect(f.port.binds).toHaveLength(1);
+	expect(f.port.resumes).toHaveLength(0);
+	expect(f.port.sendAttempts).toHaveLength(1);
+	f.port.status = status;
+	// Status progress does not implicitly release the sticky hold.
+	now += 1_000;
+	await until(() => f.db.workAttemptGet(opRef)?.sendPhase === "accepted");
+	expect(f.job().state).toBe("awaiting_operator");
+	f.port.complete(opRef, "late result");
+	await until(() => f.db.workAttemptGet(opRef)?.settledAt !== null);
+	expect(f.job().attempts[0]?.endState).toBe("completed");
+});
+
+test("transient status outage resets its uncertainty window and long in-flight work is not held", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now, statusUncertaintyTimeoutMs: 1_000 });
+	const result = await started(f);
+	const status = f.port.status.bind(f.port);
+	let queries = 0;
+	f.port.status = async (input) => {
+		queries++;
+		throw new Error("status transport secret");
+	};
+	await until(() => queries === 1);
+	now += 999;
+	f.port.status = status;
+	await until(() => f.db.workAttemptGet(result.opRef)!.version > 2);
+	now += 86_400_000;
+	await Bun.sleep(20);
+	expect(f.job().state).toBe("running");
+	expect(f.job().escalations).toHaveLength(0);
+	f.port.complete(result.opRef, "done");
+	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt !== null);
+});
+
+test("persistent query outage holds once, preserves evidence and backs off beyond 250ms", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now, statusUncertaintyTimeoutMs: 500 });
+	const result = await started(f);
+	const receipt = f.db.workAttemptGet(result.opRef)!;
+	let queries = 0;
+	f.port.status = async () => {
+		queries++;
+		throw new Error("status unavailable");
+	};
+	await until(() => queries === 1);
+	await Bun.sleep(275);
+	expect(queries).toBe(1);
+	now += 500;
+	await until(() => f.job().state === "awaiting_operator");
+	expect(f.job().escalations).toHaveLength(1);
+	expect(f.job().escalations[0]).toContain("status_unavailable");
+	expect(f.db.workAttemptGet(result.opRef)).toEqual(receipt);
+	expect(f.port.sends).toHaveLength(1);
+	expect(f.notices).toHaveLength(0);
+});
+
+test("uncertain status backoff caps at five minutes and continues observing", async () => {
+	let now = Date.now();
+	const f = await fixture({ now: () => now });
+	const result = await started(f);
+	const timer = globalThis.setTimeout;
+	const delays: number[] = [];
+	const acceleratedTimer = Object.assign((...parameters: Parameters<typeof timer>): ReturnType<typeof timer> => {
+		const [handler, delay, ...args] = parameters;
+		if (typeof handler === "function" && delay !== undefined && delay >= 500) {
+			delays.push(delay);
+			return timer(() => {
+				now += delay;
+				handler(...args);
+			}, 0);
+		}
+		return timer(handler, delay, ...args);
+	}, timer);
+	const timers = spyOn(globalThis, "setTimeout").mockImplementation(acceleratedTimer);
+	f.port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: { status: "unknown" },
+		summaryCompleted: false,
+	});
+	try {
+		await until(() => delays.filter((delay) => delay === 300_000).length >= 2);
+		expect(delays.slice(0, 3)).toEqual([500, 1_000, 2_000]);
+		expect(Math.max(...delays)).toBe(300_000);
+		expect(f.job().state).toBe("awaiting_operator");
+		expect(f.job().escalations).toHaveLength(1);
+		expect(f.db.workAttemptGet(result.opRef)?.terminal).toBeNull();
+	} finally {
+		await f.manager.stop();
+		timers.mockRestore();
+	}
 });
 
 test("steer distinguishes structured refusal from transport uncertainty without leaking text", async () => {

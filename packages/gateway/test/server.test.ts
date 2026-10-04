@@ -2331,7 +2331,7 @@ for (const verb of ["work.start", "work.run"] as const) {
 	});
 }
 
-test("status reports each connected client's generation and flags an adapter older than the gateway", async () => {
+test("status reports process ordering without claiming binary drift", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-generation-"));
 	const config: GatewayConfig = {
 		schemaVersion: 1,
@@ -2390,14 +2390,14 @@ test("status reports each connected client's generation and flags an adapter old
 		name: string;
 		startedAt?: string;
 		connectedAt: string;
-		staleGeneration: boolean;
+		predatesGateway: boolean;
 	}>;
 	expect(clients).toHaveLength(3);
-	expect(clients.find((client) => client.name === "adapter-slack")?.staleGeneration).toBe(true);
-	expect(clients.find((client) => client.name === "adapter-discord")?.staleGeneration).toBe(false);
+	expect(clients.find((client) => client.name === "adapter-slack")?.predatesGateway).toBe(true);
+	expect(clients.find((client) => client.name === "adapter-discord")?.predatesGateway).toBe(false);
 	const unidentified = clients.find((client) => client.name === "unidentified");
 	expect(unidentified?.startedAt).toBeUndefined();
-	expect(unidentified?.staleGeneration).toBe(false);
+	expect(unidentified?.predatesGateway).toBe(false);
 	for (const client of clients) expect(typeof client.connectedAt).toBe("string");
 
 	stale.close();

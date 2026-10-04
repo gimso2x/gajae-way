@@ -124,18 +124,44 @@ test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const calls: string[][] = [];
+	let mismatchedModelReceipt = false;
 	const run: CliRunner = async (args) => {
 		calls.push([...args]);
 		if (args.includes("session.create"))
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-1" } }), stderr: "" };
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						session: {
+							sessionId: "sdk-1",
+							live: true,
+							locator: { cwd: "/tmp/repo" },
+						},
+					},
+				}),
+				stderr: "",
+			};
 		if (args.includes("model.profile.set"))
 			return {
 				exitCode: 0,
 				stdout: JSON.stringify({ ok: true, result: { changed: false, id: "gpt-heavy" } }),
 				stderr: "",
 			};
-		if (args.includes("model.set"))
-			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { changed: true } }), stderr: "" };
+		if (args.includes("model.set")) {
+			const input = JSON.parse(args[args.indexOf("--json-input") + 1]!) as { id: string; thinkingLevel?: string };
+			const slash = input.id.indexOf("/");
+			const result = input.thinkingLevel
+				? {
+						provider: input.id.slice(0, slash),
+						modelId: input.id.slice(slash + 1),
+						thinkingLevel: mismatchedModelReceipt ? "low" : input.thinkingLevel,
+					}
+				: { changed: true };
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result }), stderr: "" };
+		}
 		if (args.includes("session.last_assistant"))
 			return {
 				exitCode: 0,
@@ -183,6 +209,23 @@ test("broker SessionPort preserves caller op-ref, model choice, bootstrap prompt
 		selection: { preset: "gpt-heavy" },
 	});
 	expect(profileReceipt).toEqual({ changed: false });
+	for (const [selection, expected] of [
+		["gimso2xproxy/glm-5.3-flash:high", { id: "gimso2xproxy/glm-5.3-flash", thinkingLevel: "high" }],
+		["provider/model:version:xhigh", { id: "provider/model:version", thinkingLevel: "xhigh" }],
+		["provider/model:version", { id: "provider/model:version" }],
+		["provider/model", { id: "provider/model" }],
+	] as const) {
+		expect(await port.setModel({ sessionId: binding.sessionId, repo: "/tmp/repo", selection })).toEqual({
+			changed: true,
+		});
+		const command = calls.at(-1)!;
+		expect(JSON.parse(command[command.indexOf("--json-input") + 1]!)).toEqual(expected);
+	}
+	mismatchedModelReceipt = true;
+	await expect(
+		port.setModel({ sessionId: binding.sessionId, repo: "/tmp/repo", selection: "gimso2xproxy/glm-5.3-flash:high" }),
+	).rejects.toThrow("requested model and thinking receipt");
+	mismatchedModelReceipt = false;
 	const result = await port.request({
 		sessionId: binding.sessionId,
 		repo: "/tmp/repo",
@@ -262,7 +305,7 @@ test("broker SessionPort reuses the durable epoch binding and does not recreate 
 	expect(calls.filter((args) => args.includes("session.create"))).toHaveLength(1);
 });
 
-test("broker SessionPort resumes saved dead authority through the SDK control before returning the same binding", async () => {
+test("broker SessionPort resumes saved dead authority through global lifecycle with cold-load readiness budget", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
@@ -276,8 +319,14 @@ test("broker SessionPort resumes saved dead authority through the SDK control be
 				exitCode: 0,
 				stdout: JSON.stringify({
 					ok: true,
-					result: { session: { sessionId: "saved-1", locator: { repo }, live, deleted: false } },
+					result: { session: { sessionId: "saved-1", locator: { cwd: repo }, live, deleted: false } },
 				}),
+				stderr: "",
+			};
+		if (args.includes("session.list"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { savedSession: { id: "saved-1", path: "/saved/saved-1.jsonl" } } }),
 				stderr: "",
 			};
 		if (args.includes("session.resume")) {
@@ -307,8 +356,15 @@ test("broker SessionPort resumes saved dead authority through the SDK control be
 	});
 	expect(calls.filter((args) => args.includes("inspect"))).toHaveLength(2);
 	expect(calls.find((args) => args.includes("session.resume"))).toEqual(
-		expect.arrayContaining(["sdk", "session", "raw", "control", "saved-1", "--op", "session.resume"]),
+		expect.arrayContaining(["sdk", "session", "raw", "global", "--op", "session.resume", "--idempotency-key"]),
 	);
+	const resume = calls.find((args) => args.includes("session.resume"))!;
+	expect(JSON.parse(resume[resume.indexOf("--json-input") + 1]!)).toEqual({
+		sessionId: "saved-1",
+		cwd: repo,
+		sessionPath: "/saved/saved-1.jsonl",
+		readinessTimeoutMs: 60_000,
+	});
 });
 
 test("broker SessionPort preserves a structured client-ref conflict emitted with a non-zero CLI status", async () => {
@@ -348,6 +404,21 @@ test("broker SessionPort retries a terminal-uncertain lifecycle create with the 
 	const createKeys: string[] = [];
 	const sleeps: number[] = [];
 	const run: CliRunner = async (args) => {
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: {
+						session: {
+							sessionId: "sdk-after-retry",
+							live: true,
+							locator: { cwd: join(home, "workspace") },
+						},
+					},
+				}),
+				stderr: "",
+			};
 		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
 		createKeys.push(args[args.indexOf("--idempotency-key") + 1]!);
 		if (createCalls++ === 0)
@@ -380,7 +451,115 @@ test("broker SessionPort retries a terminal-uncertain lifecycle create with the 
 	expect(sleeps).toEqual([1_000]);
 });
 
-test("bind rebinds a persisted live-false session instead of handing a dead monitor endpoint to request", async () => {
+for (const scenario of [
+	"malformed",
+	"missing-session",
+	"nonzero",
+	"wrong-cwd",
+	"wrong-id",
+	"not-live",
+	"unavailable",
+	"endpoint-stale",
+	"transport-error",
+] as const) {
+	test(`bind readiness fails closed for ${scenario}, then reuses the same created session`, async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-readiness-"));
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+		const repo = join(home, "workspace");
+		let clock = 0;
+		let ready = false;
+		let creates = 0;
+		const run: CliRunner = async (args) => {
+			if (args.includes("session.create")) {
+				creates++;
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({ ok: true, result: { sessionId: "readiness-session" } }),
+					stderr: "",
+				};
+			}
+			expect(args).toEqual(["sdk", "session", "inspect", "readiness-session"]);
+			if (!ready && scenario === "transport-error") throw new Error("transport unavailable");
+			const session = {
+				sessionId: !ready && scenario === "wrong-id" ? "foreign" : "readiness-session",
+				live: ready || scenario !== "not-live",
+				locator: { cwd: !ready && scenario === "wrong-cwd" ? "/wrong/repo" : repo },
+			};
+			const envelope =
+				!ready && scenario === "missing-session"
+					? { ok: true, result: {} }
+					: !ready && (scenario === "unavailable" || scenario === "endpoint-stale")
+						? { ok: false, error: { code: scenario === "unavailable" ? "session_unavailable" : "endpoint_stale" } }
+						: { ok: true, result: { session } };
+			return {
+				exitCode: !ready && scenario === "nonzero" ? 1 : 0,
+				stdout: !ready && scenario === "malformed" ? "{" : JSON.stringify(envelope),
+				stderr: "",
+			};
+		};
+		const port = new BrokerSessionPort({
+			database,
+			authority,
+			cli: run,
+			instanceId: "readiness",
+			tailRunner: new TailRunner({ stream: noRelay, repo }),
+			now: () => clock,
+			sleep: async (ms) => {
+				clock += ms;
+			},
+		});
+		const input = { originKey: "readiness", epoch: 0, repo };
+		await expect(port.bind(input)).rejects.toMatchObject({ details: { code: "session_readiness_uncertain" } });
+		expect(clock).toBe(60_000);
+		expect(database.getSessionRecord(input.originKey)).toMatchObject({ sessionId: "readiness-session", epoch: 0 });
+		ready = true;
+		await expect(port.bind(input)).resolves.toMatchObject({ sessionId: "readiness-session", epoch: 0 });
+		expect(creates).toBe(1);
+	});
+}
+
+test("bind polls an unavailable session until live authority appears without recreating it", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-indexing-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	let creates = 0;
+	let inspections = 0;
+	let clock = 0;
+	const cli: CliRunner = async (args) => {
+		if (args.includes("session.create")) {
+			creates++;
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "indexing" } }), stderr: "" };
+		}
+		return {
+			exitCode: 0,
+			stdout: JSON.stringify(
+				inspections++ === 0
+					? { ok: false, error: { code: "session_unavailable" } }
+					: { ok: true, result: { session: { sessionId: "indexing", live: true, locator: { cwd: repo } } } },
+			),
+			stderr: "",
+		};
+	};
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli,
+		instanceId: "indexing",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+		},
+	});
+	await expect(port.bind({ originKey: "indexing", epoch: 0, repo })).resolves.toMatchObject({ sessionId: "indexing" });
+	expect(creates).toBe(1);
+	expect(inspections).toBe(2);
+	expect(clock).toBe(250);
+});
+
+test("bind preserves a persisted live-false session when fresh evidence is unavailable after resume fails", async () => {
 	const { mkdtemp, rm } = await import("node:fs/promises");
 	const { tmpdir } = await import("node:os");
 	const { join } = await import("node:path");
@@ -399,21 +578,41 @@ test("bind rebinds a persisted live-false session instead of handing a dead moni
 			epoch: 1,
 		});
 		const commands: string[][] = [];
+		let clock = 0;
+		let inspections = 0;
 		const cli = async (args: readonly string[]) => {
 			commands.push([...args]);
-			if (args.includes("inspect") && args.includes("dead-session"))
+			if (args.includes("inspect") && args.includes("dead-session")) {
+				if (++inspections > 2)
+					return { exitCode: 0, stdout: JSON.stringify({ ok: false, error: { code: "endpoint_stale" } }), stderr: "" };
 				return {
 					exitCode: 0,
 					stdout: JSON.stringify({
 						ok: true,
-						result: { session: { sessionId: "dead-session", repo, live: false, deleted: false } },
+						result: { session: { sessionId: "dead-session", locator: { cwd: repo }, live: false, deleted: false } },
 					}),
 					stderr: "",
 				};
+			}
 			if (args.includes("session.create"))
 				return {
 					exitCode: 0,
 					stdout: JSON.stringify({ ok: true, result: { sessionId: "fresh-session" } }),
+					stderr: "",
+				};
+			if (args.includes("inspect"))
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({
+						ok: true,
+						result: {
+							session: {
+								sessionId: "fresh-session",
+								live: true,
+								locator: { cwd: repo },
+							},
+						},
+					}),
 					stderr: "",
 				};
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: {} }), stderr: "" };
@@ -424,16 +623,127 @@ test("bind rebinds a persisted live-false session instead of handing a dead moni
 			cli,
 			instanceId: "i",
 			tailRunner: new TailRunner({ stream: noRelay, repo }),
+			now: () => clock,
+			sleep: async (ms) => {
+				clock += ms;
+			},
 		});
-		const binding = await port.bind({ originKey: "monitor/eventtype/x", epoch: 1, repo });
-		expect(binding.sessionId).toBe("fresh-session");
-		expect(binding.epoch).toBe(2);
-		expect(database.getSessionRecord("monitor/eventtype/x")).toMatchObject({ epoch: 2, sessionId: "fresh-session" });
+		await expect(port.bind({ originKey: "monitor/eventtype/x", epoch: 1, repo })).rejects.toThrow(
+			"saved transcript authority is unavailable",
+		);
+		expect(commands.some((args) => args.includes("session.create"))).toBe(false);
+		expect(database.getSessionRecord("monitor/eventtype/x")).toMatchObject({ epoch: 1, sessionId: "dead-session" });
 	} finally {
 		database.close();
 		await rm(home, { recursive: true, force: true });
 	}
 });
+
+for (const scenario of [
+	"dead",
+	"revived",
+	"endpoint",
+	"wrong-id",
+	"wrong-cwd",
+	"unknown",
+	"nonzero",
+	"accepted",
+	"bound",
+	"worker",
+	"work-origin",
+	"changed-epoch",
+] as const) {
+	test(`idle bind after structured resume failure: ${scenario}`, async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-idle-resume-"));
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+		const repo = join(home, "workspace");
+		const originKey = scenario === "work-origin" ? "work/task/job" : "loopback/loopback/idle";
+		await createOwnedSessionFixture(database, authority, { sessionId: "old", repo, originKey, epoch: 0 });
+		database.inboundEnqueue({ messageId: "future", originKey, originRefJson: "{}", body: "unsent future" });
+		if (scenario === "accepted" || scenario === "bound") {
+			database.inboundEnqueue({ messageId: "old-turn", originKey, originRefJson: "{}", body: "old prompt" });
+			database.inboundBindTurn({ messageId: "old-turn", originKey, epoch: 0, opRef: "gw-old", sessionId: "old" });
+			if (scenario === "accepted") database.inboundTurnAccept("gw-old");
+		}
+		if (scenario === "worker")
+			database.workAttemptCycleEvidence = () => [
+				{ opRef: "gw-worker", jobId: "job", laneKey: "lane", sessionId: "old", runtime: null },
+			];
+		let resumeFailed = false;
+		let resumes = 0;
+		let creates = 0;
+		let oldInspectionsAfterFailure = 0;
+		const cli: CliRunner = async (args) => {
+			if (args.includes("session.list"))
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({ ok: true, result: { savedSession: { id: "old", path: "/saved/old.jsonl" } } }),
+					stderr: "",
+				};
+			if (args.includes("session.resume")) {
+				resumes++;
+				resumeFailed = true;
+				if (scenario === "changed-epoch") database!.rebindEpoch(originKey);
+				return {
+					exitCode: 1,
+					stdout: JSON.stringify({ ok: false, error: { code: "EEXIST", message: "stale .lifecycle.ready" } }),
+					stderr: "",
+				};
+			}
+			if (args.includes("session.create")) {
+				creates++;
+				return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "fresh" } }), stderr: "" };
+			}
+			expect(args.includes("inspect")).toBe(true);
+			const fresh = args.includes("fresh");
+			if (!fresh && resumeFailed) oldInspectionsAfterFailure++;
+			const session = {
+				sessionId: fresh ? "fresh" : resumeFailed && scenario === "wrong-id" ? "foreign" : "old",
+				locator: { cwd: resumeFailed && scenario === "wrong-cwd" ? "/foreign" : repo },
+				live:
+					fresh || (resumeFailed && scenario === "revived")
+						? true
+						: resumeFailed && scenario === "unknown"
+							? undefined
+							: false,
+				deleted: false,
+			};
+			return {
+				exitCode: resumeFailed && scenario === "nonzero" ? 1 : 0,
+				stdout: JSON.stringify(
+					resumeFailed && scenario === "endpoint"
+						? { ok: false, error: { code: "endpoint_stale" } }
+						: { ok: true, result: { session } },
+				),
+				stderr: "",
+			};
+		};
+		const port = new BrokerSessionPort({
+			database,
+			authority,
+			cli,
+			instanceId: "idle",
+			tailRunner: new TailRunner({ stream: noRelay, repo }),
+		});
+		const binding = port.bind({
+			originKey,
+			epoch: 0,
+			repo,
+		});
+		if (scenario === "revived") {
+			await expect(binding).resolves.toMatchObject({ sessionId: "old", epoch: 0 });
+		} else {
+			await expect(binding).rejects.toThrow();
+			if (scenario !== "changed-epoch")
+				expect(database.getSessionRecord(originKey)).toMatchObject({ sessionId: "old", epoch: 0 });
+		}
+		expect(resumes).toBe(1);
+		expect(oldInspectionsAfterFailure).toBe(1);
+		expect(creates).toBe(0);
+		expect(database.inboundPendingOldest(originKey)?.message_id).toBe("future");
+	});
+}
 
 test("a recovered answer is the full body, never the 500-character summary", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-body-"));

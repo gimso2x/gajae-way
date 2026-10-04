@@ -340,7 +340,7 @@ class UnreadableStorePort extends ScriptedSessionPort {
 	}
 }
 
-test("a bound, unaccepted turn on a session the runtime cannot answer for is released and re-fired on a fresh session", async () => {
+test("unreadable inspect and status retain a bound identity instead of inventing nonacceptance proof", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const port = new UnreadableStorePort({ onBind: (input) => `session-${input.epoch + 1}` });
@@ -366,11 +366,12 @@ test("a bound, unaccepted turn on a session the runtime cannot answer for is rel
 	manager = makeManager(port, logs);
 
 	await manager.recover();
-	expect(logs.some((line) => line.startsWith(`recovery_requeue_unaccepted origin=${KEY}`))).toBe(true);
-	await eventually(() => port.sends.length === 1, "released turn was not re-dispatched on a fresh session");
-	expect(port.sends[0]!.text).toBe("hello after cutover");
-	expect(port.sends[0]!.opRef).not.toBe(opRef);
-	expect(port.sends[0]!.sessionId).not.toBe("pre-cutover-session");
+	expect(logs.some((line) => line.startsWith(`recovery_requeue_unaccepted origin=${KEY}`))).toBe(false);
+	expect(port.sends).toEqual([]);
+	expect(database.inboundTurnRow(opRef)).toMatchObject({
+		turn_state: "bound",
+		bound_session_id: "pre-cutover-session",
+	});
 });
 
 class ColdBindFlakyPort extends ScriptedSessionPort {
@@ -458,7 +459,7 @@ class PoisonedBindEpochPort extends ScriptedSessionPort {
 	constructor() {
 		super({
 			onBind: (input) => `session-${input.epoch}`,
-			onSend: (input, scripted) => scripted.complete(input.opRef, "recovered after epoch rotation"),
+			onSend: (input, scripted) => scripted.complete(input.opRef, "recovered on the original epoch"),
 		});
 	}
 
@@ -472,7 +473,7 @@ class PoisonedBindEpochPort extends ScriptedSessionPort {
 	}
 }
 
-test("a poisoned terminal_uncertain bind epoch is rotated after the bounded burst; the pending row is sent once on the new epoch", async () => {
+test("uncertain bind failures preserve the original epoch and pending row through bounded backoff", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-restart-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const port = new PoisonedBindEpochPort();
@@ -510,29 +511,22 @@ test("a poisoned terminal_uncertain bind epoch is rotated after the bounded burs
 	expect(port.bindEpochs).toEqual([0, 0]);
 	expect(timers.map((timer) => timer.delayMs)).toEqual([2_000, 4_000]);
 
-	// Attempt 3: terminal_uncertain again. Nothing was ever sent, so the actor
-	// advances epoch 0 -> 1, leaves the row pending, and returns to the base delay.
+	// No prompt was sent, but a create might already own a host. Keep its key.
 	timers[1]!.work();
 	await eventually(() => port.bindAttempts === 3, "third bind did not run");
-	expect(database.getSessionRecord(KEY)?.epoch).toBe(1);
+	expect(database.getSessionRecord(KEY)).toBeUndefined();
 	expect(database.inboundPendingOldest(KEY)).toMatchObject({ message_id: "poisoned", turn_state: null });
 	expect(port.sends).toEqual([]);
-	expect(timers.map((timer) => timer.delayMs)).toEqual([2_000, 4_000, 2_000]);
-	expect(
-		logs.some(
-			(line) =>
-				line.startsWith(`persona_bind_epoch_rotated origin=${KEY} epoch=0 nextEpoch=1`) &&
-				line.includes("reason=terminal_uncertain"),
-		),
-	).toBe(true);
+	expect(timers.map((timer) => timer.delayMs)).toEqual([2_000, 4_000, 8_000]);
+	expect(logs.some((line) => line.startsWith("persona_bind_epoch_rotated"))).toBe(false);
 
-	// Attempt 4 uses the fresh epoch/idempotency key and succeeds exactly once.
+	// Attempt 4 observes recovery on the original epoch/key and sends once.
 	timers[2]!.work();
 	await eventually(() => port.sends.length === 1, "fresh epoch did not dispatch");
-	expect(port.bindEpochs).toEqual([0, 0, 0, 1]);
+	expect(port.bindEpochs).toEqual([0, 0, 0, 0]);
 	expect(port.sends[0]!.text).toBe("must survive the poisoned session-create key");
 	await eventually(() => terminal.length === 1, "recovered turn did not complete");
-	expect(terminal).toEqual(["recovered after epoch rotation"]);
+	expect(terminal).toEqual(["recovered on the original epoch"]);
 	expect(database.inboundPendingCount(KEY)).toBe(0);
 });
 

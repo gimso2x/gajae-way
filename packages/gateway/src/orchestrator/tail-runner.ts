@@ -151,16 +151,15 @@ export class RelayClosedError extends Error {
 
 /**
  * `gjc sdk serve` refused to attach: it printed one SDK error envelope and
- * exited. `endpoint_stale` / `not_found` mean the broker no longer serves this
- * session id - the same condition the CLI reports as `session_unavailable`,
- * so callers classify it identically (release the bound turn, rebind).
+ * exited. Preserve the runtime's code: an unavailable endpoint is not proof
+ * that an operation was never accepted or that its execution has ended.
  */
 export class RelayRefusedError extends Error {
 	readonly code: string;
 	constructor(sessionId: string, code: string, message: string | undefined) {
 		super(`relay for ${sessionId} refused: ${code}${message ? ` - ${message}` : ""}`);
 		this.name = "RelayRefusedError";
-		this.code = code === "endpoint_stale" || code === "not_found" ? "session_unavailable" : code;
+		this.code = code;
 	}
 }
 
@@ -757,6 +756,19 @@ export function decodeStreamLine(line: string): readonly TailFrame[] {
 }
 
 function decodeEvent(kind: string, event: Record<string, unknown>, correlation: TurnCorrelation): TailFrame {
+	if (kind === "agent_start" || kind === "agent_end" || kind === "agent_failed" || kind === "activity") {
+		return {
+			kind,
+			rawKind: kind,
+			...correlation,
+			payload: event,
+			steerEcho: false,
+			idle:
+				kind === "agent_end" ||
+				kind === "agent_failed" ||
+				(kind === "activity" && [event.state, event.status, event.activity].some((value) => value === "idle")),
+		};
+	}
 	if (kind === "message_end") {
 		const message = recordOf(event.message) ?? {};
 		const role = typeof message.role === "string" ? message.role : "";

@@ -954,7 +954,7 @@ test("C6a: terminal recovery after a stop invokes the reconstructed lifecycle on
 	}
 });
 
-test("C6b: an unknown operation on a broker-disowned session is re-sent once with a new opRef", async () => {
+test("C6b: an accepted operation on a broker-disowned session retains its identity without replay", async () => {
 	const port = new DisownedStatusPort();
 	const fixture = await directFixture({ port, instanceId: "canonical-recover-requeue" });
 	let recovered: PersonaSessionManager | undefined;
@@ -978,15 +978,13 @@ test("C6b: an unknown operation on a broker-disowned session is re-sent once wit
 			log: (line) => fixture.logs.push(line),
 		});
 		await recovered.recover();
-		await eventually(() => port.sends.length === 2, "disowned operation was not sent on a new session");
-		const replacement = required(port.sends[1], "replacement send missing");
-		expect(replacement.opRef).not.toBe(first.opRef);
-		expect(replacement.sessionId).not.toBe(first.sessionId);
-		expect(port.sendAttempts).toHaveLength(2);
-		port.complete(replacement.opRef, "replacement answer");
-		await eventually(() => fixture.terminals.length === 1, "replacement turn did not complete");
-		expect(fixture.terminals).toEqual([{ trigger: "recover-requeue", text: "replacement answer" }]);
-		expect(port.sends).toHaveLength(2);
+		expect(port.sendAttempts).toHaveLength(1);
+		expect(fixture.database.inboundTurnRow(first.opRef)).toMatchObject({
+			turn_state: "accepted",
+			bound_session_id: first.sessionId,
+		});
+		expect(fixture.terminals).toEqual([]);
+		expect(port.sends).toHaveLength(1);
 	} finally {
 		await recovered?.stop();
 		await fixture.close();

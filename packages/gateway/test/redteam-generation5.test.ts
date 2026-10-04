@@ -390,7 +390,7 @@ test("G4: finalizing a terminal-time held-steer acceptance is exactly once", asy
 	}
 });
 
-test("G5: accepted turns need positive death evidence, while bound turns release on an unknown liveness result", async () => {
+test("G5: accepted turns never replay from host death, while explicit Router refusal releases unacknowledged sends", async () => {
 	const acceptedPort = new AcceptedLivenessPort();
 	const accepted = await directFixture({ port: acceptedPort });
 	try {
@@ -406,12 +406,11 @@ test("G5: accepted turns need positive death evidence, while bound turns release
 		expect(acceptedPort.sends).toHaveLength(1);
 
 		acceptedPort.live = false;
+		accepted.clock.advance(30_000);
 		await accepted.manager.tick(ORIGIN_KEY);
-		await eventually(() => acceptedPort.sends.length === 2, "positive dead evidence did not release the accepted turn");
-		const released = required(acceptedPort.sends[1], "released replacement missing");
-		expect(released.opRef).not.toBe(first.opRef);
+		expect(accepted.database.inboundTurnRow(first.opRef)).toMatchObject({ turn_state: "accepted" });
 		await accepted.manager.tick(ORIGIN_KEY);
-		expect(acceptedPort.sends).toHaveLength(2);
+		expect(acceptedPort.sends).toHaveLength(1);
 	} finally {
 		await accepted.close();
 	}

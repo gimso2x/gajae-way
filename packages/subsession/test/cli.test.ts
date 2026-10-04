@@ -18,7 +18,7 @@ const SESSION = "ad2f2494-2584-4d13-b7b6-c6ac24a1087f";
 function rawSession(overrides: Record<string, unknown> = {}) {
 	return {
 		sessionId: SESSION,
-		locator: { repo: WORKTREE, stateRoot: `${WORKTREE}/.gjc/state` },
+		locator: { cwd: WORKTREE, stateRoot: `${WORKTREE}/.gjc/state` },
 		pid: 94406,
 		live: true,
 		deleted: false,
@@ -53,6 +53,22 @@ describe("parseEnvelope", () => {
 		expect(() => parseEnvelope({ exitCode: 2, stdout: "", stderr: "boom" }, "x")).toThrow(GjcCliError);
 	});
 
+	test.each(["json", "text"])("preserves endpoint_stale from nonzero %s stderr", (format) => {
+		const error = { code: "endpoint_stale", category: "unavailable", outcomeCertainty: "unknown" };
+		const stderr =
+			format === "json"
+				? JSON.stringify({ ok: false, error })
+				: `COMMAND ["sdk","session","status"]\nERROR ${JSON.stringify(error)}\nCOMPLETE true\n`;
+		try {
+			parseEnvelope({ exitCode: 1, stdout: "", stderr }, "session status");
+			throw new Error("failure was accepted");
+		} catch (failure) {
+			expect(failure).toBeInstanceOf(GjcCliError);
+			expect(failure).toMatchObject({ exitCode: 1, details: error });
+			expect((failure as Error).message).toContain("endpoint_stale");
+		}
+	});
+
 	test("rejects truncated stdout instead of guessing", () => {
 		expect(() => parseEnvelope({ exitCode: 0, stdout: '{"ok":true,"resu', stderr: "" }, "x")).toThrow(
 			/did not print a JSON envelope/,
@@ -77,7 +93,7 @@ describe("listSessions", () => {
 
 	test("drops rows without an identity or locator instead of failing the poll", async () => {
 		const options = controller(() =>
-			ok({ sessions: [rawSession(), { sessionId: "x" }, { locator: { repo: WORKTREE } }] }),
+			ok({ sessions: [rawSession(), { sessionId: "x" }, { locator: { cwd: WORKTREE } }] }),
 		);
 		expect(await listSessions(options)).toHaveLength(1);
 	});
@@ -109,7 +125,7 @@ describe("verifyReady", () => {
 	});
 
 	test("rejects a session running in a different worktree", async () => {
-		const options = controller(() => ok({ session: rawSession({ locator: { repo: "/wt/other" } }) }));
+		const options = controller(() => ok({ session: rawSession({ locator: { cwd: "/wt/other" } }) }));
 		const result = await verifyReady(options, { sessionId: SESSION, worktreePath: WORKTREE });
 		expect(result).toMatchObject({ ready: false, reason: "cwd-mismatch" });
 	});

@@ -1285,6 +1285,57 @@ export class GatewayDatabase {
 			.all() as Array<{ origin_key: string; n: number; oldest_unbound_received_at: string | null; active: number }>;
 	}
 
+	/** Current and retired trigger identities; age is diagnostic, never terminal proof. */
+	inboundActiveTurnRows(): Array<{
+		origin_key: string;
+		turn_epoch: number;
+		bound_session_id: string | null;
+		turn_op_ref: string;
+		turn_state: "bound" | "accepted";
+		started_at: string;
+	}> {
+		return this.#database
+			.query(
+				`SELECT origin_key, turn_epoch, bound_session_id, turn_op_ref, turn_state,
+					COALESCE(dispatched_at, received_at) AS started_at
+				FROM inbound_messages WHERE state = 'pending' AND turn_role = 'trigger'
+					AND turn_state IN ('bound', 'accepted') AND ${REPLAYABLE_INBOUND}
+				ORDER BY started_at, turn_op_ref`,
+			)
+			.all() as ReturnType<GatewayDatabase["inboundActiveTurnRows"]>;
+	}
+
+	/** Only explicit uncertainty of an unsettled attempt gates the cycle, not its age. */
+	workAttemptUncertainCount(): number {
+		return this.workAttemptCycleEvidence().filter((row) => row.runtime?.sendPhase === "uncertain").length;
+	}
+
+	/** Read-only validated runtime evidence; corrupt rows retain their SQL identity for diagnostics. */
+	workAttemptCycleEvidence(): Array<{
+		opRef: string;
+		jobId: string;
+		laneKey: string;
+		sessionId: string;
+		runtime: WorkAttemptRuntime | null;
+	}> {
+		const rows = this.#database
+			.query<{ op_ref: string; job_id: string; lane_key: string; session_id: string }, []>(
+				`SELECT op_ref, job_id, lane_key, session_id FROM work_attempt_runtime WHERE settled_at IS NULL
+					AND NOT EXISTS (SELECT 1 FROM broker_quarantine q
+						WHERE q.kind = 'work' AND q.subject_id = work_attempt_runtime.job_id) ORDER BY op_ref`,
+			)
+			.all();
+		return rows.map((row) => {
+			let runtime: WorkAttemptRuntime | null = null;
+			try {
+				runtime = this.workAttemptGet(row.op_ref) ?? null;
+			} catch {
+				// Projection reports invalid evidence without attempting recovery or writes.
+			}
+			return { opRef: row.op_ref, jobId: row.job_id, laneKey: row.lane_key, sessionId: row.session_id, runtime };
+		});
+	}
+
 	/** Cycle projection source: delivery state census across all origins. */
 	deliveryStateCounts(): Array<{ state: string; n: number }> {
 		return this.#database.query("SELECT state, COUNT(*) AS n FROM deliveries GROUP BY state").all() as Array<{

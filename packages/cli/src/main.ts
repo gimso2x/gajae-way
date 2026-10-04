@@ -148,6 +148,20 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 	lines.push(`instance: ${cycle.instanceId}`);
 	lines.push(`inbound: pending=${cycle.pendingInbound} inflight=${cycle.inFlightInbound}`);
 	lines.push(
+		`workers: active=${cycle.lanes.active}/${cycle.lanes.max} awaiting_operator=${cycle.lanes.awaitingOperator} stalled=${cycle.lanes.stalled} send_uncertain=${cycle.lanes.uncertainAttempts}`,
+	);
+	for (const turn of cycle.inboundTurns) {
+		const age = turn.ageMs === null ? "unknown" : `${Math.round(turn.ageMs / 1000)}s`;
+		lines.push(
+			`turn: origin=${turn.originKey} epoch=${turn.epoch} session=${turn.sessionId ?? "unknown"} op=${turn.opRef} state=${turn.state} age=${age}${turn.recoveryHold ? ` hold=${turn.recoveryHold.reason} first_observed=${turn.recoveryHold.firstObservedAt ?? "unknown"} observed=${turn.recoveryHold.observedAt ?? "unknown"}` : ""}`,
+		);
+	}
+	for (const issue of cycle.lanes.workerIssues) {
+		lines.push(
+			`worker: job=${issue.jobId} lane=${issue.laneKey} session=${issue.sessionId ?? "unknown"} op=${issue.opRef ?? "unknown"} reason=${issue.reason}`,
+		);
+	}
+	lines.push(
 		`context: unread=${cycle.contextDiff.unread} expired=${cycle.contextDiff.expired} truncated=${cycle.contextDiff.truncated} omitted_oldest=${cycle.contextDiff.omittedOldestAt ?? "-"} omitted_newest=${cycle.contextDiff.omittedNewestAt ?? "-"}`,
 	);
 	lines.push(

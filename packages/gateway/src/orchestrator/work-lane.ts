@@ -81,6 +81,9 @@ interface Observer {
 	task?: Promise<void>;
 	timer?: ReturnType<typeof setTimeout>;
 	text?: string;
+	uncertainSince?: number;
+	statusFailures?: number;
+	nextStatusAt?: number;
 }
 interface Waiter {
 	readonly owner: object;
@@ -95,6 +98,7 @@ export interface WorkLaneManagerOptions {
 	readonly deliver?: (payload: ChatMessagePayload) => void;
 	readonly pollMs?: number;
 	readonly waitTimeoutMs?: number;
+	readonly statusUncertaintyTimeoutMs?: number;
 	readonly now?: () => number;
 }
 interface WorkInput {
@@ -485,10 +489,42 @@ export class WorkLaneManager {
 					observer.task = undefined;
 					if (!this.#current(observer)) return;
 					if (this.#db.workAttemptGet(observer.runtime.opRef)?.settledAt === null)
-						this.#schedule(observer, this.#options.pollMs ?? 250);
+						this.#schedule(observer, Math.max(this.#options.pollMs ?? 250, (observer.nextStatusAt ?? 0) - this.#now()));
 					else this.#observers.delete(observer.runtime.opRef);
 				});
 		}, delay);
+	}
+	async #statusUncertain(
+		observer: Observer,
+		runtime: WorkAttemptRuntime,
+		reason: "status_unknown" | "status_unavailable",
+	): Promise<void> {
+		observer.uncertainSince ??= runtime.sendPhase === "uncertain" ? Date.parse(runtime.startedAt) : this.#now();
+		observer.statusFailures = (observer.statusFailures ?? 0) + 1;
+		observer.nextStatusAt = this.#now() + Math.min(300_000, 250 * 2 ** Math.min(observer.statusFailures, 11));
+		if (this.#now() - observer.uncertainSince < (this.#options.statusUncertaintyTimeoutMs ?? 600_000)) return;
+		await this.#port.runExclusive(runtime.sessionKey, async () => {
+			if (!this.#writeCurrent(observer)) return;
+			const current = this.#db.workAttemptGet(runtime.opRef);
+			if (!current || current.terminal || current.settledAt) return;
+			const name = runtime.sessionKey.slice("work/task/".length);
+			const job = this.#job(name, true)!;
+			if (job.state !== "running" || job.attempts.at(-1)?.opRef !== runtime.opRef) return;
+			const at = this.#at();
+			// A sticky hold is not terminal evidence or permission to replay the open attempt.
+			const held = parseLaneJobRecord(
+				JSON.stringify({
+					...job,
+					state: "awaiting_operator",
+					updatedAt: at,
+					escalations: [
+						...job.escalations.slice(-15),
+						`${at} operator hold: ${reason} opRef=${runtime.opRef}; original attempt remains open`,
+					],
+				}),
+			);
+			this.#db.putLaneJob({ ...held, laneKey: laneJobIdentity(name).laneKey, json: JSON.stringify(held) });
+		});
 	}
 	#attach(observer: Observer): void {
 		if (observer.tail || observer.attaching || !this.#writeCurrent(observer) || !this.#binding(observer.runtime))
@@ -529,10 +565,23 @@ export class WorkLaneManager {
 		let runtime = this.#db.workAttemptGet(observer.runtime.opRef)!;
 		if (runtime.settledAt) return;
 		if (!runtime.terminal) {
+			if (observer.nextStatusAt !== undefined && this.#now() < observer.nextStatusAt) return;
 			this.#attach(observer);
-			const status = await this.#query(runtime);
+			let status: PromptStatusBody;
+			try {
+				status = await this.#query(runtime);
+			} catch {
+				if (this.#writeCurrent(observer)) await this.#statusUncertain(observer, runtime, "status_unavailable");
+				return;
+			}
 			if (!this.#writeCurrent(observer)) return;
-			if (status.status === "unknown") return;
+			if (status.status === "unknown") {
+				await this.#statusUncertain(observer, runtime, "status_unknown");
+				return;
+			}
+			observer.uncertainSince = undefined;
+			observer.statusFailures = 0;
+			observer.nextStatusAt = undefined;
 			const terminal = terminalEvidence(status, this.#at());
 			runtime =
 				this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {

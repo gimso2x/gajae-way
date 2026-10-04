@@ -38,15 +38,14 @@ export interface GatewayStatusResult {
 	 */
 	readonly engagement?: { readonly botAudienceDeclines: number; readonly botAudienceRateLimited: number };
 	/**
-	 * Connected clients with their process generation. `staleGeneration` marks a
-	 * client whose process predates this gateway process: the adapter survived a
-	 * gateway-only restart and is serving the previous generation.
+	 * Connected clients with their process-start census. `predatesGateway` is
+	 * informational only: earlier startup does not prove binary or protocol drift.
 	 */
 	readonly clients?: readonly {
 		readonly name: string;
 		readonly startedAt?: string;
 		readonly connectedAt: string;
-		readonly staleGeneration: boolean;
+		readonly predatesGateway: boolean;
 	}[];
 }
 
@@ -675,7 +674,12 @@ export type CycleGateReason =
 	| "monitor_settlement_failed"
 	| "monitor_settlement_stuck"
 	| "lane_capacity_exhausted"
-	| "inbound_starved";
+	| "inbound_starved"
+	| "worker_awaiting_operator"
+	| "worker_stalled"
+	| "worker_send_uncertain"
+	| "worker_evidence_invalid"
+	| "persona_recovery_hold";
 
 export interface CycleSessionView {
 	/** Canonical, opaque origin key (protocol originKey; never reparsed). */
@@ -739,10 +743,49 @@ export interface OpsCycleResult {
 	readonly inFlightInbound: number;
 	/** Durable inbound messages still awaiting their turn, across ALL origins. */
 	readonly pendingInbound: number;
+	/** Current and retired replayable trigger identities. Age alone never proves failure. */
+	readonly inboundTurns: readonly {
+		readonly originKey: string;
+		readonly epoch: number;
+		readonly sessionId: string | null;
+		readonly opRef: string;
+		readonly state: "bound" | "accepted";
+		readonly startedAt: string;
+		readonly ageMs: number | null;
+		/** Explicit unresolved recovery observation, not an age-based timeout. */
+		readonly recoveryHold?: {
+			readonly reason: string;
+			readonly firstObservedAt: string | null;
+			readonly observedAt: string | null;
+		};
+	}[];
 	/** Aggregate unread/omission diagnostics across origins. */
 	readonly contextDiff: ConversationContextDiagnostics;
-	/** Worker-lane census against the configured admission cap. */
-	readonly lanes: { readonly active: number; readonly max: number };
+	/** Durable worker census: holds and send uncertainty gate independently of capacity. */
+	readonly lanes: {
+		readonly active: number;
+		readonly max: number;
+		readonly awaitingOperator: number;
+		readonly stalled: number;
+		readonly uncertainAttempts: number;
+		/** Metadata-only operator subjects; no model output, prompts or repository paths. */
+		readonly workerIssues: readonly {
+			readonly jobId: string;
+			readonly laneKey: string;
+			readonly sessionId: string | null;
+			readonly opRef: string | null;
+			readonly reason:
+				| "awaiting_operator"
+				| "stalled"
+				| "send_uncertain"
+				| "job_record_invalid"
+				| "job_identity_mismatch"
+				| "job_state_mismatch"
+				| "job_lane_mismatch"
+				| "settled_job_open_attempt"
+				| "runtime_evidence_invalid";
+		}[];
+	};
 }
 
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */

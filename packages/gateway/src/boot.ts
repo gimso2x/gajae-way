@@ -72,7 +72,7 @@ export async function bootGateway(options: BootGatewayOptions = {}): Promise<Gat
 			// bound to the app repo reports that repo's git state as its own.
 			const personaWorkspace = join(config.home, "workspace");
 			// Process start, not "boot reached this line": adapters compare their own
-			// process start against it (staleGeneration). Stamping after integrity
+			// process start against it (predatesGateway). Stamping after integrity
 			// checks and broker preflight made an adapter that systemd restarted
 			// together with this gateway (PartOf) read as the previous generation.
 			const startedAt = new Date(Date.now() - process.uptime() * 1000).toISOString();

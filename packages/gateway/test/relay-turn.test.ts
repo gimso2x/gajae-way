@@ -100,6 +100,45 @@ function messageEnd(role: string, text: string, correlation = CORRELATION, id = 
 	};
 }
 
+test("wrapped lifecycle events preserve exact correlation without unknown diagnostics or assistant content", async () => {
+	const relay = new FakeRelay();
+	const diagnostics: string[] = [];
+	const frames: TailFrame[] = [];
+	const handle = await runner(() => relay).attach({
+		sessionId: "s1",
+		brokerGeneration: 1,
+		repo: "/tmp/repo",
+		onFrame: (frame) => {
+			frames.push(frame);
+		},
+		onDiagnostic: (line) => diagnostics.push(line),
+	});
+	handle.beginTurn("op-1");
+	handle.correlate("op-1", CORRELATION);
+	for (const kind of ["agent_start", "activity", "agent_end", "agent_failed"] as const) {
+		const line = JSON.stringify({
+			type: "event",
+			kind,
+			payload: { event_type: kind, event: { state: "idle" } },
+			...CORRELATION,
+		});
+		const decoded = decodeStreamLine(line)[0]!;
+		expect(decoded).toMatchObject({
+			kind,
+			rawKind: kind,
+			...CORRELATION,
+			steerEcho: false,
+			idle: kind !== "agent_start",
+		});
+		expect(decoded.assistantText).toBeUndefined();
+		relay.host(JSON.parse(line));
+	}
+	await Bun.sleep(5);
+	expect(diagnostics.some((line) => line.includes("unknown_runtime_event"))).toBe(false);
+	expect(frames).toHaveLength(4);
+	await handle.close();
+});
+
 test("attach exchanges hello and stamps every request with the host's connectionId", async () => {
 	const relay = new FakeRelay("connection:7");
 	const handle = await runner(() => relay).attach({ sessionId: "s1", brokerGeneration: 1, repo: "/tmp/repo" });
@@ -450,17 +489,17 @@ test("a spawner that throws counts toward give-up like a relay that dies", async
 	await handle.close();
 });
 
-test("a serve refusal envelope (endpoint_stale) rejects attach as session_unavailable instead of waiting for hello", async () => {
+test("a serve refusal envelope preserves endpoint_stale instead of implying an unaccepted turn", async () => {
 	const relay = new FakeRelay("connection:1", { hello: false });
 	const attach = runner(() => relay).attach({ sessionId: "s1", brokerGeneration: 1, repo: "/tmp/repo" });
 	relay.host({ ok: false, error: { code: "endpoint_stale", message: "session s1 endpoint is not live" } });
 	relay.end();
 	const error = await attach.catch((e: unknown) => e);
 	expect(error).toBeInstanceOf(RelayRefusedError);
-	expect((error as RelayRefusedError).code).toBe("session_unavailable");
+	expect((error as RelayRefusedError).code).toBe("endpoint_stale");
 });
 
-test("a gjc 0.16 textual refusal ('[Uncaught Exception] Error: endpoint_stale: â€¦') rejects attach as session_unavailable", async () => {
+test("a textual refusal preserves endpoint_stale", async () => {
 	const relay = new FakeRelay("connection:1", { hello: false });
 	const attach = runner(() => relay).attach({ sessionId: "s1", brokerGeneration: 1, repo: "/tmp/repo" });
 	relay.hostLine("[Uncaught Exception] Error: endpoint_stale: session s1 endpoint is not live");
@@ -468,5 +507,5 @@ test("a gjc 0.16 textual refusal ('[Uncaught Exception] Error: endpoint_stale: â
 	relay.end();
 	const error = await attach.catch((e: unknown) => e);
 	expect(error).toBeInstanceOf(RelayRefusedError);
-	expect((error as RelayRefusedError).code).toBe("session_unavailable");
+	expect((error as RelayRefusedError).code).toBe("endpoint_stale");
 });

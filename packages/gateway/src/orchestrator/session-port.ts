@@ -127,8 +127,6 @@ export interface SessionBindInput {
 	readonly model?: GjcModelSelection;
 	/** The SDK host's default coding register is retained when true. */
 	readonly codingRegister?: boolean;
-	/** Internal recursion fence: one poisoned create key may advance to one fresh epoch per bind call. */
-	readonly epochRecovery?: boolean;
 }
 
 export interface SessionBinding {
@@ -259,12 +257,6 @@ const SESSION_CREATE_READINESS_MS = 60_000;
 const SESSION_READY_TIMEOUT_MS = 60_000;
 const SESSION_READY_POLL_MS = 250;
 const SESSION_CREATE_RETRY_MS = 1_000;
-/** Maximum poisoned-create-key epoch rotations permitted per origin. */
-export const MAX_POISONED_CREATE_ROTATIONS = 3;
-
-function createRotationMetaKey(originKey: string): string {
-	return `create_rotation:${originKey}`;
-}
 /**
  * The runtime refuses `turn.prompt` with `busy` while a previous turn on the
  * same session is still running. That is occupancy, not failure: the prompt
@@ -297,9 +289,7 @@ export class BrokerSessionPort implements SessionPort {
 			this.#database.assertBrokerAuthority(this.#authority);
 			const result = await options.cli(args, commandOptions);
 			this.#database.assertBrokerAuthority(this.#authority);
-			// Steering requires an unambiguous control receipt: do not promote a
-			// failed transport to a definitive rejection merely because stdout is JSON.
-			return args.includes("turn.steer") ? result : normalizeSdkEnvelopeFailure(result);
+			return result;
 		};
 		this.#instanceId = options.instanceId;
 		this.#tailRunner = options.tailRunner;
@@ -328,72 +318,63 @@ export class BrokerSessionPort implements SessionPort {
 			throw new Error("session epoch must be a non-negative integer");
 		const existing = this.#database.getSessionRecord(input.originKey);
 		if (existing?.epoch === input.epoch && existing.sessionId) {
-			this.#assertOwned({ sessionId: existing.sessionId, repo: input.repo });
-			// Only owned bindings may be inspected, resumed, or replaced.
-			let indexed = true;
-			try {
-				// Judge the raw envelope: a persisted id is reusable only when the
-				// A persisted id is reusable if live, and resumable if it still has
-				// saved authority. Monitor authoring reaches SessionPort directly, so
-				// resume here before paying for a cold replacement session.
-				const result = await this.#cli(["sdk", "session", "inspect", existing.sessionId]);
-				const envelope = JSON.parse(result.stdout) as {
-					ok?: unknown;
-					result?: { session?: { live?: unknown; deleted?: unknown } };
-					error?: { code?: unknown };
-				};
-				if (envelope.ok === false) indexed = envelope.error?.code !== "session_unavailable";
-				if (envelope.ok === true && envelope.result?.session?.live === false) {
-					if (envelope.result.session.deleted !== true) {
-						try {
-							return await this.resume({
-								sessionId: existing.sessionId,
-								repo: input.repo,
-								originKey: input.originKey,
-								epoch: input.epoch,
-							});
-						} catch (error) {
-							if (error instanceof BrokerAuthorityError) throw error;
-							// Saved authority cannot be resumed: replace it below.
-						}
-					}
-					indexed = false;
+			const target = {
+				sessionId: existing.sessionId,
+				repo: input.repo,
+				originKey: input.originKey,
+				epoch: input.epoch,
+			};
+			const assertBindingOwned = () => {
+				const owned = this.#database.assertOwnedSession(target.sessionId, target.repo, this.#authority);
+				if (owned.originKey !== input.originKey || owned.epoch !== input.epoch)
+					throw new BrokerAuthorityError("unowned_session");
+			};
+			assertBindingOwned();
+			// Only affirmative, identity-matched raw evidence may condemn an idle binding.
+			const inspect = async () => {
+				try {
+					const result = await this.#cli(["sdk", "session", "inspect", existing.sessionId!]);
+					const envelope = recordOf(JSON.parse(result.stdout));
+					const session = recordOf(recordOf(envelope?.result)?.session);
+					if (
+						result.exitCode === 0 &&
+						envelope?.ok === true &&
+						session?.sessionId === existing.sessionId &&
+						recordOf(session.locator)?.cwd === input.repo
+					)
+						return session;
+				} catch (error) {
+					if (error instanceof BrokerAuthorityError) throw error;
 				}
-			} catch (error) {
-				if (error instanceof BrokerAuthorityError) throw error;
-				indexed = true;
-			}
-			if (indexed) {
-				this.#resetCreateRotations(input.originKey);
+				return undefined;
+			};
+			const session = await inspect();
+			if (session?.live !== false && session?.deleted !== true) {
+				await this.#awaitIndexed(existing.sessionId, input.repo);
+				assertBindingOwned();
 				return { sessionId: existing.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
 			}
-			const rebound = this.#database.rebindEpoch(input.originKey);
-			console.error(
-				`session_rebound origin=${input.originKey} epoch=${input.epoch} nextEpoch=${rebound} session=${existing.sessionId} reason=not_live_or_disowned_by_broker`,
-			);
-			return await this.bind({ ...input, epoch: rebound });
-		}
-		const idempotencyKey = sessionCreateRef(this.#instanceId, input.originKey, input.epoch, input.repo);
-		let created: { readonly sessionId?: unknown };
-		try {
-			created = await this.#createSession(input.repo, idempotencyKey, input.model);
-		} catch (error) {
-			if (error instanceof BrokerAuthorityError) throw error;
-			if (input.epochRecovery === false) throw error;
-			const rotations = this.#createRotations(input.originKey);
-			if (rotations >= MAX_POISONED_CREATE_ROTATIONS) {
-				console.error(
-					`session_create_rotation_capped origin=${input.originKey} rotations=${rotations} reason=poisoned_create_key_capped`,
-				);
+			try {
+				return await this.resume(target);
+			} catch (error) {
+				if (error instanceof BrokerAuthorityError) throw error;
+				// Resume failure alone is not death evidence: it may have revived the host.
+				const fresh = await inspect();
+				assertBindingOwned();
+				const current = this.#database.getSessionRecord(input.originKey);
+				if (current?.epoch !== input.epoch || current.sessionId !== existing.sessionId) throw error;
+				if (fresh?.live === true && fresh.deleted !== true) {
+					return target;
+				}
+				// Even a fresh live:false observation does not prove the lifecycle
+				// request stopped. Hold this identity; a replacement could overlap it.
 				throw error;
 			}
-			this.#database.metaSet(createRotationMetaKey(input.originKey), String(rotations + 1));
-			const nextEpoch = this.#database.rebindEpoch(input.originKey);
-			console.error(
-				`session_create_epoch_rotated origin=${input.originKey} epoch=${input.epoch} nextEpoch=${nextEpoch} reason=poisoned_create_key`,
-			);
-			return await this.bind({ ...input, epoch: nextEpoch, epochRecovery: false });
 		}
+		const idempotencyKey = sessionCreateRef(this.#instanceId, input.originKey, input.epoch, input.repo);
+		// A failed create may already own a host. Every later attempt keeps this
+		// deterministic key until an explicit caller-owned epoch change.
+		const created = await this.#createSession(input.repo, idempotencyKey, input.model);
 		if (typeof created.sessionId !== "string" || created.sessionId.length === 0) {
 			throw new Error("session.create succeeded without a sessionId");
 		}
@@ -418,7 +399,6 @@ export class BrokerSessionPort implements SessionPort {
 		// a moment later. A tail/send before that answers session_unavailable, so
 		// wait until the broker reports the id live before handing the binding out.
 		await this.#awaitIndexed(created.sessionId, input.repo);
-		this.#resetCreateRotations(input.originKey);
 		return {
 			sessionId: created.sessionId,
 			originKey: input.originKey,
@@ -428,49 +408,46 @@ export class BrokerSessionPort implements SessionPort {
 		};
 	}
 
-	#createRotations(originKey: string): number {
-		const raw = this.#database.metaGet(createRotationMetaKey(originKey));
-		const value = raw === undefined ? Number.NaN : Number(raw);
-		return Number.isSafeInteger(value) && value >= 0 ? value : 0;
-	}
-
-	#resetCreateRotations(originKey: string): void {
-		this.#database.metaSet(createRotationMetaKey(originKey), "0");
-	}
-
 	#createChain: Promise<unknown> = Promise.resolve();
 
-	/** Judged on the raw inspect envelope (gjc >= 0.16.0 omits locator.repo, which the subsession normalizer requires). */
+	/** Readiness uses the raw inspect envelope; owned session identity is checked separately. */
 	async #awaitIndexed(sessionId: string, repo: string): Promise<void> {
 		this.#assertOwned({ sessionId, repo });
-		const deadline = Date.now() + SESSION_READY_TIMEOUT_MS;
+		const deadline = this.#now() + SESSION_READY_TIMEOUT_MS;
 		let lastCode: string | undefined;
 		for (;;) {
 			try {
-				const result = await this.#cli(["sdk", "session", "inspect", sessionId], { timeoutMs: 10_000 });
-				const envelope = JSON.parse(result.stdout) as {
-					ok?: unknown;
-					result?: { session?: { live?: unknown } };
-					error?: { code?: unknown };
-				};
-				// Only a broker that explicitly reports the id as not indexed / not
-				// live keeps us waiting; anything else is treated as ready (the send
-				// path still has its own recovery if that turns out to be wrong).
-				const disowned = envelope.ok === false && envelope.error?.code === "session_unavailable";
-				const notLive =
-					envelope.ok === true && envelope.result?.session !== undefined && envelope.result.session.live === false;
-				if (!disowned && !notLive) return;
-				lastCode = disowned ? "session_unavailable" : "not_live";
+				if (this.#now() >= deadline) break;
+				const result = await this.#cli(["sdk", "session", "inspect", sessionId], {
+					timeoutMs: Math.max(1, Math.min(10_000, deadline - this.#now())),
+				});
+				const envelope = recordOf(JSON.parse(result.stdout));
+				const session = recordOf(recordOf(envelope?.result)?.session);
+				const locator = recordOf(session?.locator);
+				this.#assertOwned({ sessionId, repo });
+				if (
+					this.#now() < deadline &&
+					result.exitCode === 0 &&
+					envelope?.ok === true &&
+					session?.live === true &&
+					session.sessionId === sessionId &&
+					locator?.cwd === repo &&
+					session.deleted !== true
+				)
+					return;
+				lastCode =
+					stableErrorCode(recordOf(envelope?.error)?.code) ??
+					(result.exitCode !== 0 ? "inspect_failed" : session?.live === false ? "not_live" : "invalid_inspect");
 			} catch (error) {
 				if (error instanceof BrokerAuthorityError) throw error;
-				const code = sdkErrorCode(error);
-				if (code !== "session_unavailable") return;
-				lastCode = code;
+				lastCode = sdkErrorCode(error) ?? "inspect_failed";
 			}
-			if (Date.now() >= deadline)
-				throw new Error(`session ${sessionId} was created but never became live (${lastCode})`);
-			await this.#sleep(SESSION_READY_POLL_MS);
+			if (this.#now() >= deadline) break;
+			await this.#sleep(Math.min(SESSION_READY_POLL_MS, deadline - this.#now()));
 		}
+		throw new GjcCliError(`session ${sessionId} readiness remains uncertain (${lastCode})`, 0, "", {
+			code: "session_readiness_uncertain",
+		});
 	}
 
 	/** Cold creates are serialized per agent dir: parallel launches starve gjc's lifecycle launcher. */
@@ -496,26 +473,29 @@ export class BrokerSessionPort implements SessionPort {
 		for (let attempt = 1; attempt <= SESSION_CREATE_ATTEMPTS; attempt++) {
 			try {
 				return parseEnvelope<{ sessionId?: unknown }>(
-					await this.#cli([
-						"sdk",
-						"session",
-						"raw",
-						"global",
-						"--op",
-						"session.create",
-						"--idempotency-key",
-						idempotencyKey,
-						"--json-input",
-						// A fresh session host boots the full agent (~10s measured on the
-						// persona host); the runtime's 10s default readiness cutoff turns a
-						// slow-but-healthy cold start into spawn_failed. Use the maximum
-						// budget: create is idempotent under this key either way.
-						JSON.stringify({
-							cwd: repo,
-							readinessTimeoutMs: SESSION_CREATE_READINESS_MS,
-							...(typeof model === "string" ? { modelId: model } : model ? { modelPreset: model.preset } : {}),
-						}),
-					]),
+					await this.#cli(
+						[
+							"sdk",
+							"session",
+							"raw",
+							"global",
+							"--op",
+							"session.create",
+							"--idempotency-key",
+							idempotencyKey,
+							"--json-input",
+							// A fresh session host boots the full agent (~10s measured on the
+							// persona host); the runtime's 10s default readiness cutoff turns a
+							// slow-but-healthy cold start into spawn_failed. Use the maximum
+							// budget: create is idempotent under this key either way.
+							JSON.stringify({
+								cwd: repo,
+								readinessTimeoutMs: SESSION_CREATE_READINESS_MS,
+								...(typeof model === "string" ? { modelId: model } : model ? { modelPreset: model.preset } : {}),
+							}),
+						],
+						{ timeoutMs: SESSION_CREATE_READINESS_MS + 30_000 },
+					),
 					"session.create",
 				);
 			} catch (error) {
@@ -557,7 +537,9 @@ export class BrokerSessionPort implements SessionPort {
 
 	async inspect(input: { sessionId: string; repo: string }): Promise<BrokerSession | undefined> {
 		this.#assertOwned(input);
-		return await this.#safe(async () => await inspectSession(this.#controller(input.repo), input.sessionId));
+		const session = await this.#safe(async () => await inspectSession(this.#controller(input.repo), input.sessionId));
+		this.#assertOwned(input);
+		return session?.sessionId === input.sessionId && session.repo === input.repo ? session : undefined;
 	}
 
 	/**
@@ -613,30 +595,69 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding> {
-		this.#assertOwned(input);
+		const assertBindingOwned = () => {
+			const owned = this.#database.assertOwnedSession(input.sessionId, input.repo, this.#authority);
+			if (owned.originKey !== input.originKey || owned.epoch !== input.epoch)
+				throw new BrokerAuthorityError("unowned_session");
+		};
+		assertBindingOwned();
 		const existing = await this.inspect(input);
-		if (!existing || existing.deleted || existing.repo !== input.repo)
+		if (!existing || existing.sessionId !== input.sessionId || existing.deleted || existing.repo !== input.repo)
 			throw new Error(`cannot resume session ${input.sessionId}: saved authority is unavailable`);
 		if (!existing.live) {
-			parseEnvelope(
+			const inventory = parseEnvelope<{ savedSession?: { id?: unknown; path?: unknown } }>(
 				await this.#cli([
 					"sdk",
 					"session",
 					"raw",
-					"control",
-					input.sessionId,
+					"global",
 					"--op",
-					"session.resume",
+					"session.list",
 					"--json-input",
-					"{}",
+					JSON.stringify({ cwd: input.repo, resolveSessionId: input.sessionId }),
 				]),
+				"session.list",
+			);
+			const saved = inventory.savedSession;
+			if (saved?.id !== input.sessionId || typeof saved.path !== "string" || !saved.path.startsWith("/"))
+				throw new Error(`cannot resume session ${input.sessionId}: saved transcript authority is unavailable`);
+			parseEnvelope(
+				await this.#cli(
+					[
+						"sdk",
+						"session",
+						"raw",
+						"global",
+						"--op",
+						"session.resume",
+						"--idempotency-key",
+						`gw-resume-${createHash("sha256")
+							.update(`${this.#instanceId}|${input.sessionId}|${existing.lastHeartbeatAt ?? existing.pid ?? 0}`)
+							.digest("hex")
+							.slice(0, 32)}`,
+						"--json-input",
+						JSON.stringify({
+							sessionId: input.sessionId,
+							cwd: input.repo,
+							sessionPath: saved.path,
+							readinessTimeoutMs: SESSION_READY_TIMEOUT_MS,
+						}),
+					],
+					{ timeoutMs: SESSION_READY_TIMEOUT_MS + 30_000 },
+				),
 				"session.resume",
 			);
 			const resumed = await this.inspect(input);
-			if (!resumed || resumed.deleted || !resumed.live || resumed.repo !== input.repo)
+			if (
+				!resumed ||
+				resumed.sessionId !== input.sessionId ||
+				resumed.deleted ||
+				!resumed.live ||
+				resumed.repo !== input.repo
+			)
 				throw new Error(`session.resume did not restore live authority for ${input.sessionId}`);
 		}
-		this.#resetCreateRotations(input.originKey);
+		assertBindingOwned();
 		return { sessionId: input.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
 	}
 
@@ -759,7 +780,14 @@ export class BrokerSessionPort implements SessionPort {
 			if (typeof changed !== "boolean") throw new Error("model.profile.set succeeded without a changed receipt");
 			return { changed };
 		}
-		const result = parseEnvelope<{ changed?: unknown }>(
+		// session.create accepts a selector; model.set accepts an exact catalog id
+		// and a separate thinkingLevel. Keep provider/model colons intact unless
+		// the final suffix is one of the SDK's reviewed thinking values.
+		const suffix = /:(inherit|off|minimal|low|medium|high|xhigh|max)$/.exec(input.selection);
+		const modelInput = suffix
+			? { id: input.selection.slice(0, -suffix[0].length), thinkingLevel: suffix[1] }
+			: { id: input.selection };
+		const result = parseEnvelope<{ changed?: unknown; provider?: unknown; modelId?: unknown; thinkingLevel?: unknown }>(
 			await this.#cli([
 				"sdk",
 				"session",
@@ -769,10 +797,24 @@ export class BrokerSessionPort implements SessionPort {
 				"--op",
 				"model.set",
 				"--json-input",
-				JSON.stringify({ id: input.selection }),
+				JSON.stringify(modelInput),
 			]),
 			"model.set",
 		);
+		if (suffix) {
+			const slash = modelInput.id.indexOf("/");
+			const modelId = slash >= 0 ? modelInput.id.slice(slash + 1) : modelInput.id;
+			const provider = slash >= 0 ? modelInput.id.slice(0, slash) : undefined;
+			if (
+				typeof result.provider !== "string" ||
+				result.provider.length === 0 ||
+				(provider !== undefined && result.provider !== provider) ||
+				result.modelId !== modelId ||
+				result.thinkingLevel !== suffix[1]
+			)
+				throw new Error("model.set succeeded without the requested model and thinking receipt");
+			return { changed: true };
+		}
 		if (typeof result.changed !== "boolean") throw new Error("model.set succeeded without a changed receipt");
 		return { changed: result.changed };
 	}
@@ -1340,31 +1382,6 @@ function parseLastAssistantPage(result: CliResult): LastAssistantPage {
 		complete: (page as Record<string, unknown>).complete === true,
 		...(typeof cursor === "string" && cursor.length > 0 ? { cursor } : {}),
 	};
-}
-
-/**
- * Current `gjc sdk session` commands return a declared `{ ok: false, error }`
- * envelope with a non-zero process status. Subsession's parser receives the
- * envelope as its structured-error authority, so preserve that payload while
- * leaving unstructured process failures untouched.
- */
-function normalizeSdkEnvelopeFailure(result: CliResult): CliResult {
-	if (result.exitCode === 0) return result;
-	try {
-		const parsed: unknown = JSON.parse(result.stdout);
-		if (
-			typeof parsed === "object" &&
-			parsed !== null &&
-			!Array.isArray(parsed) &&
-			(parsed as { ok?: unknown }).ok === false &&
-			typeof (parsed as { error?: unknown }).error === "object" &&
-			(parsed as { error?: unknown }).error !== null
-		)
-			return { ...result, exitCode: 0 };
-	} catch {
-		// A process failure without a complete JSON error envelope remains one.
-	}
-	return result;
 }
 
 /** The command line of a live pid, or undefined when it is gone. `ps` is the portable read on macOS and Linux. */

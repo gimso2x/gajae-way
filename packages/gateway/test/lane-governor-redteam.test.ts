@@ -257,11 +257,25 @@ test("R7 socket ops.cycle saturation gate clears after retirement without stale 
 	await h.run("a");
 	await h.run("b");
 	const full = (await h.request("ops.cycle")).result;
-	expect(full.lanes).toEqual({ active: 2, max: 2 });
+	expect(full.lanes).toEqual({
+		active: 2,
+		max: 2,
+		awaitingOperator: 0,
+		stalled: 0,
+		uncertainAttempts: 0,
+		workerIssues: [],
+	});
 	expect(full.gates).toContain("lane_capacity_exhausted");
 	await h.request("work.retire", { name: "a" });
 	const freed = (await h.request("ops.cycle")).result;
-	expect(freed.lanes).toEqual({ active: 1, max: 2 });
+	expect(freed.lanes).toEqual({
+		active: 1,
+		max: 2,
+		awaitingOperator: 0,
+		stalled: 0,
+		uncertainAttempts: 0,
+		workerIssues: [],
+	});
 	expect(freed.gates).not.toContain("lane_capacity_exhausted");
 	expect(freed.gates).not.toContain("stale_session_identity");
 });

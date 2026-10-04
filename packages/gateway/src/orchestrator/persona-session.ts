@@ -46,6 +46,9 @@ const STATUS_TERMINAL_GRACE_MS = 250;
 /** `turn.result` recheck cadence for a running turn whose end no relay will announce: 250 ms doubling to 5 s. */
 const STATUS_RECHECK_MIN_MS = 250;
 const STATUS_RECHECK_MAX_MS = 5_000;
+/** Unavailable status is an operator hold, not a fast running-operation poll. */
+const STATUS_UNAVAILABLE_MIN_MS = 30_000;
+const STATUS_UNAVAILABLE_MAX_MS = 5 * 60_000;
 /**
  * A transcript row is judged against the turn's dispatch floor with this much
  * slack: the host stamps rows and the gateway stamps dispatched_at on two
@@ -267,7 +270,8 @@ export class PersonaSessionManager {
 		this.#brokerLiveness = options.brokerLiveness;
 		this.#onBindHold = options.onBindHold;
 		this.#onRecoveryHold = options.onRecoveryHold;
-		this.#log = options.log ?? ((line: string) => console.error(line));
+		this.#log =
+			options.log ?? ((line: string) => (line.startsWith("persona_model ") ? console.log(line) : console.error(line)));
 	}
 
 	/** Call only after inboundEnqueue's durable acceptance boundary. */
@@ -693,6 +697,7 @@ class OriginActor {
 
 	async #recoverTurn(turn: InboundTurn): Promise<void> {
 		if (this.#quarantinedTurn(turn.opRef)) return;
+		if ((this.#statusHolds.get(turn.opRef)?.retryAtMs ?? 0) > this.#manager.now()) return;
 		const currentEpoch = this.#epoch();
 		const retired = turn.epoch < currentEpoch;
 		const sessionId = turn.sessionId;
@@ -710,30 +715,23 @@ class OriginActor {
 		// reason to resend an accepted operation.
 		const first = await this.#inspectForRecovery(sessionId);
 		const status = await this.#statusForRecovery(sessionId, turn.opRef);
+		// Neither endpoint failure nor a dead host proves an accepted operation
+		// never ran. Keep its original identity until authoritative terminal proof.
+		if (status.unreachable && (turn.state === "accepted" || status.unreachableCode !== "session_unavailable")) {
+			await this.#holdStatusUnavailable(turn.opRef, turn.epoch, status.unreachableCode);
+			return;
+		}
+		if (status.status.status !== "unknown") this.#clearStatusHold(turn.opRef, turn.epoch);
 		const second = await this.#inspectForRecovery(sessionId);
-		// A bound (never acknowledged) turn whose session the runtime cannot answer
-		// for at all (both inspects failed AND status is unreachable) — e.g. a
-		// pre-cutover store the current gjc no longer reads — has no operation the
-		// runtime could be holding, so releasing its trigger back to pending is
-		// exactly-once-safe: the next dispatch binds a live session. A reachable
-		// runtime, even with an unknown status, keeps the hold: it may have
-		// accepted the send.
-		const disownedByBroker =
-			status.unreachable === true &&
-			(status.unreachableCode === "session_unavailable" || (first.failed && second.failed));
-		// An ACCEPTED op is only released when the broker disowns the id AND the
-		// session is provably not live (inspect answered live=false, or is gone):
-		// nothing can still be running there, so the fresh-turn re-fire is
-		// exactly-once-safe. A merely unreachable but possibly-live session holds.
+		// Only an explicit Router refusal can release unacknowledged work.
+		// Failed inspect calls are transport failures, never dead-session proof.
+		const disownedByBroker = status.unreachable === true && status.unreachableCode === "session_unavailable";
 		const raw = this.#manager.port.liveness
 			? await this.#manager.port.liveness({ sessionId, repo: this.#manager.repo })
 			: undefined;
 		const sessionDead =
-			(first.session !== undefined && first.session.live === false) ||
-			(first.failed && second.failed) ||
-			raw?.live === false ||
-			raw?.disowned === true;
-		const releasable = turn.state === "bound" || (turn.state === "accepted" && sessionDead);
+			(first.session !== undefined && first.session.live === false) || raw?.live === false || raw?.disowned === true;
+		const releasable = turn.state === "bound";
 		if (releasable && status.status.status === "unknown" && disownedByBroker) {
 			const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
 			// The binding itself is unusable: recreate through the existing rebind
@@ -964,8 +962,41 @@ class OriginActor {
 	}
 
 	readonly #holdSweeps = new Map<string, number>();
+	readonly #holdFirstObserved = new Map<string, string>();
+	readonly #statusHolds = new Map<string, { reason: string; failures: number; retryAtMs: number }>();
 	/** Op-refs whose persistent hold was already escalated to the operator in this process. */
 	readonly #holdEscalated = new Set<string>();
+
+	async #holdStatusUnavailable(opRef: string, epoch: number, code: string | undefined): Promise<number> {
+		const previous = this.#statusHolds.get(opRef);
+		const failures = (previous?.failures ?? 0) + 1;
+		const delay = Math.min(STATUS_UNAVAILABLE_MAX_MS, STATUS_UNAVAILABLE_MIN_MS * 2 ** Math.min(failures - 1, 10));
+		const reason = `${code === "endpoint_stale" || code === "not_found" ? "status_endpoint_unavailable" : "status_unavailable"}:${code ?? "transport_error"}`;
+		this.#statusHolds.set(opRef, { reason, failures, retryAtMs: this.#manager.now() + delay });
+		const sweeps = (this.#holdSweeps.get(opRef) ?? 0) + 1;
+		this.#holdSweeps.set(opRef, sweeps);
+		this.#manager.log(
+			`recovery_hold origin=${this.originKey} epoch=${epoch} opRef=${opRef} reason=${reason} sweeps=${sweeps} retryMs=${delay} outcome=unknown action=retain`,
+		);
+		if (previous?.reason !== reason)
+			this.#manager.log(
+				`recovery_hold_transition origin=${this.originKey} epoch=${epoch} opRef=${opRef} from=${previous?.reason ?? "observing"} to=${reason}`,
+			);
+		await this.#escalateHold(opRef, epoch, reason, sweeps);
+		return delay;
+	}
+
+	#clearStatusHold(opRef: string, epoch: number): void {
+		this.#manager.database.metaDelete(`persona-recovery-hold:${opRef}`);
+		this.#holdFirstObserved.delete(opRef);
+		this.#holdSweeps.delete(opRef);
+		const previous = this.#statusHolds.get(opRef);
+		if (!previous) return;
+		this.#statusHolds.delete(opRef);
+		this.#manager.log(
+			`recovery_hold_transition origin=${this.originKey} epoch=${epoch} opRef=${opRef} from=${previous.reason} to=observing`,
+		);
+	}
 
 	/**
 	 * Tells the operator once that a hold is not clearing on its own. Alert only:
@@ -974,7 +1005,29 @@ class OriginActor {
 	 * sweeps is deduplicated by the delivery ledger rather than re-posting.
 	 */
 	async #escalateHold(opRef: string, epoch: number, reason: string, sweeps: number): Promise<void> {
-		if (sweeps < HOLD_ESCALATE_SWEEPS || this.#holdEscalated.has(opRef)) return;
+		const observedAt = new Date(this.#manager.now()).toISOString();
+		if (!this.#holdFirstObserved.has(opRef)) this.#holdFirstObserved.set(opRef, observedAt);
+		if (sweeps < HOLD_ESCALATE_SWEEPS) return;
+		const prior = this.#manager.database.metaGet(`persona-recovery-hold:${opRef}`);
+		let firstObservedAt = this.#holdFirstObserved.get(opRef)!;
+		if (prior !== undefined) {
+			try {
+				const evidence = JSON.parse(prior) as { epoch?: unknown; firstObservedAt?: unknown };
+				if (
+					evidence.epoch === epoch &&
+					typeof evidence.firstObservedAt === "string" &&
+					Number.isFinite(Date.parse(evidence.firstObservedAt))
+				)
+					firstObservedAt = evidence.firstObservedAt;
+			} catch {
+				// Replace unreadable diagnostic evidence, never operation authority.
+			}
+		}
+		this.#manager.database.metaSet(
+			`persona-recovery-hold:${opRef}`,
+			JSON.stringify({ epoch, reason, firstObservedAt, observedAt }),
+		);
+		if (this.#holdEscalated.has(opRef)) return;
 		this.#holdEscalated.add(opRef);
 		await this.#manager.emitRecoveryHold({
 			originKey: this.originKey,
@@ -1082,9 +1135,7 @@ class OriginActor {
 		await this.#resolveStaleHolds();
 		const trigger = this.#manager.database.inboundPendingOldest(this.originKey);
 		if (!trigger) return;
-		const epoch = this.#epoch();
-		const retryAttempt = this.#manager.database.freshTurnAttempt(this.originKey, epoch, trigger.message_id);
-		const opRef = personaTurnOpRef(this.#manager.instanceId, this.originKey, epoch, trigger.message_id, retryAttempt);
+		let epoch = this.#epoch();
 		let binding: SessionBinding;
 		try {
 			binding = await this.#ensureSession(epoch);
@@ -1093,6 +1144,9 @@ class OriginActor {
 			await this.#noteBindFailure(trigger, epoch, error);
 			return;
 		}
+		epoch = binding.epoch;
+		const retryAttempt = this.#manager.database.freshTurnAttempt(this.originKey, epoch, trigger.message_id);
+		const opRef = personaTurnOpRef(this.#manager.instanceId, this.originKey, epoch, trigger.message_id, retryAttempt);
 		const bound = this.#manager.database.inboundBindTurn({
 			messageId: trigger.message_id,
 			originKey: this.originKey,
@@ -1119,10 +1173,16 @@ class OriginActor {
 		try {
 			tail = await this.#attachTail(binding.sessionId, epoch, false);
 		} catch (error) {
-			// The relay refusing to attach because the broker no longer serves the
-			// session (`endpoint_stale`) is the same proof as a disowning send: the
-			// prompt never landed. Release the bound row and rebind, never hold.
-			if (sdkStatusErrorCode(error) !== "session_unavailable") throw error;
+			// This process has not called send yet: attachment failure can retry
+			// this trigger, but endpoint_stale does not condemn the session.
+			if (sdkStatusErrorCode(error) !== "session_unavailable") {
+				this.#manager.database.inboundTurnRequeue(opRef);
+				this.#manager.log(
+					`persona_attach_retry origin=${this.originKey} opRef=${opRef} detail=${safeDiagnostic(error)}`,
+				);
+				this.#scheduleDispatchRetry(DISPATCH_FAILURE_RETRY_MS);
+				return;
+			}
 			this.#manager.database.inboundTurnRequeue(opRef);
 			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
 			this.#bindFailures += 1;
@@ -1231,7 +1291,6 @@ class OriginActor {
 			tail.correlate(opRef, receipt);
 			this.#manager.database.inboundTurnAccept(opRef);
 			this.#bindFailures = 0;
-			this.#bindEpochPoisoned = false;
 			this.#clearBindWedgeProbe();
 		} catch (error) {
 			// The Router disowning the session id is NOT ambiguous: it is proof the
@@ -1355,8 +1414,6 @@ class OriginActor {
 
 	#bindFailures = 0;
 	#preSendFailures = 0;
-	/** A terminal_uncertain bind poisons this epoch's idempotency key; retries cannot make that key decidable. */
-	#bindEpochPoisoned = false;
 	#sameDetailBindFailures = 0;
 	#lastBindDetail: string | undefined;
 	#bindHoldProbed = false;
@@ -1382,7 +1439,6 @@ class OriginActor {
 		this.#bindFailures += 1;
 		const attempts = this.#bindFailures;
 		const detail = safeDiagnostic(error);
-		if (detail.includes("terminal_uncertain")) this.#bindEpochPoisoned = true;
 		if (detail === this.#lastBindDetail) this.#sameDetailBindFailures += 1;
 		else {
 			this.#lastBindDetail = detail;
@@ -1422,26 +1478,9 @@ class OriginActor {
 			}
 		}
 		if (this.#bindWedged) {
-			// A dead/stale owner cannot be recovered by another poisoned epoch key.
+			// A dead/stale owner cannot authorize a replacement session.
 			// Keep the pending trigger held and retry only at the bounded ceiling.
-			this.#bindEpochPoisoned = false;
 			this.#scheduleDispatchRetry(DISPATCH_FAILURE_RETRY_MAX_MS);
-			return;
-		}
-		if (this.#bindEpochPoisoned && attempts >= MAX_SEND_REBIND_ATTEMPTS) {
-			// bind() failed BEFORE inboundBindTurn, so no prompt was sent and no
-			// operation belongs to this row. terminal_uncertain is attached to the
-			// epoch-scoped session-create idempotency key; retrying that same key
-			// forever cannot recover it (live: one channel repeated it 335 times).
-			// Advance the epoch to derive a new key while leaving every inbound row
-			// pending and intact, then retry with the normal base delay.
-			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
-			this.#manager.log(
-				`persona_bind_epoch_rotated origin=${this.originKey} epoch=${epoch} nextEpoch=${nextEpoch} message=${trigger.message_id} attempts=${attempts} reason=terminal_uncertain`,
-			);
-			this.#bindFailures = 0;
-			this.#bindEpochPoisoned = false;
-			this.#scheduleDispatchRetry(DISPATCH_FAILURE_RETRY_MS);
 			return;
 		}
 		const delay = Math.min(DISPATCH_FAILURE_RETRY_MAX_MS, DISPATCH_FAILURE_RETRY_MS * 2 ** Math.min(attempts - 1, 10));
@@ -1578,27 +1617,23 @@ class OriginActor {
 			// the unchanged decision table's `session.resume` branch BEFORE any send;
 			// a dead binding is never handed to a send as if it were live.
 			const { session, failed } = await this.#inspectForRecovery(existing.sessionId);
-			if (failed || session === undefined || session.live) return binding;
-			if (!session.deleted && session.repo === this.#manager.repo) {
-				try {
-					await this.#manager.port.resume({
-						sessionId: existing.sessionId,
-						repo: this.#manager.repo,
-						originKey: this.originKey,
-						epoch,
-					});
-					this.#manager.log(
-						`session_resumed origin=${this.originKey} epoch=${epoch} session=${existing.sessionId} reason=idle_dead_binding`,
-					);
-					return binding;
-				} catch (error) {
-					this.#manager.log(
-						`session_resume_failed origin=${this.originKey} epoch=${epoch} session=${existing.sessionId} detail=${safeDiagnostic(error)}`,
-					);
-				}
-			}
-			// Deleted or unresumable: fall through to the epoch-scoped idempotent bind,
-			// whose rebind policy owns condemnation (SessionRebinder), not this actor.
+			if (
+				!failed &&
+				session?.sessionId === existing.sessionId &&
+				session.live === true &&
+				!session.deleted &&
+				session.repo === this.#manager.repo
+			)
+				return binding;
+			if (
+				!failed &&
+				session?.sessionId === existing.sessionId &&
+				session.live === false &&
+				!session.deleted &&
+				session.repo === this.#manager.repo
+			)
+				return await this.#manager.port.resume(binding);
+			// Bind owns strict readiness and the formal resume attempt on this identity.
 		}
 		const binding = await this.#manager.port.bind({
 			originKey: this.originKey,
@@ -1793,7 +1828,7 @@ class OriginActor {
 		}
 		if (isTerminalTailFrame(frame)) {
 			bound.tailTerminalObserved = true;
-			await this.#reconcileBound(bound);
+			await this.#reconcileBound(bound, true);
 		}
 	}
 
@@ -1839,41 +1874,36 @@ class OriginActor {
 		}
 	}
 
-	async #reconcileBound(bound: BoundTurn): Promise<void> {
+	async #reconcileBound(bound: BoundTurn, terminalWake = false): Promise<void> {
 		if (this.#stopped || this.#manager.stopped) return;
 		if (this.#quarantinedTurn(bound.turn.opRef)) return;
+		const hold = this.#statusHolds.get(bound.turn.opRef);
+		if (hold && hold.retryAtMs > this.#manager.now() && !terminalWake) {
+			if (bound.tailEvidenceUnavailable) this.#scheduleStatusRecheck(bound, hold.retryAtMs - this.#manager.now());
+			return;
+		}
 		let report: StatusReport;
 		try {
 			report = await this.#statusOf(bound);
 		} catch (error) {
 			if (this.#stopped || this.#manager.stopped) return;
-			// The broker disowning the id (session_unavailable) with the session
-			// provably not live means nothing is running there: release the turn
-			// and rebind instead of holding an adopted turn forever. A retired turn
-			// whose answer is still wanted (session replaced under it after a steer
-			// refusal) is judged the same way: held forever, its lifecycle kept
-			// announcing a turn that never ran (live: "working… (286m)", 2026-09-05).
-			if (sdkStatusErrorCode(error) === "session_unavailable" && (!bound.retired || bound.answerWanted)) {
+			// A Router refusal can release a never-acknowledged send only.
+			// Accepted work may have side effects even after its host is gone.
+			if (
+				sdkStatusErrorCode(error) === "session_unavailable" &&
+				this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state === "bound" &&
+				(!bound.retired || bound.answerWanted)
+			) {
 				const raw = this.#manager.port.liveness
 					? await this.#manager.port.liveness({ sessionId: bound.sessionId, repo: this.#manager.repo })
 					: undefined;
-				// A BOUND (never acknowledged) turn is safe to re-fire on the broker's
-				// word alone. An ACCEPTED turn may have run side effects: it is
-				// released only on positive evidence that the session is dead
-				// (live=false or disowned); an unanswerable liveness probe holds it.
-				const state = this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state;
-				const dead = raw?.live === false || raw?.disowned === true;
-				if (state === "bound" ? raw?.live !== true : dead) {
+				if (raw?.live !== true) {
 					await this.#releaseUnlanded(bound, "router_disowned");
 					return;
 				}
 			}
-			this.#manager.log(
-				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
-			);
-			// A turn no relay will announce the end of must not wait for the 60 s
-			// sweep after one unreadable status: keep rechecking at the bounded cadence.
-			if (bound.tailEvidenceUnavailable) this.#scheduleStatusRecheck(bound);
+			const delay = await this.#holdStatusUnavailable(bound.turn.opRef, bound.epoch, sdkStatusErrorCode(error));
+			if (bound.tailEvidenceUnavailable) this.#scheduleStatusRecheck(bound, delay);
 			return;
 		}
 		if (this.#stopped || this.#manager.stopped) return;
@@ -1920,6 +1950,7 @@ class OriginActor {
 			await this.#escalateHold(bound.turn.opRef, bound.epoch, "operation_state_unknown", count);
 			return;
 		}
+		this.#clearStatusHold(bound.turn.opRef, bound.epoch);
 		this.#holdSweeps.delete(bound.turn.opRef);
 		if (this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state === "bound")
 			this.#manager.database.inboundTurnAccept(bound.turn.opRef);
@@ -2248,10 +2279,11 @@ class OriginActor {
 	}
 
 	/** Bounded status poll for a turn no relay will ever announce the end of; one timer per turn, backing off. */
-	#scheduleStatusRecheck(bound: BoundTurn): void {
+	#scheduleStatusRecheck(bound: BoundTurn, unavailableDelay?: number): void {
 		const key = `status:${retiredKey(bound)}`;
 		if (this.#retiredReattachTimers.has(key)) return;
-		const delay = Math.min(STATUS_RECHECK_MAX_MS, STATUS_RECHECK_MIN_MS * 2 ** bound.statusRechecks);
+		const delay =
+			unavailableDelay ?? Math.min(STATUS_RECHECK_MAX_MS, STATUS_RECHECK_MIN_MS * 2 ** bound.statusRechecks);
 		bound.statusRechecks += 1;
 		const timer = this.#manager.schedule(() => {
 			this.#retiredReattachTimers.delete(key);
@@ -2466,6 +2498,10 @@ export function isDefinitiveSteerRejection(error: unknown): boolean {
 function sdkStatusErrorCode(error: unknown): string | undefined {
 	const code = (error as { code?: unknown } | undefined)?.code;
 	if (typeof code === "string" && /^[a-z0-9_.-]{1,64}$/i.test(code)) return code;
+	if (error instanceof GjcCliError) {
+		const details = error.details as { code?: unknown } | undefined;
+		if (typeof details?.code === "string" && /^[a-z0-9_.-]{1,64}$/i.test(details.code)) return details.code;
+	}
 	const message = error instanceof Error ? error.message : "";
 	return /session_unavailable/.test(message) ? "session_unavailable" : undefined;
 }

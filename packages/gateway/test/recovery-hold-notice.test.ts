@@ -53,7 +53,10 @@ test("a persistent recovery hold reaches the owner DM once, deduplicated by op-r
 	expect(payload.origin).toEqual(OWNER);
 	expect(payload.deliveryId).toMatch(/^gw-x-[0-9a-f]{32}$/);
 	expect(payload.text).toContain("[recovery hold] slack/channel/C1");
-	expect(payload.text).toContain("약 5분째");
+	expect(payload.text).toContain("조회 5회");
+	expect(payload.text).not.toContain("분째");
+	expect(payload.text).toContain("/new는 기존 작업을 복구하거나 완료하지 않습니다");
+	expect(payload.text).toContain("같은 요청을 다시 보내거나 대기 기록을 삭제하지 마세요");
 	expect(payload.text).toContain('메시지: "@PM stuck question"');
 	expect(payload.text).toContain("gw-p-aaa");
 	expect(payload.text).toContain("자동 재전송은 하지 않습니다");

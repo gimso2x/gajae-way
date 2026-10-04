@@ -122,14 +122,9 @@ export interface GatewayServer {
 }
 
 /**
- * Generation census for the connected stack.
- *
- * A gateway restart does not kill an adapter: it reconnects and keeps serving,
- * which is why the pending-delivery count and the schema version both look
- * healthy while replies lag a beat behind (issue #251). `staleGeneration` is
- * the signal that
- * previously required comparing process start times by hand: the client process
- * predates this gateway process, so it is still the old generation's adapter.
+ * Process-start census for the connected stack. Starting before the gateway
+ * does not prove binary drift: service-manager ordering and healthy reconnects
+ * both produce this condition. Verify executable digests separately.
  */
 function connectedClients(
 	connections: Iterable<Connection>,
@@ -138,7 +133,7 @@ function connectedClients(
 	readonly name: string;
 	readonly startedAt?: string;
 	readonly connectedAt: string;
-	readonly staleGeneration: boolean;
+	readonly predatesGateway: boolean;
 }[] {
 	const gatewayStart = Date.parse(gatewayStartedAt);
 	const clients = [];
@@ -150,9 +145,8 @@ function connectedClients(
 			name: connection.client.name,
 			...(startedAt === undefined ? {} : { startedAt }),
 			connectedAt: connection.client.connectedAt,
-			// Unknown generation is not reported as stale: a client that never sent a
-			// start time is a diagnostic gap, not evidence of a mismatch.
-			staleGeneration: Number.isFinite(clientStart) && Number.isFinite(gatewayStart) && clientStart < gatewayStart,
+			// Unknown start time is a diagnostic gap, not evidence of binary drift.
+			predatesGateway: Number.isFinite(clientStart) && Number.isFinite(gatewayStart) && clientStart < gatewayStart,
 		});
 	}
 	return clients;
@@ -2425,9 +2419,8 @@ export function reportRecoveryHold(
 	const ownerTarget = runtime.config.ownerTarget?.origin;
 	if (!ownerTarget) return;
 	const noticeId = `gw-x-${createHash("sha256").update(`recovery-hold:${input.opRef}`).digest("hex").slice(0, 32)}`;
-	const minutes = input.sweeps;
 	const excerpt = input.trigger ? sanitizeDiagnostic(input.trigger.body).replace(/\s+/g, " ").slice(0, 80) : "";
-	const notice = `[recovery hold] ${sanitizeDiagnostic(input.originKey).slice(0, 160)} 메시지 처리가 약 ${minutes}분째 보류 중입니다 (사유: ${safeDiagnosticField(input.reason)}). 자동 재전송은 하지 않습니다.${excerpt ? ` 메시지: "${excerpt}"` : ""} 확인: journalctl --user -u <bot>-gateway | grep ${safeDiagnosticField(input.opRef)} — 새로 시작하려면 해당 대화에서 /new.`;
+	const notice = `[recovery hold] ${sanitizeDiagnostic(input.originKey).slice(0, 160)} 메시지 처리가 보류 중입니다 (조회 ${input.sweeps}회, 사유: ${safeDiagnosticField(input.reason)}). 자동 재전송은 하지 않습니다.${excerpt ? ` 메시지: "${excerpt}"` : ""} 작업 참조: ${safeDiagnosticField(input.opRef)}. 기존 세션과 작업의 종료·접수 증거를 확인해야 합니다. /new는 기존 작업을 복구하거나 완료하지 않습니다. 같은 요청을 다시 보내거나 대기 기록을 삭제하지 마세요.`;
 	const payload = runtime.delivery.prepare(noticeId, ownerTarget, notice, undefined, noticeId);
 	if (payload) broadcastDelivery(runtime, payload);
 }

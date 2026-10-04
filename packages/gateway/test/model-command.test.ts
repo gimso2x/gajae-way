@@ -162,6 +162,8 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 	let client: { send(value: unknown): void; close(): void } | undefined;
 	const logs: string[] = [];
 	const previousError = console.error;
+	const previousLog = console.log;
+	console.log = (...values: unknown[]) => logs.push(values.map((value) => String(value)).join(" "));
 	console.error = (...values: unknown[]) => logs.push(values.map((value) => String(value)).join(" "));
 	try {
 		server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
@@ -255,6 +257,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 			await server?.stop();
 		} finally {
 			console.error = previousError;
+			console.log = previousLog;
 			if (!server) database.close();
 			await rm(home, { recursive: true, force: true });
 		}

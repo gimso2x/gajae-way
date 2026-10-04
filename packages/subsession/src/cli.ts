@@ -22,7 +22,7 @@ export type CliRunner = (args: readonly string[], options?: { readonly timeoutMs
 
 export type BrokerSession = {
 	readonly sessionId: string;
-	/** `locator.repo`: the workspace the session was launched in. */
+	/** SDK `locator.cwd`: the workspace the session was launched in. */
 	readonly repo: string;
 	readonly stateRoot?: string;
 	readonly pid?: number;
@@ -56,7 +56,13 @@ export class GjcCliError extends Error {
  */
 export function parseEnvelope<T>(result: CliResult, command: string): T {
 	if (result.exitCode !== 0) {
-		throw new GjcCliError(`gjc sdk ${command} exited ${result.exitCode}`, result.exitCode, result.stderr.trim());
+		const details = structuredFailure(result.stdout.trim() ? result.stdout : result.stderr);
+		throw new GjcCliError(
+			`gjc sdk ${command} exited ${result.exitCode}${details ? `: ${details.code}` : ""}`,
+			result.exitCode,
+			result.stderr.trim(),
+			details,
+		);
 	}
 	let body: unknown;
 	try {
@@ -79,9 +85,29 @@ export function parseEnvelope<T>(result: CliResult, command: string): T {
 	return envelope.result as T;
 }
 
+/** JSON and the SDK's COMMAND/ERROR rendering carry the same failure DTO. */
+function structuredFailure(text: string): Record<string, unknown> | undefined {
+	try {
+		const lines = text.split(/\r?\n/).filter((line) => line.startsWith("ERROR "));
+		const parsed = JSON.parse(lines.length === 1 ? lines[0]!.slice(6) : text);
+		const details = lines.length === 1 ? parsed : parsed?.ok === false ? parsed.error : undefined;
+		if (
+			typeof details === "object" &&
+			details !== null &&
+			!Array.isArray(details) &&
+			typeof details.code === "string" &&
+			/^[a-z0-9_.-]{1,64}$/i.test(details.code)
+		)
+			return details;
+	} catch {
+		// Incomplete output is not an SDK decision.
+	}
+	return undefined;
+}
+
 type RawSession = {
 	sessionId?: unknown;
-	locator?: { repo?: unknown; stateRoot?: unknown };
+	locator?: { cwd?: unknown; stateRoot?: unknown };
 	pid?: unknown;
 	live?: unknown;
 	deleted?: unknown;
@@ -93,12 +119,12 @@ function normalizeSession(raw: RawSession): BrokerSession | undefined {
 	if (typeof raw.sessionId !== "string" || raw.sessionId.length === 0) {
 		return undefined;
 	}
-	if (typeof raw.locator?.repo !== "string") {
+	if (typeof raw.locator?.cwd !== "string" || raw.locator.cwd.length === 0) {
 		return undefined;
 	}
 	return {
 		sessionId: raw.sessionId,
-		repo: raw.locator.repo,
+		repo: raw.locator.cwd,
 		...(typeof raw.locator.stateRoot === "string" ? { stateRoot: raw.locator.stateRoot } : {}),
 		...(typeof raw.pid === "number" ? { pid: raw.pid } : {}),
 		live: raw.live === true,

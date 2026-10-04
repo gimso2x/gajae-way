@@ -7,6 +7,7 @@ import {
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
 import { DEFAULT_WORK_MAX_LANES } from "../config";
+import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { WORK_LANE_PREFIX } from "../orchestrator/lane-governor";
 import type { GatewayDatabase } from "../store/db";
 
@@ -19,8 +20,8 @@ import type { GatewayDatabase } from "../store/db";
  * object; the SQLite rows and the ledger remain the only authority.
  *
  * Fail-closed rules:
- * - A session row whose bound gjc session id is empty (mid-rebind after /new,
- *   or never created) is reported as stale identity, never as healthy.
+ * - An unbound session with unresolved work is stale. An idle persona epoch
+ *   after /new is a placeholder until its next message, not runtime drift.
  * - Any delivery row in a state outside the ledger's known set is an unknown
  *   settlement and gates the projection — it is never counted as healthy.
  * - Quarantined memory intents and failed monitor events are surfaced as gates;
@@ -64,6 +65,7 @@ export interface RuntimeCycleSources {
 	readonly inboundCounts: ReadonlyMap<string, number>;
 	readonly pendingInbound: number;
 	readonly inFlightInbound: number;
+	readonly inboundTurns: OpsCycleResult["inboundTurns"];
 	readonly unknownInboundStates: readonly string[];
 	readonly deliveryCounts: ReadonlyMap<string, number>;
 	readonly unknownDeliveryStates: readonly string[];
@@ -75,6 +77,10 @@ export interface RuntimeCycleSources {
 	/** Bound `work.run` lanes and the configured admission cap. */
 	readonly activeLanes: number;
 	readonly maxLanes: number;
+	readonly awaitingOperatorLanes: number;
+	readonly stalledLanes: number;
+	readonly uncertainWorkerAttempts: number;
+	readonly workerIssues: OpsCycleResult["lanes"]["workerIssues"];
 	/**
 	 * Worker origins whose durable lane job is settled (`attempt_ended`,
 	 * `done`, `aborted`). An unbound worker row is a deliberate retirement only
@@ -130,10 +136,82 @@ export class RuntimeCycleProjector {
 		const inboundMap = new Map(inbound.map((r) => [r.state, r.n]));
 		const unknownInbound = inbound.map((r) => r.state).filter((state) => !KNOWN_INBOUND_STATES.has(state));
 		const unknownDeliveries = deliveries.map((r) => r.state).filter((state) => !KNOWN_DELIVERY_STATES.has(state));
+		const jobs = this.#database.laneJobRows();
+		const runtimeEvidence = this.#database.workAttemptCycleEvidence();
+		const workerIssues: Array<OpsCycleResult["lanes"]["workerIssues"][number]> = [];
+		const settledWorkOrigins = new Set<string>();
+		for (const row of jobs) {
+			const runtimeRows = runtimeEvidence.filter(
+				(runtime) => runtime.jobId === row.job_id || runtime.laneKey === row.lane_key,
+			);
+			const subject = {
+				jobId: row.job_id,
+				laneKey: row.lane_key,
+				sessionId: null as string | null,
+				opRef: null as string | null,
+			};
+			try {
+				const record = parseLaneJobRecord(this.#database.laneJobJson(row.job_id) ?? "");
+				const attempt = record.attempts.at(-1);
+				subject.sessionId = attempt?.sessionId ?? record.sessions.at(-1) ?? null;
+				subject.opRef = attempt?.opRef ?? null;
+				let reason: OpsCycleResult["lanes"]["workerIssues"][number]["reason"] | undefined;
+				if (record.jobId !== row.job_id) reason = "job_identity_mismatch";
+				else if (record.state !== row.state) reason = "job_state_mismatch";
+				else if (
+					!/^work-[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(row.lane_key) ||
+					this.#database.laneJobJsonByLaneKey(row.lane_key) !== this.#database.laneJobJson(row.job_id) ||
+					record.lane.branch !== row.branch ||
+					record.lane.worktreePath !== row.worktree_path ||
+					record.attempts.some((item) => !record.sessions.includes(item.sessionId))
+				)
+					reason = "job_lane_mismatch";
+				else if (
+					SETTLED_JOB_STATES.has(record.state) &&
+					(record.attempts.some((item) => item.endedAt === undefined) || runtimeRows.length > 0)
+				)
+					reason = "settled_job_open_attempt";
+				if (reason) workerIssues.push({ ...subject, reason });
+				else if (SETTLED_JOB_STATES.has(record.state))
+					settledWorkOrigins.add(`${WORK_LANE_PREFIX}${row.lane_key.slice("work-".length)}`);
+				else if (record.state === "awaiting_operator" || record.state === "stalled")
+					workerIssues.push({ ...subject, reason: record.state });
+			} catch {
+				workerIssues.push({
+					...subject,
+					sessionId: runtimeRows[0]?.sessionId ?? null,
+					opRef: runtimeRows[0]?.opRef ?? null,
+					reason: "job_record_invalid",
+				});
+			}
+		}
+		for (const row of runtimeEvidence) {
+			const { runtime, ...subject } = row;
+			if (!runtime || !jobs.some((job) => job.job_id === row.jobId && job.lane_key === row.laneKey))
+				workerIssues.push({ ...subject, reason: "runtime_evidence_invalid" });
+			else if (runtime.sendPhase === "uncertain") workerIssues.push({ ...subject, reason: "send_uncertain" });
+		}
 		return {
 			sessionRows: sessions,
 			inboundCounts: inboundMap,
 			inFlightInbound,
+			inboundTurns: this.#database.inboundActiveTurnRows().map((row) => {
+				const age = nowMs - Date.parse(row.started_at);
+				const recoveryHold = readRecoveryHold(
+					this.#database.metaGet(`persona-recovery-hold:${row.turn_op_ref}`),
+					row.turn_epoch,
+				);
+				return {
+					originKey: row.origin_key,
+					epoch: row.turn_epoch,
+					sessionId: row.bound_session_id,
+					opRef: row.turn_op_ref,
+					state: row.turn_state,
+					startedAt: row.started_at,
+					ageMs: Number.isFinite(age) ? Math.max(0, age) : null,
+					...(recoveryHold ? { recoveryHold } : {}),
+				};
+			}),
 			pendingInbound: inboundMap.get("pending") ?? 0,
 			unknownInboundStates: unknownInbound,
 			deliveryCounts: new Map(deliveries.map((r) => [r.state, r.n])),
@@ -149,12 +227,11 @@ export class RuntimeCycleProjector {
 			instanceId: this.#database.instanceId,
 			activeLanes: this.#database.workLaneRows().length,
 			maxLanes: this.#maxLanes,
-			settledWorkOrigins: new Set(
-				this.#database
-					.laneJobRows()
-					.filter((row) => SETTLED_JOB_STATES.has(row.state))
-					.map((row) => `${WORK_LANE_PREFIX}${row.lane_key.slice("work-".length)}`),
-			),
+			awaitingOperatorLanes: jobs.filter((row) => row.state === "awaiting_operator").length,
+			stalledLanes: jobs.filter((row) => row.state === "stalled").length,
+			uncertainWorkerAttempts: workerIssues.filter((issue) => issue.reason === "send_uncertain").length,
+			workerIssues,
+			settledWorkOrigins,
 		};
 	}
 }
@@ -174,7 +251,15 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 			row.origin_key.startsWith(WORK_LANE_PREFIX) &&
 			row.gjc_session_id === "" &&
 			sources.settledWorkOrigins.has(row.origin_key);
-		if ((row.gjc_session_id === "" && !retiredLane) || row.epoch < 0) gates.add("stale_session_identity");
+		const unresolved =
+			(sources.inboundPendingByOrigin.get(row.origin_key) ?? 0) > 0 ||
+			(sources.unsettledByOrigin.get(row.origin_key)?.n ?? 0) > 0 ||
+			sources.inboundTurns.some((turn) => turn.originKey === row.origin_key);
+		if (
+			(row.gjc_session_id === "" && !retiredLane && (row.origin_key.startsWith(WORK_LANE_PREFIX) || unresolved)) ||
+			row.epoch < 0
+		)
+			gates.add("stale_session_identity");
 		return {
 			originKey: row.origin_key,
 			origin,
@@ -223,6 +308,14 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 	// Lane saturation is an operator condition: every further work.run is
 	// refused until a lane is retired, so it must not read as a healthy idle.
 	if (sources.activeLanes >= sources.maxLanes) gates.add("lane_capacity_exhausted");
+	// These durable states require reconciliation/operator action, regardless
+	// of admission capacity. A long accepted/running turn alone is not a gate.
+	if (sources.awaitingOperatorLanes > 0) gates.add("worker_awaiting_operator");
+	if (sources.stalledLanes > 0) gates.add("worker_stalled");
+	if (sources.uncertainWorkerAttempts > 0) gates.add("worker_send_uncertain");
+	if (sources.workerIssues.some((issue) => !["awaiting_operator", "stalled", "send_uncertain"].includes(issue.reason)))
+		gates.add("worker_evidence_invalid");
+	if (sources.inboundTurns.some((turn) => turn.recoveryHold !== undefined)) gates.add("persona_recovery_hold");
 	// Pending work with nothing in flight for longer than any healthy dispatch
 	// takes is a stuck actor, not a busy one. Measured 2026-09-15: 159 pending /
 	// 0 in flight for hours projected as `dispatching` while four origins were
@@ -268,9 +361,47 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 		},
 		inFlightInbound: sources.inFlightInbound,
 		pendingInbound,
+		inboundTurns: sources.inboundTurns,
 		contextDiff: sources.contextDiff,
-		lanes: { active: sources.activeLanes, max: sources.maxLanes },
+		lanes: {
+			active: sources.activeLanes,
+			max: sources.maxLanes,
+			awaitingOperator: sources.awaitingOperatorLanes,
+			stalled: sources.stalledLanes,
+			uncertainAttempts: sources.uncertainWorkerAttempts,
+			workerIssues: sources.workerIssues,
+		},
 	};
+}
+
+function readRecoveryHold(
+	value: string | undefined,
+	epoch: number,
+): { reason: string; firstObservedAt: string | null; observedAt: string | null } | undefined {
+	if (value === undefined) return undefined;
+	try {
+		const hold = JSON.parse(value) as {
+			epoch?: unknown;
+			reason?: unknown;
+			firstObservedAt?: unknown;
+			observedAt?: unknown;
+		};
+		if (
+			hold.epoch === epoch &&
+			typeof hold.reason === "string" &&
+			hold.reason.length > 0 &&
+			hold.reason.length <= 512 &&
+			typeof hold.firstObservedAt === "string" &&
+			Number.isFinite(Date.parse(hold.firstObservedAt)) &&
+			typeof hold.observedAt === "string" &&
+			Number.isFinite(Date.parse(hold.observedAt)) &&
+			Date.parse(hold.firstObservedAt) <= Date.parse(hold.observedAt)
+		)
+			return { reason: hold.reason, firstObservedAt: hold.firstObservedAt, observedAt: hold.observedAt };
+	} catch {
+		// An explicit hold with unreadable evidence must not turn green.
+	}
+	return { reason: "recovery_hold_evidence_invalid", firstObservedAt: null, observedAt: null };
 }
 
 function parseStringList(value: string): readonly string[] {

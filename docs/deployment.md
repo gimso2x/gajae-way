@@ -192,7 +192,7 @@ gajaeway ops restart-stack
 
 On Linux that is the one `systemctl --user restart gajaeway-gateway`; on macOS it kickstarts the gateway and then every dependent job, in order. It never uses `launchctl bootout`, which removes the job and leaves it with no automatic recovery.
 
-To diagnose a stack that is already mismatched, read `clients` in `gajaeway status`: every connected client reports its process `startedAt` and a `staleGeneration` flag that is true when the client process predates the running gateway process. That replaces comparing `ps -o lstart` by hand.
+Read `clients` in `gajaeway status` for process ordering: every connected client reports `startedAt` and `predatesGateway`. This is informational, not proof of a mismatched binary. An adapter can start milliseconds before the gateway during a coordinated restart or reconnect after a gateway-only restart. Compare `/proc/<MainPID>/exe` SHA-256 with the installed executable to establish runtime binary drift; do not add a startup-time tolerance or infer version mismatch from timestamps.
 
 ### One gateway per home, owned by the service manager
 
@@ -252,5 +252,6 @@ If the gate model is unreachable, both steps fail open: the turn runs and the re
 - **launchd hangs:** move the working directory, state, `gjc`, and symlink targets out of TCC-protected paths; then send `/new` to sessions created under the old location.
 - **Webhook or monitor failure:** verify the gateway configuration and use `gajaeway monitors inspect <monitor-id>`.
 - **Recovery or restore:** use the [operator runbook](runbooks/gajaeway-v1.md), especially its backup, restore, crash-recovery, and schema guidance.
+- **`endpoint_stale` / status unavailable:** preserve the accepted operation reference and session identity. A dead endpoint or host is not proof that accepted work never ran; do not replay, reset, or settle it from a neighboring receipt. Status failures retain their structured SDK code, log `outcome=unknown action=retain`, and back off from 30 seconds to at most 5 minutes, escalating through the existing deduplicated owner notice after five failed observations. Live `unknown` remains an observation hold, not a terminal result. Saved-session resume uses broker `raw global session.resume`, broker-verified transcript inventory, a stable lifecycle key, and a 60-second readiness budget (90-second CLI budget); it never resends the prompt. Confirm the original operation's exact terminal status and a fresh successful request before declaring operational recovery.
 
 Read [architecture](architecture.md) for delivery semantics and [memory](memory.md) for the private Markdown repository.
