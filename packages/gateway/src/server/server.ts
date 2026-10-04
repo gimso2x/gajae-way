@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { stat, unlink } from "node:fs/promises";
+import { readFile, stat, unlink } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import {
 	CAPABILITIES,
@@ -18,6 +18,8 @@ import {
 	isSilentOutput,
 	LOOPBACK_ORIGIN,
 	type MonitorEventRecord,
+	type MonitorRecord,
+	type MonitorScheduleProjection,
 	negotiate,
 	type OriginRef,
 	originKey,
@@ -57,9 +59,11 @@ import { validateMemory } from "../memory/validator";
 import { MonitorPropagator } from "../monitors/propagate";
 import { MonitorRegistry } from "../monitors/registry";
 import { MonitorRuntime } from "../monitors/runtime";
+import { DEFAULT_CRON_CATCH_UP, nextCronFire } from "../monitors/triggers/cron";
 import { backupDatabase, integrityDatabase } from "../ops/backup";
 import { RuntimeCycleProjector } from "../ops/cycle";
 import type { GlobalGjcClient } from "../orchestrator/broker";
+import { BrokerSpawnerGuard } from "../orchestrator/broker-spawner-guard";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
 	type PersonaBindHoldInput,
@@ -90,6 +94,20 @@ import { DeliveryLedger, type ExpiredDeliveryRow } from "../store/ledger";
 import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
 import { OrderedFrameWriter } from "./frame-writer";
+import {
+	buildHandoffDigest,
+	extendHandoffChain,
+	type HandoffProvenance,
+	type HandoffReply,
+	handoffMessageId,
+	parseHandoffReply,
+	readHandoffProvenance,
+	renderHandoffFailure,
+	renderHandoffPointer,
+	renderHandoffTurn,
+	resolveHandoffTarget,
+} from "./handoff";
+import { InterimSpeechGate } from "./interim-speech";
 import { applyModelCommand, listModelChoices } from "./model-command";
 import { composeSpeakerLabel, composeTurnHeader } from "./speaker";
 
@@ -116,6 +134,32 @@ function reactionTargetMessageId(origin: OriginRef, id: string): string | undefi
 	const target = /^\d+\.\d+$/.test(id) ? `${channel}:${id}` : id;
 	const match = /^([^:]+):(\d+\.\d+)$/.exec(target);
 	return match?.[1] === channel && isPlatformMessageId(target) ? target : undefined;
+}
+
+const AGENTS_MD_MISSING_DIGEST = "missing";
+const UPDATED_AGENTS_MD_HEADING =
+	"## AGENTS.md (updated since this session started; supersedes the project-context copy loaded at session start)";
+
+interface AgentsMdSnapshot {
+	readonly digest: string;
+	readonly text?: string;
+}
+
+async function readWorkspaceAgentsMd(home: string): Promise<AgentsMdSnapshot> {
+	try {
+		const content = await readFile(join(home, "workspace", "AGENTS.md"));
+		return {
+			digest: createHash("sha256").update(content).digest("hex"),
+			text: content.toString("utf8"),
+		};
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		return { digest: AGENTS_MD_MISSING_DIGEST };
+	}
+}
+
+function updatedAgentsMdSection(snapshot: AgentsMdSnapshot): string {
+	return `${UPDATED_AGENTS_MD_HEADING}\n${snapshot.text ?? "[AGENTS.md was deleted from the workspace after this session started.]"}`;
 }
 
 interface Connection {
@@ -207,7 +251,8 @@ export interface GatewayServerOptions {
 	readonly stallCheckIntervalMs?: number;
 	/** Test seam for periodic delivery recovery; production sweeps every 15s. */
 	readonly deliverySweepIntervalMs?: number;
-	/** Mid-work speech pacing (issue #71). */
+	/** Mid-work speech gating configuration (issue #71). */
+	readonly interimSpeech?: { readonly maxPerTurn?: number; readonly minGapMs?: number };
 	/** Maximum wait for an adapter to settle a direct delivery. */
 	readonly deliverSettlementTimeoutMs?: number;
 }
@@ -253,7 +298,7 @@ async function applyConfigReload(
 	}
 	runtime.config = result.config;
 	runtime.personaSessions.setStallTimeoutMs(result.config.stallTimeoutMs);
-	console.error(
+	console.info(
 		`gateway config reload (${trigger}) ok; applied=[${result.changed.join(",")}] restart-required=[${result.restartRequired.join(",")}] ignored=[${result.ignored.join(",")}]`,
 	);
 	return result;
@@ -524,7 +569,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				return;
 			}
 			if (origin.platform === "loopback") {
-				console.error(notice);
+				console.warn(notice);
 				return;
 			}
 			const context = runtime.inbound.get(trigger.message_id);
@@ -590,7 +635,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 					connection.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload });
 		},
 	});
-	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors);
+	const monitorRuntime = new MonitorRuntime(options.config, registry, monitors, options.database, {
+		catchUp: { ...DEFAULT_CRON_CATCH_UP, ...options.config.monitorCatchUp },
+	});
 	const lanes = new LaneGovernor({
 		database: options.database,
 		sessionPort,
@@ -625,9 +672,11 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 			.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`));
 	}, 60_000);
 	const deliverySweepTimer = setInterval(() => {
-		if (![...connections].some((connection) => connection.negotiated)) return;
 		try {
-			const sweep = delivery.sweep();
+			// The age TTL runs with or without an adapter: an unsettled row must reach
+			// a terminal state even while nothing is connected to retry it (#171).
+			const connected = [...connections].some((connection) => connection.negotiated);
+			const sweep = delivery.sweep(Date.now(), false, connected);
 			for (const expired of sweep.expired) reportDeliveryExpired(runtime, options.database, expired, "age");
 			for (const payload of sweep.payloads) broadcastDelivery(runtime, payload);
 		} catch (error) {
@@ -660,6 +709,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	const brokerWithGeneration = options.broker as
 		| (GlobalGjcClient & { onGeneration?: GlobalGjcClient["onGeneration"] })
 		| undefined;
+	const spawnerGuard =
+		brokerWithGeneration?.agentDir && brokerWithGeneration.executable
+			? new BrokerSpawnerGuard({ agentDir: brokerWithGeneration.agentDir, executable: brokerWithGeneration.executable })
+			: undefined;
 	const stopBrokerGenerationListener =
 		typeof brokerWithGeneration?.onGeneration === "function"
 			? brokerWithGeneration.onGeneration((generation) => {
@@ -671,6 +724,15 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 						.catch((error: unknown) =>
 							console.error(`persona broker-generation reconciliation failed: ${diagnostic(error)}`),
 						);
+					// A new broker is the first observable sign of a gjc upgrade: re-check
+					// the runtime version and whether a pre-upgrade process is killing brokers.
+					if (typeof brokerWithGeneration.refreshVersion === "function")
+						void brokerWithGeneration
+							.refreshVersion()
+							.catch((error: unknown) => console.error(`gjc version refresh failed: ${diagnostic(error)}`));
+					void spawnerGuard
+						?.observe()
+						.catch((error: unknown) => console.error(`broker spawner guard failed: ${diagnostic(error)}`));
 				})
 			: undefined;
 	runtime = {
@@ -695,6 +757,9 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		cycle: new RuntimeCycleProjector(options.database, memory, {
 			maxLanes: lanes.maxLanes,
 			agentDir: options.broker?.agentDir,
+			gjcVersion: () => options.broker?.gjcVersion,
+			brokerRespawnChurn: () =>
+				typeof options.broker?.respawnChurn === "function" ? options.broker.respawnChurn() : false,
 		}),
 		lanes,
 		work,
@@ -777,6 +842,37 @@ async function handleFrame(
 		writeError(connection, error, frame.type === "request" ? frame.id : undefined);
 	}
 }
+
+function localCronFireTime(at: Date, timezone: string): string {
+	const parts = new Intl.DateTimeFormat("en-CA", {
+		timeZone: timezone,
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
+		second: "2-digit",
+		hourCycle: "h23",
+	}).formatToParts(at);
+	const part = (type: Intl.DateTimeFormatPartTypes): string => {
+		const value = parts.find((entry) => entry.type === type)?.value;
+		if (!value) throw new Error(`missing ${type} in cron timestamp`);
+		return value;
+	};
+	return `${part("year")}-${part("month")}-${part("day")} ${part("hour")}:${part("minute")}:${part("second")}`;
+}
+
+function scheduleProjection(monitor: MonitorRecord, now: Date): MonitorScheduleProjection {
+	if (monitor.trigger.kind !== "cron") return { effectiveTimezone: null, nextFireAt: null };
+	const timezone = monitor.trigger.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+	if (!monitor.enabled) return { effectiveTimezone: timezone, nextFireAt: null };
+	const next = nextCronFire(monitor.trigger.schedule, now, timezone);
+	return {
+		effectiveTimezone: timezone,
+		nextFireAt: next ? { local: localCronFireTime(next, timezone), utc: next.toISOString() } : null,
+	};
+}
+
 async function handleRequest(
 	connection: Connection,
 	request: RequestFrame,
@@ -875,7 +971,7 @@ async function handleRequest(
 				throw new ProtocolError("invalid_params", "invalid delivery failure");
 			// unknown -> invalid_params; already-terminal -> idempotent no-op ack (the
 			// adapter may be retrying a stale outcome).
-			const failOutcome = runtime.delivery.fail(params.deliveryId, params.ambiguous);
+			const failOutcome = runtime.delivery.fail(params.deliveryId, params.ambiguous, params.reason);
 			if (failOutcome === "unknown") throw new ProtocolError("invalid_params", "unknown deliveryId");
 			if (failOutcome === "transitioned") {
 				runtime.directSettlements.get(params.deliveryId)?.({
@@ -1168,14 +1264,20 @@ async function handleRequest(
 			}
 			return;
 		}
-		case "monitor.list":
+		case "monitor.list": {
+			const now = new Date();
+			const monitors = runtime.registry.list();
+			const schedules = Object.fromEntries(
+				monitors.map((monitor) => [monitor.monitorId, scheduleProjection(monitor, now)] as const),
+			);
 			connection.write({
 				v: PROFILE_VERSION,
 				type: "response",
 				id: request.id,
-				result: { monitors: runtime.registry.list() },
+				result: { monitors, schedules },
 			});
 			return;
+		}
 		case "monitor.inspect": {
 			const monitorId = (request.params as { monitorId?: unknown } | undefined)?.monitorId;
 			if (typeof monitorId !== "string") throw new ProtocolError("invalid_params", "unknown monitorId");
@@ -1184,17 +1286,34 @@ async function handleRequest(
 			const recentEvents = options.database
 				.monitorEventRows(monitorId, "newest", true)
 				.slice(0, 100)
-				.map((row) => ({
-					eventId: row.event_id,
-					monitorId: row.monitor_id,
-					eventType: row.event_type,
-					firedAt: row.fired_at,
-					stage: row.stage,
-					...(options.database.isBrokerQuarantined("monitor", row.event_id)
-						? { quarantined: true, reason: "broker_authority_quarantined" }
-						: {}),
-				}));
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { monitor, recentEvents } });
+				.map((row) => {
+					const recovery = options.database.monitorEventRecovery(row.event_id);
+					return {
+						eventId: row.event_id,
+						monitorId: row.monitor_id,
+						eventType: row.event_type,
+						firedAt: row.fired_at,
+						stage: row.stage,
+						...(recovery ? { recovery } : {}),
+						...(row.procedure_json ? { procedure: JSON.parse(row.procedure_json) } : {}),
+						...(row.skipped_by ? { skippedBy: row.skipped_by } : {}),
+						...(options.database.isBrokerQuarantined("monitor", row.event_id)
+							? { quarantined: true, reason: "broker_authority_quarantined" }
+							: {}),
+					};
+				});
+			const catchUp = options.database.monitorCronState(monitorId);
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: {
+					monitor,
+					schedule: scheduleProjection(monitor, new Date()),
+					recentEvents,
+					...(catchUp ? { catchUp: { skippedTotal: catchUp.skippedTotal, lastSkip: catchUp.lastSkip } } : {}),
+				},
+			});
 			return;
 		}
 		case "monitor.test": {
@@ -1574,7 +1693,7 @@ async function sendChat(
 						recipient.write({ v: PROFILE_VERSION, type: "event", event: "chat.message", payload: delivery });
 			}
 		}
-		console.error(`gateway restart requested by owner via ${key}`);
+		console.info(`gateway restart requested by owner via ${key}`);
 		// Let the ack leave the socket, then exit cleanly; the supervisor restarts us.
 		setTimeout(() => {
 			// Exit non-zero on purpose: launchd KeepAlive=true and systemd
@@ -1662,7 +1781,7 @@ async function sendChat(
 			authorIsBot && isAddressed(origin, { mentioned: engagement?.mentioned === true, authorIsBot }, threadFollowUp);
 		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
 		if (addressed || botAudienceAdmission.reason === "rate_limited")
-			console.error(
+			console.warn(
 				`gateway bot audience admission declined origin=${key} message=${typeof params.messageId === "string" ? params.messageId : "unidentified"} reason=${botAudienceAdmission.reason} consecutive=${runtime.botAudienceTurns.consecutiveTurns(key)} window=${runtime.botAudienceTurns.windowedTurns(key)} declines=${runtime.botAudienceTurns.botAudienceDeclines()} rateLimited=${runtime.botAudienceTurns.botAudienceRateLimited()}`,
 			);
 	}
@@ -1889,7 +2008,7 @@ async function editChat(
 			authorIsBot && isAddressed(origin, { mentioned: engagement?.mentioned === true, authorIsBot }, threadFollowUp);
 		runtime.botAudienceTurns.recordBotAudienceDecline(addressed, botAudienceAdmission.reason);
 		if (addressed || botAudienceAdmission.reason === "rate_limited")
-			console.error(
+			console.warn(
 				`gateway bot audience admission declined origin=${key} message=${params.messageId} reason=${botAudienceAdmission.reason} consecutive=${runtime.botAudienceTurns.consecutiveTurns(key)} window=${runtime.botAudienceTurns.windowedTurns(key)} declines=${runtime.botAudienceTurns.botAudienceDeclines()} rateLimited=${runtime.botAudienceTurns.botAudienceRateLimited()}`,
 			);
 	}
@@ -1956,13 +2075,26 @@ async function createInboundTurnLifecycle(
 				replyTo?: { messageId?: string; authorName?: string; fromSelf?: boolean; excerpt?: string };
 				/** Set at intake by the speech gate (#260); absent means the reply is never judged. */
 				speechGated?: boolean;
+				/** Present when this row is a relayed handoff from another conversation (#72). */
+				handoff?: unknown;
 			})
 		: undefined;
+	const incomingHandoff = readHandoffProvenance(engagement?.handoff);
 	const speaker = composeSpeakerLabel(engagement);
 	const place =
 		[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
 		`${origin.platform} ${origin.kind} ${origin.conversationId}`;
 	const bootstrapState = options.database.getSessionBootstrap(key);
+	const bootstrapPending = !bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch;
+	const agentsMdSnapshot = await readWorkspaceAgentsMd(runtime.config.home);
+	const hasAgentsMdBaseline = bootstrapState?.agentsMdEpoch === input.epoch;
+	const legacyBootstrappedSession = !bootstrapPending && !hasAgentsMdBaseline;
+	const agentsMdChanged = hasAgentsMdBaseline
+		? bootstrapState.agentsMdDigest !== agentsMdSnapshot.digest
+		: legacyBootstrappedSession;
+	if (!hasAgentsMdBaseline || agentsMdChanged)
+		options.database.recordSessionAgentsBaseline(key, input.epoch, agentsMdSnapshot.digest);
+	const agentsMdSection = agentsMdChanged ? updatedAgentsMdSection(agentsMdSnapshot) : undefined;
 	let turnText = laneReport ? laneReportTriggerText(userText) : userText;
 	let contextMessageIds: readonly string[] = [];
 	let contextOmissionRevision = 0;
@@ -1990,7 +2122,7 @@ async function createInboundTurnLifecycle(
 		// A fresh session (new epoch) also gets the recent thread it is joining,
 		// not only the unread diff: without it the persona answers as if the
 		// conversation had just started.
-		const isFreshSession = !bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch;
+		const isFreshSession = bootstrapPending;
 		const recent = isFreshSession
 			? options.database.recentConversation(
 					key,
@@ -2026,18 +2158,18 @@ async function createInboundTurnLifecycle(
 		turnText = `${header}${laneReport ? laneReportTriggerText(userText) : `${speaker ? `${composeTurnHeader({ speaker, place, authorId: engagement?.authorId, messageId: row.message_id, engagement })}\n` : ""}${userText}`}`;
 	}
 
-	const bootstrap =
-		!bootstrapState || bootstrapState.lastBootstrappedEpoch < input.epoch
-			? await buildSessionBootstrap({
-					home: runtime.config.home,
-					origin,
-					epoch: input.epoch,
-					engagement,
-					config: runtime.config,
-				})
-			: undefined;
+	const bootstrap = bootstrapPending
+		? await buildSessionBootstrap({
+				home: runtime.config.home,
+				origin,
+				epoch: input.epoch,
+				engagement,
+				config: runtime.config,
+			})
+		: undefined;
 	const systemPreamble = [
 		await runtime.persona.systemPreamble(),
+		...(agentsMdSection ? [agentsMdSection] : []),
 		currentConversationNotice(origin),
 		...(bootstrap ? [bootstrap.text] : []),
 		ATTACHMENT_SCOPE_NOTICE,
@@ -2066,6 +2198,9 @@ async function createInboundTurnLifecycle(
 	let assistantDeliveryStarted = false;
 	let reactionTokensSeen = false;
 	const maxTurnParts = 10;
+	// Mid-work speech gate (issue #71/#351): holds back pure procedural narration and
+	// near-repeats; count/pacing limits apply only when configured.
+	const interimSpeech = new InterimSpeechGate(options.interimSpeech);
 	/**
 	 * Raw messages whose reaction tokens have already been claimed this turn. The
 	 * terminal path re-runs over text the tail already shipped as interim (to
@@ -2086,8 +2221,85 @@ async function createInboundTurnLifecycle(
 		}
 		return verdict;
 	};
+	/**
+	 * Delivers one line into THIS conversation under the trigger's terminal slot,
+	 * so a replayed or reconciled answer can never post it twice.
+	 */
+	const deliverTerminalLine = (text: string) => {
+		const deliveryId = deterministicTerminalDeliveryId(key, input.turn.triggerMessageId, 0);
+		if (options.database.inboundTurnClaimTerminal(input.turn.opRef, 0, deliveryId) !== deliveryId) return;
+		const payload = runtime.delivery.prepare(crypto.randomUUID(), origin, text, undefined, deliveryId);
+		if (!payload) return;
+		deliveredParts.push(text);
+		assistantDeliveryStarted = true;
+		broadcastDelivery(runtime, payload);
+	};
+	/**
+	 * A `[HANDOFF:<target>]` answer (#72): the target conversation's session gets
+	 * one durable, relayed inbound row and answers there; this conversation gets
+	 * a pointer. Anything that cannot be handed off is said here, and nothing runs.
+	 */
+	const handOff = async (handoff: HandoffReply) => {
+		const resolved = resolveHandoffTarget(handoff.target, runtime.config);
+		const hop = resolved.ok
+			? extendHandoffChain(incomingHandoff?.chain ?? [], key, resolved.originKey)
+			: { ok: false as const, reason: resolved.reason };
+		if (!hop.ok || !resolved.ok) {
+			const reason = hop.ok ? "unresolvable target" : hop.reason;
+			console.error(`gateway handoff refused origin=${key} target=${safeDiagnosticField(handoff.target)}: ${reason}`);
+			deliverTerminalLine(renderHandoffFailure(handoff.target, reason));
+			return;
+		}
+		const sourceMessageId = editedMessageId(row.message_id) ?? row.message_id;
+		const provenance: HandoffProvenance = {
+			chain: hop.chain,
+			sourceOriginKey: key,
+			sourceMessageId,
+			...(incomingHandoff
+				? {
+						...(incomingHandoff.requesterId ? { requesterId: incomingHandoff.requesterId } : {}),
+						...(incomingHandoff.requesterName ? { requesterName: incomingHandoff.requesterName } : {}),
+					}
+				: {
+						...(engagement?.authorId ? { requesterId: engagement.authorId } : {}),
+						...(speaker ? { requesterName: speaker } : {}),
+					}),
+			at: row.received_at,
+		};
+		const digest = buildHandoffDigest(
+			options.database.recentConversation(
+				key,
+				origin.conversationId,
+				RECENT_HISTORY_MAX,
+				new Date(Date.now() - RECENT_HISTORY_WINDOW_MS).toISOString(),
+			),
+		);
+		// No author identity on the relayed row: nobody in the target conversation
+		// sent it, so it must not read (or authorise) as the requester speaking there.
+		const accepted = options.database.inboundEnqueue({
+			messageId: handoffMessageId(key, sourceMessageId, resolved.originKey),
+			originKey: resolved.originKey,
+			originRefJson: JSON.stringify(resolved.origin),
+			body: renderHandoffTurn({ provenance, sourcePlace: place, note: handoff.note, digest }),
+			engagementJson: JSON.stringify({ mentioned: false, group: resolved.origin.kind !== "dm", handoff: provenance }),
+		});
+		if (accepted) {
+			console.error(`gateway handoff enqueued origin=${key} target=${resolved.originKey} chain=${hop.chain.length}`);
+			// Not awaited: the target actor runs its own turn under its own serialization.
+			void runtime.personaSessions
+				.notifyInbound(resolved.originKey)
+				.catch((error) => console.error(`gateway handoff dispatch deferred to recovery: ${diagnostic(error)}`));
+		}
+		deliverTerminalLine(renderHandoffPointer(handoff.target));
+	};
 	const deliverAssistantText = async (rawMessage: string, source: "interim" | "terminal") => {
 		if (!nonLoopback) return;
+		const handoff = parseHandoffReply(rawMessage);
+		if (handoff) {
+			// The work itself never posts here; only the final answer hands off.
+			if (source === "terminal") await handOff(handoff);
+			return;
+		}
 		let message = rawMessage;
 		// A leading silence marker followed only by a reaction directive is still
 		// control-only, even though the reaction parser expects the directive first.
@@ -2111,7 +2323,7 @@ async function createInboundTurnLifecycle(
 			reactionTokensSeen = true;
 			for (const wanted of reactionReply.reactions) {
 				if (!platformSupportsReaction(origin.platform, wanted.emojiName)) {
-					console.error(
+					console.warn(
 						`gateway reaction skipped for ${key}: ${origin.platform} cannot react with ${wanted.emoji} (${wanted.emojiName})`,
 					);
 					continue;
@@ -2308,7 +2520,9 @@ async function createInboundTurnLifecycle(
 				outputTokens: lastKnown.outputTokens + Math.ceil(frame.assistantText.length / 4),
 			};
 			try {
-				await deliverAssistantText(frame.assistantText, "interim");
+				const decision = interimSpeech.admit(frame.assistantText, Date.now());
+				if (decision.deliver) await deliverAssistantText(frame.assistantText, "interim");
+				else console.error(`gateway mid-work speech suppressed (${turnId}, ${decision.reason}).`);
 			} catch (error) {
 				console.error(`gateway intermediate delivery failed (${turnId}): ${diagnostic(error)}`);
 			}
@@ -2775,6 +2989,11 @@ export function currentConversationNotice(origin: OriginRef): string {
 		...(isChatPlatform(origin.platform)
 			? [
 					"Threaded replies: start a reply part with [REPLY:<message id>] to answer that specific message; the token is routing metadata and never appears in the delivered text. Message ids are in each incoming message header (msg:<id>). When the message you are answering is itself inside a thread, target the thread's parent message id so your answer lands in that thread instead of the conversation root.",
+				]
+			: []),
+		...(isChatPlatform(origin.platform)
+			? [
+					"Handoffs: when the work belongs to another conversation, make the FIRST line of your final reply [HANDOFF:<target>] (a configured handoff alias or an origin such as discord:<channel id>) and write below it what that conversation's session needs to know and do. That session answers there; this conversation only gets a pointer. A handoff grants the other session nothing it does not already have, chains stop after 2 hops, and a target already in the chain is refused.",
 				]
 			: []),
 		// The third reply mode: acknowledge without speaking. Kept next to the silence

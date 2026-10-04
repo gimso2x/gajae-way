@@ -33,6 +33,7 @@ import {
 	type LaneReportRow,
 	type WorkAttemptAdmission,
 	type WorkAttemptRuntime,
+	type WorkAttemptSettleResult,
 	type WorkAttemptTerminalEvidence,
 	type WorkParent,
 	type WorkReportRoot,
@@ -40,9 +41,9 @@ import {
 	workAttemptReportId,
 } from "../store/db";
 import { readFailedTransportCause } from "./failed-turn-evidence";
-import { type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
+import { type LaneForceRetireReason, type LaneGovernor, laneJobIdentity, workSessionKey } from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
-import type { SessionPort } from "./session-port";
+import { isSessionUnavailable, type SessionPort } from "./session-port";
 import type { TailHandle } from "./tail-runner";
 
 const owners = new WeakSet<GatewayDatabase>();
@@ -64,9 +65,13 @@ const reasons = new Set([
 	"terminal_uncertain",
 	"session_dead",
 	"session_disowned",
+	"host_lost",
 	"recovery_indeterminate",
 	"output_unavailable",
 ]);
+/** Minimum spacing between streamed-frame activity writes for one attempt. */
+const ACTIVITY_TOUCH_MS = 1_000;
+const HOST_LOST_GRACE_MS = 30_000;
 const refusalCodes = new Set([
 	"busy",
 	"steer_refused",
@@ -87,6 +92,19 @@ const pendingOutput = () => ({
 function hasAcceptanceEvidence(runtime: WorkAttemptRuntime): boolean {
 	return runtime.sendPhase === "accepted" || runtime.output.proof !== null || runtime.output.knownSilence !== null;
 }
+function workAttemptEndState(
+	reason: string,
+): "completed" | "terminal_missing_receipt" | "terminal_uncertain" | "failed" | "attempt_ended" {
+	return reason === "end_turn"
+		? "completed"
+		: reason === "terminal_missing_receipt"
+			? "terminal_missing_receipt"
+			: ["terminal_uncertain", "session_dead", "session_disowned", "recovery_indeterminate"].includes(reason)
+				? "terminal_uncertain"
+				: ["sdk_failed", "send_rejected"].includes(reason)
+					? "failed"
+					: "attempt_ended";
+}
 interface Observer {
 	readonly runtime: WorkAttemptRuntime;
 	readonly generation: number;
@@ -96,7 +114,11 @@ interface Observer {
 	attaching?: Promise<void>;
 	task?: Promise<void>;
 	timer?: ReturnType<typeof setTimeout>;
+	wakeRequested?: boolean;
 	text?: string;
+	touchedAt?: number;
+	/** First of an unbroken run of host-gone verdicts; any other observation resets it. */
+	goneSince?: number;
 }
 interface Waiter {
 	readonly owner: object;
@@ -114,6 +136,8 @@ export interface WorkLaneManagerOptions {
 	readonly brokerGeneration?: () => number;
 	readonly pollMs?: number;
 	readonly waitTimeoutMs?: number;
+	/** How long consecutive host-gone verdicts must persist before a live observer settles `host_lost`. */
+	readonly hostLostGraceMs?: number;
 	readonly now?: () => number;
 }
 interface WorkInput {
@@ -151,6 +175,9 @@ export class WorkLaneManager {
 		this.#db = options.database;
 		this.#port = options.port;
 		options.lanes.setRecoveryGate(() => this.recover());
+		options.lanes.setForceRetireSettlement((name, opRef, reason, endedAt) =>
+			this.settleForceRetiredAttempt(name, opRef, reason, endedAt),
+		);
 	}
 	#now(): number {
 		return this.#options.now?.() ?? Date.now();
@@ -219,6 +246,121 @@ export class WorkLaneManager {
 			if (error instanceof ProtocolError) throw error;
 			throw new ProtocolError("verb_failed", "work lane state unavailable", { reasonCode: "lane_state_corrupt", name });
 		}
+	}
+	/**
+	 * Closes a dead lane's current attempt through the normal atomic settlement
+	 * path. LaneGovernor calls this while it owns the lane mutation lock.
+	 */
+	settleForceRetiredAttempt(name: string, opRef: string, reason: LaneForceRetireReason, endedAt: string): boolean {
+		const record = this.#job(name, true);
+		if (!record) return false;
+		const attempt = record.attempts.at(-1);
+		if (!attempt || attempt.opRef !== opRef) return false;
+		const runtime = this.#db.workAttemptGet(opRef);
+		if (!runtime) return false;
+		if (runtime.settledAt !== null) return attempt.endedAt === runtime.settledAt;
+		if (attempt.endedAt !== undefined) return false;
+
+		const recordedTerminal = runtime.terminal;
+		const terminal: WorkAttemptTerminalEvidence = recordedTerminal ?? {
+			kind: "local",
+			observedAt: endedAt,
+			reasonCode: reason,
+		};
+		const endState = recordedTerminal ? workAttemptEndState(terminal.reasonCode) : "attempt_ended";
+		const errorCode = recordedTerminal
+			? terminal.reasonCode === "end_turn"
+				? undefined
+				: terminal.reasonCode
+			: "host_lost";
+		const output =
+			runtime.output.disposition === "pending"
+				? { ...runtime.output, disposition: "unavailable" as const, nextReadAt: null }
+				: runtime.output;
+		const closed = closeAttempt({
+			record,
+			opRef,
+			endState,
+			errorCode,
+			endedAt,
+		});
+		const text = reportText(name, endState, terminal.reasonCode, opRef, output);
+		let decision: "report" | "suppressed" | "no_target" | "wake_unaccepted";
+		let admission: WorkAttemptAdmission | undefined;
+		if (runtime.wakeReportId !== null && !hasAcceptanceEvidence(runtime)) {
+			decision = "wake_unaccepted";
+		} else if (runtime.output.knownSilence !== null) {
+			decision = "suppressed";
+		} else if (runtime.parent === null) {
+			decision = "no_target";
+		} else {
+			decision = "report";
+			if (runtime.parent.kind === "persona") {
+				const fallbackPayload = buildDeliveryPayload(runtime.opRef, runtime.parent.origin, text, runtime.deliveryId);
+				if (!fallbackPayload) return false;
+				const holdReason = this.#options.personaHold?.(runtime.parent.originKey);
+				admission = {
+					kind: "persona",
+					row: {
+						messageId: runtime.reportId,
+						originKey: runtime.parent.originKey,
+						originRefJson: JSON.stringify(runtime.parent.origin),
+						body: text,
+						receivedAt: endedAt,
+					},
+					fallbackPayload,
+					...(holdReason ? { holdReason } : {}),
+				};
+			} else {
+				const root = runtime.parent.root;
+				admission = {
+					kind: "lane",
+					report: {
+						reportId: runtime.reportId,
+						parentName: runtime.parent.name,
+						childName: name,
+						childOpRef: runtime.opRef,
+						body: text,
+						root,
+					},
+					fallbackPayload: root
+						? (buildDeliveryPayload(runtime.opRef, root.origin, text, runtime.deliveryId) ?? null)
+						: null,
+				};
+			}
+		}
+		const settled: WorkAttemptSettleResult | undefined = this.#db.workAttemptSettle(
+			opRef,
+			runtime.version,
+			closed,
+			{ decision, settledAt: endedAt, terminal, ...(output !== runtime.output ? { output } : {}) },
+			admission,
+		);
+		if (!settled) return false;
+		this.#finishWaiters(opRef);
+		for (const payload of [settled.fallbackPayload, settled.childFallback]) {
+			if (!payload) continue;
+			try {
+				this.#options.deliverFallback?.(payload);
+			} catch {
+				console.error(`work_fallback_delivery_failed deliveryId=${payload.deliveryId}`);
+			}
+		}
+		if (settled.runtime.decision === "reported" && settled.runtime.parent?.kind === "persona") {
+			try {
+				this.#options.notifyPersona?.(settled.runtime.parent.originKey);
+			} catch {
+				console.error(`work_persona_nudge_failed origin=${settled.runtime.parent.originKey}`);
+			}
+		}
+		const parents = new Set([name]);
+		if (settled.runtime.parent?.kind === "lane") parents.add(settled.runtime.parent.name);
+		for (const parentName of parents) {
+			void this.#drainLaneReports(parentName).catch(() => {
+				console.error(`lane_report_drain_failed parent=${parentName}`);
+			});
+		}
+		return true;
 	}
 	#assertNotQuarantined(jobId: string, name?: string): void {
 		if (this.#db.isBrokerQuarantined("work", jobId))
@@ -520,8 +662,10 @@ export class WorkLaneManager {
 					sessionId: attempt.sessionId,
 					cwd: job.lane.worktreePath,
 				});
-			} catch {
-				throw workError("work status unavailable", "status_unavailable", { ...attempt, jobId: job.jobId });
+			} catch (error) {
+				// A settled attempt whose host is gone has no live op to report.
+				if (attempt.endedAt === undefined || !isSessionUnavailable(error))
+					throw workError("work status unavailable", "status_unavailable", { ...attempt, jobId: job.jobId });
 			}
 			const current = this.#db.getSessionRecord(key);
 			if (current?.sessionId !== binding.sessionId || current.epoch !== binding.epoch) op = null;
@@ -585,7 +729,12 @@ export class WorkLaneManager {
 	}
 	async #query(runtime: { jobId: string; sessionId: string; cwd: string; opRef: string }): Promise<PromptStatusBody> {
 		this.#assertNotQuarantined(runtime.jobId);
-		const report = await this.#port.status({ sessionId: runtime.sessionId, repo: runtime.cwd, opRef: runtime.opRef });
+		const report = await this.#port.status({
+			sessionId: runtime.sessionId,
+			repo: runtime.cwd,
+			opRef: runtime.opRef,
+			priority: "background",
+		});
 		if (
 			report.operationRef !== runtime.opRef ||
 			!report.status ||
@@ -609,7 +758,16 @@ export class WorkLaneManager {
 		return observer;
 	}
 	#schedule(observer: Observer, delay: number): void {
-		if (!this.#current(observer) || observer.timer || observer.task) return;
+		if (!this.#current(observer)) return;
+		if (observer.task) {
+			if (delay === 0) observer.wakeRequested = true;
+			return;
+		}
+		if (observer.timer) {
+			if (delay !== 0) return;
+			clearTimeout(observer.timer);
+			observer.timer = undefined;
+		}
 		const opRef = observer.runtime.opRef;
 		observer.timer = setTimeout(() => {
 			observer.timer = undefined;
@@ -635,8 +793,18 @@ export class WorkLaneManager {
 					const failures = this.#failures.get(opRef)?.failures ?? 0;
 					if (failures > 0 && failures % FAILURES_PER_READOPTION === 0)
 						return this.#readopt(observer, "reconciliation_unavailable");
+					if (observer.wakeRequested) {
+						observer.wakeRequested = false;
+						return this.#schedule(observer, 0);
+					}
 					const pollMs = this.#options.pollMs ?? 250;
-					this.#schedule(observer, failures ? Math.min(pollMs * 2 ** (failures - 1), MAX_FAILURE_BACKOFF_MS) : pollMs);
+					// When a tail is attached, frames wake the observer; use a slow fallback
+					// cadence instead of polling every 250ms.
+					const basePollMs = observer.tail && !this.#options.pollMs ? 5_000 : pollMs;
+					this.#schedule(
+						observer,
+						failures ? Math.min(basePollMs * 2 ** (failures - 1), MAX_FAILURE_BACKOFF_MS) : basePollMs,
+					);
 				});
 		}, delay);
 	}
@@ -687,7 +855,9 @@ export class WorkLaneManager {
 				repo: runtime.cwd,
 				originKey: runtime.sessionKey,
 				onFrame: () => {
-					if (this.#writeCurrent(observer)) this.#schedule(observer, 0);
+					if (!this.#writeCurrent(observer)) return;
+					this.#schedule(observer, 0);
+					this.#touch(observer);
 				},
 			});
 			if (!this.#writeCurrent(observer)) {
@@ -710,19 +880,65 @@ export class WorkLaneManager {
 				observer.attaching = undefined;
 			});
 	}
+	/**
+	 * Streamed turn frames are the attempt's activity: `work jobs` `last=` must
+	 * show when the worker last did something, not when the attempt started, so
+	 * a stalled lane is visible. Throttled; the write is fenced to the binding.
+	 */
+	#touch(observer: Observer): void {
+		const now = this.#now();
+		if (observer.touchedAt !== undefined && now - observer.touchedAt < ACTIVITY_TOUCH_MS) return;
+		observer.touchedAt = now;
+		try {
+			this.#db.workAttemptActivity(observer.runtime.opRef, new Date(now).toISOString());
+		} catch {
+			console.error(`work activity update unavailable opRef=${observer.runtime.opRef}`);
+		}
+	}
+	/**
+	 * Positive evidence that the attempt's host is gone: the SDK router already
+	 * answered `session_unavailable` for the operation, and an independent
+	 * inspect confirms the id is disowned or not live. Broker unavailability
+	 * yields neither and never settles an attempt.
+	 */
+	async #hostGone(runtime: { sessionId: string; cwd: string }, statusError: unknown): Promise<boolean> {
+		if (!isSessionUnavailable(statusError) || !this.#port.liveness) return false;
+		try {
+			const live = await this.#port.liveness({ sessionId: runtime.sessionId, repo: runtime.cwd });
+			return live.disowned || live.live === false;
+		} catch {
+			return false;
+		}
+	}
 	async #tick(observer: Observer): Promise<void> {
 		if (!this.#writeCurrent(observer)) return;
 		let runtime = this.#db.workAttemptGet(observer.runtime.opRef)!;
 		if (runtime.settledAt) return;
 		if (!runtime.terminal) {
 			this.#attach(observer);
-			const status = await this.#query(runtime);
+			let status: PromptStatusBody | undefined;
+			try {
+				status = await this.#query(runtime);
+				observer.goneSince = undefined;
+			} catch (error) {
+				if (!(await this.#hostGone(runtime, error))) {
+					observer.goneSince = undefined;
+					throw error;
+				}
+				// A router that is still re-indexing hosts (e.g. just restarted) may
+				// briefly disown a live one: require the verdict to persist.
+				observer.goneSince ??= this.#now();
+				if (this.#now() - observer.goneSince < (this.#options.hostLostGraceMs ?? HOST_LOST_GRACE_MS)) return;
+			}
 			if (!this.#writeCurrent(observer)) return;
-			if (status.status === "unknown") return;
-			const terminal = terminalEvidence(status, this.#at());
+			if (status?.status === "unknown") return;
+			if (!status) console.error(`work_host_lost opRef=${runtime.opRef} session=${runtime.sessionId} source=observer`);
+			const terminal = status
+				? terminalEvidence(status, this.#at())
+				: { kind: "local" as const, observedAt: this.#at(), reasonCode: "host_lost" };
 			runtime =
 				this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {
-					...(provesAcceptance(status)
+					...(status && provesAcceptance(status)
 						? {
 								sendPhase: "accepted" as const,
 								sendEvidence: runtime.sendEvidence ?? { source: "status" as const, observedAt: this.#at() },
@@ -766,6 +982,7 @@ export class WorkLaneManager {
 						terminalIdentity: runtime.terminal?.status,
 						signal: observer.abort.signal,
 						isCurrent: () => this.#writeCurrent(observer),
+						...(observer.tail ? { relay: observer.tail } : {}),
 					})
 					.catch(() => ({ status: "absent" as const, code: "transport_error" as const }));
 				if (!this.#writeCurrent(observer)) return;
@@ -852,16 +1069,7 @@ export class WorkLaneManager {
 					console.error(`work_transport_cause_read_error opRef=${runtime.opRef} reason=${failureReason(error)}`);
 				}
 			}
-			const endState =
-				reason === "end_turn"
-					? "completed"
-					: reason === "terminal_missing_receipt"
-						? "terminal_missing_receipt"
-						: ["terminal_uncertain", "session_dead", "session_disowned", "recovery_indeterminate"].includes(reason)
-							? "terminal_uncertain"
-							: ["sdk_failed", "send_rejected"].includes(reason)
-								? "failed"
-								: "attempt_ended";
+			const endState = workAttemptEndState(reason);
 			let job = closeAttempt({
 				record: this.#job(name, true)!,
 				opRef: runtime.opRef,
@@ -935,7 +1143,7 @@ export class WorkLaneManager {
 				admission,
 			);
 			if (!settled) return undefined;
-			for (const waiter of [...(this.#waiters.get(runtime.opRef) ?? [])]) waiter.finish();
+			this.#finishWaiters(runtime.opRef);
 			return settled;
 		});
 
@@ -994,6 +1202,9 @@ export class WorkLaneManager {
 			await observer.tail?.close();
 			observer.tail = undefined;
 		}
+	}
+	#finishWaiters(opRef: string): void {
+		for (const waiter of [...(this.#waiters.get(opRef) ?? [])]) waiter.finish();
 	}
 	async #drainLaneReports(parentName: string): Promise<void> {
 		if (this.#stopped) return;
@@ -1273,10 +1484,17 @@ export class WorkLaneManager {
 		}
 		let after = "";
 		while (!this.#stopped) {
-			const rows = this.#db.workAttemptOpen(100, after);
-			if (!rows.length) break;
+			let invalidAfter = after;
+			const rows = this.#db.workAttemptOpen(100, after, (error) => {
+				if (error.opRef && error.opRef > invalidAfter) invalidAfter = error.opRef;
+				console.error(
+					`work_recovery_invalid_attempt opRef=${JSON.stringify(error.opRef)} assertion=${error.assertion}`,
+				);
+			});
+			const lastValid = rows.at(-1)?.opRef ?? after;
+			const nextAfter = invalidAfter > lastValid ? invalidAfter : lastValid;
+			if (!rows.length && nextAfter === after) break;
 			for (const runtime of rows) {
-				after = runtime.opRef;
 				const prior = this.#observers.get(runtime.opRef);
 				if (prior && this.#writeCurrent(prior)) continue;
 				if (prior) {
@@ -1293,10 +1511,12 @@ export class WorkLaneManager {
 					continue;
 				}
 				let status: PromptStatusBody | undefined;
+				let statusError: unknown;
 				try {
 					status = await this.#query(runtime);
-				} catch {
+				} catch (error) {
 					/* Liveness decides whether authority can be recovered. */
+					statusError = error;
 				}
 				if (!this.#current(observer)) continue;
 				const terminal = status && terminalEvidence(status, this.#at());
@@ -1326,12 +1546,18 @@ export class WorkLaneManager {
 					continue;
 				}
 				if (this.#writeCurrent(observer)) {
+					// The router itself answered session_unavailable for the operation
+					// and inspect agrees: the host died with the attempt open.
+					const hostLost = isSessionUnavailable(statusError) && (live.disowned || live.live === false);
+					if (hostLost)
+						console.error(`work_host_lost opRef=${runtime.opRef} session=${runtime.sessionId} source=recovery`);
 					this.#db.workAttemptUpdate(runtime.opRef, runtime.version, {
 						terminal: {
 							kind: "local",
 							observedAt: this.#at(),
-							reasonCode:
-								live.disowned || !this.#binding(runtime)
+							reasonCode: hostLost
+								? "host_lost"
+								: live.disowned || !this.#binding(runtime)
 									? "session_disowned"
 									: live.live === false
 										? "session_dead"
@@ -1341,6 +1567,7 @@ export class WorkLaneManager {
 					this.#schedule(observer, 0);
 				}
 			}
+			after = nextAfter;
 		}
 		if (this.#stopped) return;
 		const parents = new Set([

@@ -10,6 +10,19 @@ import type { ReactionAction, ReactionRef } from "./reactions";
  * delivery settlement verbs, and redelivery labeling on chat.message.
  */
 
+/**
+ * Allowlisted classification of a failed delivery attempt. Adapter failure
+ * reasons are free text (platform bodies, credentials); only this code is kept.
+ */
+export type DeliveryErrorCode =
+	| "rate_limited"
+	| "timeout"
+	| "network"
+	| "not_found"
+	| "forbidden"
+	| "invalid_request"
+	| "other";
+
 export interface GatewayStatusResult {
 	readonly profileVersion: string;
 	readonly capabilities: readonly string[];
@@ -28,6 +41,17 @@ export interface GatewayStatusResult {
 			readonly originKey: string;
 			readonly attempts: number;
 			readonly expiredAt: string;
+			readonly lastError: DeliveryErrorCode | null;
+		}[];
+		/** The five oldest unsettled rows with their retry diagnostics (metadata only). */
+		readonly recentPending: readonly {
+			readonly deliveryId: string;
+			readonly originKey: string;
+			readonly state: "pending" | "inflight" | "failed_ambiguous";
+			readonly attempts: number;
+			readonly lastError: DeliveryErrorCode | null;
+			readonly nextRetryAt: string | null;
+			readonly createdAt: string;
 		}[];
 	};
 	/** Aggregate-only conversation diff health; never includes message bodies. */
@@ -403,12 +427,13 @@ export interface MemorySearchResult {
  * at creation, never inferred; unknown types route to the catch-all session.
  */
 export type TriggerSpec =
-	| { readonly kind: "cron"; readonly schedule: string }
+	| { readonly kind: "cron"; readonly schedule: string; readonly timezone?: string }
 	| { readonly kind: "webhook"; readonly route: string }
 	| { readonly kind: "watcher"; readonly root: string; readonly debounceMs?: number }
 	| { readonly kind: "script"; readonly command: readonly string[]; readonly intervalMs: number };
 
 export type BurstPolicyKind = "coalesce" | "dedupe" | "serialize" | "drop";
+export type MonitorOverlapPolicy = "queue" | "skip";
 export type MonitorModelSelection = string | { readonly preset: string };
 export type MonitorServiceTier =
 	| "none"
@@ -441,6 +466,14 @@ export interface MonitorSpec {
 	readonly eventTypes: readonly string[];
 	/** Burst policy; coalesce when unspecified (spec fact 12). */
 	readonly burstPolicy?: BurstPolicyKind;
+	/**
+	 * What a new fire does while an earlier event of the same monitor is still
+	 * awaiting authoring (admitted, batched, dispatched or failed-and-retrying).
+	 * `queue` (default) admits it behind the predecessor; `skip` records it as
+	 * the terminal stage `skipped` and never authors it, so a monitor slower
+	 * than its own cadence cannot stack stale reports (issue #83).
+	 */
+	readonly overlap?: MonitorOverlapPolicy;
 	/** Channel target for authored output: at most one (spec fact 7). */
 	readonly channelTarget?: MonitorChannelTarget | null;
 	/**
@@ -450,6 +483,13 @@ export interface MonitorSpec {
 	 * response contract is unaffected.
 	 */
 	readonly instruction?: string;
+	/**
+	 * Procedure/doctrine files this monitor follows, relative to the session
+	 * workspace (`memory/...` reaches the memory corpus). They are re-read on
+	 * EVERY firing and their current content is handed to the authoring turn, so
+	 * an edit reaches a long-lived event-type session on the very next firing.
+	 */
+	readonly procedureFiles?: readonly string[];
 	/** Absent means inherit the gateway default; present overrides this monitor's authoring session. */
 	readonly model?: MonitorModelSelection;
 	/** Absent means inherit the gateway default; present overrides this monitor's request tier. */
@@ -461,6 +501,7 @@ export interface MonitorRecord extends MonitorSpec {
 	readonly monitorId: string;
 	readonly createdAt: string;
 	readonly burstPolicy: BurstPolicyKind;
+	readonly overlap: MonitorOverlapPolicy;
 	readonly enabled: boolean;
 }
 
@@ -471,6 +512,37 @@ export interface MonitorUpdateParams extends Partial<Omit<MonitorSpec, "trigger"
 	/** Change the schedule while retaining the monitor's existing cron trigger. */
 	readonly schedule?: string;
 }
+export interface MonitorScheduleProjection {
+	readonly effectiveTimezone: string | null;
+	readonly nextFireAt: { readonly local: string; readonly utc: string } | null;
+}
+
+export const PROTOCOL_FAILURE_REASONS = [
+	"protocol_response_not_array",
+	"protocol_entry_missing_field",
+	"protocol_unknown_event",
+	"protocol_duplicate_event",
+	"protocol_omitted_event",
+	"protocol_unparseable_json",
+	"protocol_off_contract",
+] as const;
+export type ProtocolFailureReason = (typeof PROTOCOL_FAILURE_REASONS)[number];
+
+export interface MonitorProtocolFailureRecord {
+	readonly reason: ProtocolFailureReason;
+	readonly failedAt: string;
+	readonly responseByteLength: number;
+	/** Null when the invalid response could not be parsed as an array. */
+	readonly responseEntryCount: number | null;
+}
+
+export interface MonitorEventRecovery {
+	readonly protocolFailures: readonly MonitorProtocolFailureRecord[];
+	readonly firstFailedAt: string;
+	readonly deliveredAt: string | null;
+	readonly recoveryLatencyMs: number | null;
+	readonly dispatchAttempts: number;
+}
 
 export interface MonitorTestParams {
 	readonly monitorId: string;
@@ -478,15 +550,39 @@ export interface MonitorTestParams {
 	readonly payload?: unknown;
 }
 
+/** Cron slots refused by catch-up policy after downtime; never silently dropped (issue #157). */
+export interface MonitorCatchUpDiagnostic {
+	readonly skippedTotal: number;
+	readonly lastSkip: {
+		readonly count: number;
+		readonly oldest: string;
+		readonly newest: string;
+		readonly recordedAt: string;
+	};
+}
 export interface MonitorEventRecord {
 	readonly eventId: string;
 	readonly monitorId: string;
 	readonly eventType: string;
 	readonly firedAt: string;
 	readonly stage: string;
+	/** For a `skipped` event: the in-flight predecessor that held the monitor's slot (issue #83). */
+	readonly skippedBy?: string;
 	/** Historical authority hold; stage remains the recorded historical stage. */
 	readonly quarantined?: boolean;
 	readonly reason?: string;
+	/** Procedure file versions the authoring turn was given; present once authored with declared procedure files. */
+	readonly procedure?: readonly MonitorProcedureVersion[];
+	readonly recovery?: MonitorEventRecovery;
+}
+
+/** Version of one declared procedure file as read for one firing. */
+export interface MonitorProcedureVersion {
+	readonly path: string;
+	readonly status: "ok" | "truncated" | "missing" | "unreadable" | "too_large" | "outside_root";
+	/** sha256 of the full file bytes, when the file was read. */
+	readonly sha256?: string;
+	readonly mtime?: string;
 }
 
 /** A worker gjc session run: an isolated coding-register session doing delegated work. */
@@ -738,7 +834,10 @@ export type CycleGateReason =
 	| "monitor_authoring_lost"
 	| "lane_capacity_exhausted"
 	| "inbound_starved"
-	| "agent_disk_headroom";
+	| "agent_disk_headroom"
+	| "gjc_unverified_version"
+	| "monitor_dispatch_failing"
+	| "broker_respawn_churn";
 
 /**
  * Free space on the filesystem holding the broker-bound GJC agent directory.
@@ -851,10 +950,22 @@ export interface VerbCatalogV01 {
 	"memory.search": { params: MemorySearchParams; result: MemorySearchResult };
 	"monitor.add": { params: MonitorSpec; result: { readonly monitorId: string } };
 	"monitor.update": { params: MonitorUpdateParams; result: { readonly monitorId: string } };
-	"monitor.list": { params: undefined; result: { readonly monitors: readonly MonitorRecord[] } };
+	"monitor.list": {
+		params: undefined;
+		result: {
+			readonly monitors: readonly MonitorRecord[];
+			readonly schedules: Readonly<Record<string, MonitorScheduleProjection>>;
+		};
+	};
 	"monitor.inspect": {
 		params: { readonly monitorId: string };
-		result: { readonly monitor: MonitorRecord; readonly recentEvents: readonly MonitorEventRecord[] };
+		result: {
+			readonly monitor: MonitorRecord;
+			readonly schedule: MonitorScheduleProjection;
+			readonly recentEvents: readonly MonitorEventRecord[];
+			/** Present once a cron catch-up sweep has refused slots under its age/count policy. */
+			readonly catchUp?: MonitorCatchUpDiagnostic;
+		};
 	};
 	"monitor.test": { params: MonitorTestParams; result: { readonly eventId: string } };
 	"monitor.remove": { params: { readonly monitorId: string }; result: { readonly removed: true } };
@@ -940,9 +1051,22 @@ export function isSilenceToken(text: string): boolean {
 	return (SILENCE_TOKENS as readonly string[]).some((t) => unbracket(t).toUpperCase() === normalized);
 }
 
-/** Existing embedded marker grammar; inspect original content before clipping. */
+/**
+ * Markdown code: closed fenced blocks, then inline spans of any backtick run
+ * length. Text inside code is quoted, never a directive.
+ */
+const MARKDOWN_CODE = /```[\s\S]*?```|(`+)[^\n]*?\1/g;
+
+/**
+ * Existing embedded marker grammar; inspect original content before clipping.
+ *
+ * A marker inside markdown code is a quoted mention, not a directive: a reply
+ * explaining the protocol ("`[SILENT]`(답하지 않기) 같은 표시를 해석해요") is a
+ * real answer. Counting it silenced two fully written Discord replies whole
+ * (live pilot, 2026-09-29).
+ */
 export function containsSilenceToken(text: string): boolean {
-	return /\[(SILENT|silent)\]/.test(text);
+	return /\[(SILENT|silent)\]/.test(text.replace(MARKDOWN_CODE, ""));
 }
 
 /**

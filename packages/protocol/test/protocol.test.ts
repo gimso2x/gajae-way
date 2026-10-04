@@ -11,6 +11,7 @@ import {
 	isSilentOutput,
 	LOOPBACK_ORIGIN,
 	MAX_FRAME_BYTES,
+	monitorSessionOrigin,
 	negotiate,
 	originKey,
 	PROFILE_VERSION,
@@ -119,6 +120,14 @@ describe("origin normalization", () => {
 		).toThrow();
 	});
 
+	test("monitor session origins are scoped by monitor id and round-trip", () => {
+		const key = originKey(monitorSessionOrigin("m-1", "backlog.watch"));
+		expect(key).toBe("monitor/eventtype/backlog.watch/parent=m-1");
+		expect(key).not.toBe(originKey(monitorSessionOrigin("m-2", "backlog.watch")));
+		expect(parseOriginKey(key)).toEqual(monitorSessionOrigin("m-1", "backlog.watch"));
+		expect(() => originKey(monitorSessionOrigin("bad/id", "backlog.watch"))).toThrow();
+	});
+
 	test("thread requires parentId", () => {
 		expect(() => validateOriginRef({ platform: "telegram", kind: "topic", conversationId: "c1" })).toThrow();
 	});
@@ -211,6 +220,29 @@ describe("silence tokens", () => {
 	for (const text of ["ordinary text", "preamble SILENT", "preamble [NO_REPLY]", "preamble [ SILENT ]"]) {
 		test(`does not broaden embedded grammar for ${JSON.stringify(text)}`, () => {
 			expect(containsSilenceToken(text)).toBe(false);
+		});
+	}
+
+	for (const text of [
+		"- **답장 표시**: 👀 리액션, `[SILENT]`(답하지 않기) 같은 표시를 해석해요.",
+		"quoted ``[SILENT]`` with a double-backtick span",
+		"flow\n```\nadapter ⇄ [SILENT] ⇄ session\n```\nend",
+		"inline `[silent]` lowercase",
+	]) {
+		test(`a marker inside markdown code is quoted, not a directive: ${JSON.stringify(text)}`, () => {
+			expect(containsSilenceToken(text)).toBe(false);
+			expect(isSilentOutput(text)).toBe(false);
+		});
+	}
+
+	for (const text of [
+		"explains `[SILENT]` in code, then opts out.\n\n[SILENT]",
+		"```\ncode\n```\n[SILENT]",
+		"unclosed ```\n[SILENT]",
+		"stray ` backtick [SILENT]",
+	]) {
+		test(`a marker outside markdown code still silences: ${JSON.stringify(text)}`, () => {
+			expect(containsSilenceToken(text)).toBe(true);
 		});
 	}
 

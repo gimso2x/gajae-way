@@ -3,10 +3,12 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
 	type ChannelEngagementPolicy,
+	describeChatPlatforms,
 	ENGAGEMENT_AUDIENCES,
 	ENGAGEMENT_MODES,
 	type EngagementAudience,
 	type EngagementMode,
+	isChatPlatform,
 	type OriginRef,
 	parseRuntimeConfig as parseSharedRuntimeConfig,
 	type RuntimeConfig,
@@ -88,6 +90,8 @@ export interface GatewayConfigFile {
 	 * MONITOR_CONTEXT_FAILURE_ROLL_THRESHOLD.
 	 */
 	readonly monitorContextFailureRollThreshold?: number;
+	/** Durable cron slot replay age/count limits; omitted values use runtime defaults. */
+	readonly monitorCatchUp?: MonitorCatchUpConfig;
 	readonly webhook?: { readonly bind?: string; readonly port: number; readonly exposeNonLoopback?: boolean };
 	readonly watcherRoots?: readonly string[];
 	readonly scriptRoot?: string;
@@ -96,6 +100,32 @@ export interface GatewayConfigFile {
 	readonly work?: WorkLaneConfig;
 	/** Global default bot-audience budget; channel entries override it field by field. */
 	readonly botAudience?: BotAudienceConfig;
+	/** Mid-work speech limits (issue #71); unset means every non-narration mid-work message ships. */
+	readonly interimSpeech?: InterimSpeechConfig;
+	/** Named `[HANDOFF:<alias>]` targets (issue #72): alias -> the chat origin whose session takes the work. */
+	readonly handoffTargets?: Readonly<Record<string, OriginRef>>;
+}
+
+export interface MonitorCatchUpConfig {
+	readonly maxSlots?: number;
+	readonly maxAgeMs?: number;
+}
+
+/** Bounds for monitorCatchUp: 1–1000 slots and 1 minute–7 days of age. */
+export const MONITOR_CATCH_UP_MAX_SLOTS = 1000;
+export const MONITOR_CATCH_UP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface InterimSpeechConfig {
+	/**
+	 * Hard cap on delivered mid-work messages within one turn; unset means no cap
+	 * beyond the turn's part budget. 0 delivers no mid-work messages at all.
+	 */
+	readonly maxPerTurn?: number;
+	/**
+	 * Minimum spacing between delivered mid-work messages in milliseconds.
+	 * The first message is never delayed.
+	 */
+	readonly minGapMs?: number;
 }
 
 export interface BotAudienceConfig {
@@ -331,6 +361,27 @@ function parseBotAudience(value: unknown): BotAudienceConfig | undefined {
 	};
 }
 
+function parseNonNegativeInteger(value: unknown, field: string): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isSafeInteger(value) || (value as number) < 0)
+		throw new ConfigError("config_invalid", `${field} must be a non-negative integer`);
+	return value as number;
+}
+
+function parseInterimSpeech(value: unknown): InterimSpeechConfig | undefined {
+	if (value === undefined) return undefined;
+	const input = requireObject(value, "interimSpeech");
+	for (const key of Object.keys(input))
+		if (key !== "maxPerTurn" && key !== "minGapMs")
+			throw new ConfigError("config_invalid", "interimSpeech contains an unknown field");
+	const maxPerTurn = parseNonNegativeInteger(input.maxPerTurn, "interimSpeech.maxPerTurn");
+	const minGapMs = parseNonNegativeInteger(input.minGapMs, "interimSpeech.minGapMs");
+	return {
+		...(maxPerTurn === undefined ? {} : { maxPerTurn }),
+		...(minGapMs === undefined ? {} : { minGapMs }),
+	};
+}
+
 function parseStallTimeout(value: unknown): number {
 	if (!Number.isInteger(value) || (value as number) < 1_000 || (value as number) > 3_600_000)
 		throw new ConfigError("config_invalid", "stallTimeoutMs must be an integer between 1000 and 3600000");
@@ -349,6 +400,27 @@ function parseOwnerTarget(value: unknown): { readonly origin: OriginRef } {
 			`ownerTarget.origin is invalid: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
+}
+
+function parseHandoffTargets(value: unknown): Readonly<Record<string, OriginRef>> {
+	const input = requireObject(value, "handoffTargets");
+	const targets: Record<string, OriginRef> = {};
+	for (const [alias, origin] of Object.entries(input)) {
+		// An alias with `/` or `:` would be shadowed by the origin-key spellings the resolver also accepts.
+		if (!/^[A-Za-z0-9_.-]{1,64}$/.test(alias))
+			throw new ConfigError("config_invalid", `handoffTargets.${alias} must be named with letters, digits, _ . or -`);
+		let parsed: OriginRef;
+		try {
+			parsed = validateOriginRef(requireObject(origin, `handoffTargets.${alias}`) as unknown as OriginRef);
+		} catch (error) {
+			if (error instanceof ConfigError) throw error;
+			throw new ConfigError("config_invalid", `handoffTargets.${alias} must be a valid origin`);
+		}
+		if (!isChatPlatform(parsed.platform))
+			throw new ConfigError("config_invalid", `handoffTargets.${alias} must be a ${describeChatPlatforms()} origin`);
+		targets[alias] = parsed;
+	}
+	return targets;
 }
 
 function parseStringArray(value: unknown, field: string): readonly string[] {
@@ -385,6 +457,36 @@ function parseMonitorContextFailureRollThreshold(value: unknown): number {
 	if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > 20)
 		throw new ConfigError("config_invalid", "monitorContextFailureRollThreshold must be an integer between 1 and 20");
 	return value as number;
+}
+
+function parseMonitorCatchUp(value: unknown): MonitorCatchUpConfig {
+	const input = requireObject(value, "monitorCatchUp");
+	if (Object.keys(input).some((key) => key !== "maxSlots" && key !== "maxAgeMs"))
+		throw new ConfigError("config_invalid", "monitorCatchUp may only contain maxSlots and maxAgeMs");
+	if (
+		input.maxSlots !== undefined &&
+		(!Number.isInteger(input.maxSlots) ||
+			(input.maxSlots as number) < 1 ||
+			(input.maxSlots as number) > MONITOR_CATCH_UP_MAX_SLOTS)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`monitorCatchUp.maxSlots must be an integer between 1 and ${MONITOR_CATCH_UP_MAX_SLOTS}`,
+		);
+	if (
+		input.maxAgeMs !== undefined &&
+		(!Number.isInteger(input.maxAgeMs) ||
+			(input.maxAgeMs as number) < 60_000 ||
+			(input.maxAgeMs as number) > MONITOR_CATCH_UP_MAX_AGE_MS)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`monitorCatchUp.maxAgeMs must be an integer between 60000 and ${MONITOR_CATCH_UP_MAX_AGE_MS}`,
+		);
+	return {
+		...(input.maxSlots === undefined ? {} : { maxSlots: input.maxSlots as number }),
+		...(input.maxAgeMs === undefined ? {} : { maxAgeMs: input.maxAgeMs as number }),
+	};
 }
 
 function parseWork(value: unknown): WorkLaneConfig {
@@ -468,6 +570,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(input.ownerTarget === undefined ? {} : { ownerTarget: parseOwnerTarget(input.ownerTarget) }),
 		...(input.work === undefined ? {} : { work: parseWork(input.work) }),
 		...(input.botAudience === undefined ? {} : { botAudience: parseBotAudience(input.botAudience) }),
+		...(input.handoffTargets === undefined ? {} : { handoffTargets: parseHandoffTargets(input.handoffTargets) }),
 		...(input.monitorContextFailureRollThreshold === undefined
 			? {}
 			: {
@@ -475,6 +578,8 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 						input.monitorContextFailureRollThreshold,
 					),
 				}),
+		...(input.monitorCatchUp === undefined ? {} : { monitorCatchUp: parseMonitorCatchUp(input.monitorCatchUp) }),
+		...(parseInterimSpeech(input.interimSpeech) ? { interimSpeech: parseInterimSpeech(input.interimSpeech) } : {}),
 	};
 }
 
@@ -575,7 +680,14 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
  * resolved per inbound message) and `stallTimeoutMs` (tail liveness alarms). Each
  * applies to the next actor event.
  */
-export const RELOADABLE_FIELDS = ["mentionAllowlist", "channels", "stallTimeoutMs", "dmPolicy", "botAudience"] as const;
+export const RELOADABLE_FIELDS = [
+	"mentionAllowlist",
+	"channels",
+	"stallTimeoutMs",
+	"dmPolicy",
+	"botAudience",
+	"handoffTargets",
+] as const;
 
 /** Fields bound to live startup resources and therefore changeable only by restart. */
 export const RESTART_REQUIRED_FIELDS = [
@@ -590,7 +702,9 @@ export const RESTART_REQUIRED_FIELDS = [
 	"runtime",
 	"ownerTarget",
 	"monitorContextFailureRollThreshold",
+	"monitorCatchUp",
 	"work",
+	"interimSpeech",
 ] as const;
 
 /**

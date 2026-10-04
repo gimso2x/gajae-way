@@ -5,8 +5,12 @@ import { dirname, isAbsolute, normalize } from "node:path";
 import {
 	type ChatMessagePayload,
 	isSilentOutput,
+	type MonitorEventRecovery,
+	type MonitorProtocolFailureRecord,
 	type OriginRef,
 	originKey,
+	PROTOCOL_FAILURE_REASONS,
+	type ProtocolFailureReason,
 	parseOriginKey,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
@@ -62,6 +66,22 @@ function brokerAuthorityKey(authority: BrokerAuthority): string {
 		throw new BrokerAuthorityError("invalid_authority");
 	return JSON.stringify([authority.canonicalAgentDir, authority.identity]);
 }
+
+/** Durable cron catch-up diagnostics for one monitor (issue #157), stored in `meta`. */
+export interface MonitorCronState {
+	/** Newest slot refused under policy; the cursor never re-considers it. */
+	readonly cursor: string;
+	/** Slots refused under policy over the monitor's lifetime. */
+	readonly skippedTotal: number;
+	readonly lastSkip: {
+		readonly count: number;
+		readonly oldest: string;
+		readonly newest: string;
+		readonly recordedAt: string;
+	};
+}
+
+const monitorCronMetaKey = (monitorId: string) => `monitor_cron:${monitorId}`;
 
 const BROKER_SNAPSHOT_TABLES = [
 	"sessions",
@@ -229,9 +249,15 @@ export interface LaneReportRow {
 	readonly updated_at: string;
 }
 export class WorkAttemptStateError extends Error {
-	constructor() {
-		super("work lane state unavailable");
+	readonly opRef: string | undefined;
+	readonly assertion: string;
+	constructor(opRef?: string, assertion = "work attempt payload validation") {
+		super(
+			`work lane state unavailable${opRef === undefined ? "" : ` opRef=${JSON.stringify(opRef)}`} assertion=${assertion}`,
+		);
 		this.name = "WorkAttemptStateError";
+		this.opRef = opRef;
+		this.assertion = assertion;
 	}
 }
 
@@ -292,11 +318,12 @@ const WORK_REASON_CODES = new Set([
 	"terminal_uncertain",
 	"session_dead",
 	"session_disowned",
+	"host_lost",
 	"recovery_indeterminate",
 	"output_unavailable",
 ]);
-function workAssert(condition: unknown): asserts condition {
-	if (!condition) throw new WorkAttemptStateError();
+function workAssert(condition: unknown, assertion = "work attempt payload validation"): asserts condition {
+	if (!condition) throw new WorkAttemptStateError(undefined, assertion);
 }
 function workTime(value: unknown): boolean {
 	return typeof value === "string" && value.length <= 40 && Number.isFinite(Date.parse(value));
@@ -569,7 +596,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 24;
+const LATEST_SCHEMA_VERSION = 29;
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
 /** Maximum age of prior messages supplied to one engaged conversation turn. */
@@ -637,6 +664,13 @@ export interface MonitorFailureRow {
 	readonly code: string;
 	readonly detail: string;
 	readonly failed_at: string;
+	readonly protocol_reason: ProtocolFailureReason | null;
+	readonly response_byte_length: number | null;
+	readonly response_entry_count: number | null;
+}
+
+interface MonitorFailureOptions {
+	readonly protocolFailure?: Pick<MonitorProtocolFailureRecord, "reason" | "responseByteLength" | "responseEntryCount">;
 }
 
 export class DatabaseStartupError extends Error {
@@ -668,6 +702,9 @@ export class DatabaseStartupError extends Error {
  * - failed: the last dispatch attempt failed; reconcile redispatches.
  * - failed_no_retry: dispatch failed and reconcile will not retry it again
  *   (reclaim budget exhausted); operator-visible terminal state.
+ * - skipped: terminal — the monitor's overlap policy is `skip` and an earlier
+ *   event of the same monitor was still awaiting authoring when this one
+ *   fired (`skipped_by` names it). A scheduling outcome, never a failure.
  */
 export const MONITOR_EVENT_STAGES = [
 	"admitted",
@@ -678,12 +715,25 @@ export const MONITOR_EVENT_STAGES = [
 	"authored_no_delivery",
 	"failed",
 	"failed_no_retry",
+	"skipped",
 ] as const;
 export type MonitorEventStage = (typeof MONITOR_EVENT_STAGES)[number];
 /** Stages whose rows reconcile() may claim and redispatch. */
 export const RECONCILABLE_STAGES: readonly MonitorEventStage[] = ["admitted", "batched", "dispatched", "failed"];
 /** Terminal stages: no further transition will ever happen without operator action. */
-export const TERMINAL_STAGES: readonly MonitorEventStage[] = ["delivered", "authored_no_delivery", "failed_no_retry"];
+export const TERMINAL_STAGES: readonly MonitorEventStage[] = [
+	"delivered",
+	"authored_no_delivery",
+	"failed_no_retry",
+	"skipped",
+];
+
+/**
+ * Stages in which an event still owes an authoring turn: the overlap policy's
+ * definition of "a previous event of the same monitor is still in flight".
+ * `authored` is excluded: its turn is done and only delivery is pending.
+ */
+const IN_FLIGHT_MONITOR_STAGES = "'admitted','batched','dispatched','failed'";
 
 /**
  * Minimum wait, measured from the last failure (`updated_at`), before reconcile reclaims a
@@ -750,7 +800,7 @@ export class GatewayDatabase {
 			.get()!.n;
 		const openMonitors = this.#database
 			.query<{ n: number }, []>(
-				"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
+				"SELECT COUNT(*) AS n FROM monitor_events WHERE stage NOT IN ('delivered','authored_no_delivery','failed_no_retry','skipped') AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)",
 			)
 			.get()!.n;
 		return { authority, populated, openInbound, openWork, openMonitors };
@@ -1009,25 +1059,52 @@ export class GatewayDatabase {
 		try {
 			const runtime = JSON.parse(row.record_json) as WorkAttemptRuntime;
 			validateWorkRuntime(runtime, this.instanceId);
-			workAssert(runtime.opRef === row.op_ref && runtime.jobId === row.job_id && runtime.laneKey === row.lane_key);
-			workAssert(runtime.sessionId === row.session_id && runtime.version === row.version);
-			workAssert(runtime.settledAt === row.settled_at && runtime.deliveryId === row.delivery_id);
+			workAssert(
+				runtime.opRef === row.op_ref && runtime.jobId === row.job_id && runtime.laneKey === row.lane_key,
+				"runtime identity matches database columns",
+			);
+			workAssert(
+				runtime.sessionId === row.session_id && runtime.version === row.version,
+				"runtime session and version match database columns",
+			);
+			workAssert(
+				runtime.settledAt === row.settled_at && runtime.deliveryId === row.delivery_id,
+				"runtime settlement and delivery id match database columns",
+			);
 			this.#workHistory(runtime);
 			return runtime;
-		} catch {
-			throw new WorkAttemptStateError();
+		} catch (error) {
+			throw new WorkAttemptStateError(
+				opRef,
+				error instanceof WorkAttemptStateError ? error.assertion : "runtime record parsing",
+			);
 		}
 	}
 
 	/** Keyset pagination: callers can recover arbitrarily many lanes in bounded reads. */
-	workAttemptOpen(limit = 100, afterOpRef = ""): readonly WorkAttemptRuntime[] {
+	workAttemptOpen(
+		limit = 100,
+		afterOpRef = "",
+		onInvalid?: (error: WorkAttemptStateError) => void,
+	): readonly WorkAttemptRuntime[] {
 		workAssert(Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000);
-		return this.#database
+		const rows = this.#database
 			.query<{ op_ref: string }, [string, number]>(
 				"SELECT op_ref FROM work_attempt_runtime WHERE settled_at IS NULL AND op_ref > ? AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = work_attempt_runtime.job_id) ORDER BY op_ref LIMIT ?",
 			)
-			.all(afterOpRef, limit)
-			.map((row) => this.workAttemptGet(row.op_ref)!);
+			.all(afterOpRef, limit);
+		if (!onInvalid) return rows.map((row) => this.workAttemptGet(row.op_ref)!);
+		const attempts: WorkAttemptRuntime[] = [];
+		for (const row of rows) {
+			try {
+				const runtime = this.workAttemptGet(row.op_ref);
+				if (runtime) attempts.push(runtime);
+			} catch (error) {
+				if (!(error instanceof WorkAttemptStateError)) throw error;
+				onInvalid(error);
+			}
+		}
+		return attempts;
 	}
 
 	workAttemptOpenByLane(laneKey: string): WorkAttemptRuntime | undefined {
@@ -1277,6 +1354,25 @@ export class GatewayDatabase {
 			if (acceptanceEstablished && next.noticeHash !== null)
 				this.metaSet(`lane-notice:${next.sessionKey}`, JSON.stringify({ epoch: next.epoch, hash: next.noticeHash }));
 			return next;
+		});
+	}
+
+	/**
+	 * Streamed turn activity of an open attempt refreshes its lane's
+	 * `last_activity_at`, fenced to the attempt's own binding. Never moves it back.
+	 */
+	workAttemptActivity(opRef: string, at: string): boolean {
+		return this.withTransaction(() => {
+			const current = this.workAttemptGet(opRef);
+			if (!current || current.settledAt !== null) return false;
+			this.#assertNotQuarantined("work", current.jobId);
+			return (
+				this.#database
+					.query(
+						"UPDATE sessions SET last_activity_at = ? WHERE origin_key = ? AND gjc_session_id = ? AND epoch = ? AND (last_activity_at IS NULL OR last_activity_at < ?)",
+					)
+					.run(at, current.sessionKey, current.sessionId, current.epoch, at).changes === 1
+			);
 		});
 	}
 
@@ -1558,16 +1654,29 @@ export class GatewayDatabase {
 
 	#workValidateHistory(runtime: WorkAttemptRuntime, input: LaneJobRecord): void {
 		const record = parseLaneJobRecord(JSON.stringify(input));
-		workAssert(record.jobId === runtime.jobId && record.lane.worktreePath === runtime.cwd);
+		workAssert(
+			record.jobId === runtime.jobId && record.lane.worktreePath === runtime.cwd,
+			"history job identity matches runtime",
+		);
 		const attempt = record.attempts.find((item) => item.opRef === runtime.opRef);
-		workAssert(attempt && attempt.sessionId === runtime.sessionId && attempt.startedAt === runtime.startedAt);
-		workAssert(runtime.settledAt === null ? attempt.endedAt === undefined : attempt.endedAt === runtime.settledAt);
-		if (runtime.settledAt === null) workAssert(record.attempts.at(-1)?.opRef === runtime.opRef);
+		workAssert(
+			attempt && attempt.sessionId === runtime.sessionId && attempt.startedAt === runtime.startedAt,
+			"history attempt identity matches runtime",
+		);
+		workAssert(
+			runtime.settledAt === null ? attempt.endedAt === undefined : attempt.endedAt === runtime.settledAt,
+			"attempt.endedAt matches runtime.settledAt",
+		);
+		if (runtime.settledAt === null)
+			workAssert(record.attempts.at(-1)?.opRef === runtime.opRef, "open runtime belongs to latest history attempt");
 	}
 
 	#workHistory(runtime: WorkAttemptRuntime): LaneJobRecord {
 		const json = this.laneJobJson(runtime.jobId);
-		workAssert(json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json);
+		workAssert(
+			json !== undefined && this.laneJobJsonByLaneKey(runtime.laneKey) === json,
+			"lane history rows share one serialized record",
+		);
 		const record = parseLaneJobRecord(json);
 		this.#workValidateHistory(runtime, record);
 		return record;
@@ -1661,6 +1770,8 @@ export class GatewayDatabase {
 		| {
 				epoch: number;
 				lastBootstrappedEpoch: number;
+				agentsMdEpoch: number;
+				agentsMdDigest: string | null;
 				appliedAt: string | null;
 				includedSections: readonly string[];
 				byteCount: number;
@@ -1673,6 +1784,8 @@ export class GatewayDatabase {
 				{
 					epoch: number;
 					last_bootstrapped_epoch: number;
+					agents_md_epoch: number;
+					agents_md_digest: string | null;
 					bootstrap_applied_at: string | null;
 					bootstrap_sections_json: string;
 					bootstrap_byte_count: number;
@@ -1681,19 +1794,32 @@ export class GatewayDatabase {
 				},
 				[string]
 			>(
-				"SELECT epoch, last_bootstrapped_epoch, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions WHERE origin_key = ?",
+				"SELECT epoch, last_bootstrapped_epoch, agents_md_epoch, agents_md_digest, bootstrap_applied_at, bootstrap_sections_json, bootstrap_byte_count, bootstrap_truncated, bootstrap_diagnostics_json FROM sessions WHERE origin_key = ?",
 			)
 			.get(originKey);
 		if (!row) return undefined;
 		return {
 			epoch: row.epoch,
 			lastBootstrappedEpoch: row.last_bootstrapped_epoch,
+			agentsMdEpoch: row.agents_md_epoch,
+			agentsMdDigest: row.agents_md_digest,
 			appliedAt: row.bootstrap_applied_at,
 			includedSections: parseStringList(row.bootstrap_sections_json),
 			byteCount: row.bootstrap_byte_count,
 			truncated: row.bootstrap_truncated === 1,
 			diagnostics: parseStringList(row.bootstrap_diagnostics_json),
 		};
+	}
+
+	/** Records the current AGENTS.md digest for a session epoch when it changes. */
+	recordSessionAgentsBaseline(originKey: string, epoch: number, digest: string): boolean {
+		return (
+			this.#database
+				.query(
+					"UPDATE sessions SET agents_md_epoch = ?, agents_md_digest = ? WHERE origin_key = ? AND epoch = ? AND (agents_md_epoch < ? OR (agents_md_epoch = ? AND agents_md_digest IS NOT ?))",
+				)
+				.run(epoch, digest, originKey, epoch, epoch, epoch, digest).changes === 1
+		);
 	}
 
 	markSessionBootstrapped(
@@ -1993,6 +2119,21 @@ export class GatewayDatabase {
 			.sort((a, b) => a.eventType.localeCompare(b.eventType));
 	}
 
+	/**
+	 * Cycle projection source: how many of the most recently settled monitor
+	 * events, newest first, ended `failed_no_retry` before the first success.
+	 * Dispatch outcome, not process liveness, is what a monitor outage looks like.
+	 */
+	monitorConsecutiveTerminalFailures(limit = 100): number {
+		const rows = this.#database
+			.query<{ stage: string }, [number]>(
+				`SELECT stage FROM monitor_events WHERE stage IN ('delivered','authored_no_delivery','failed_no_retry') AND ${REPLAYABLE_MONITOR} ORDER BY updated_at DESC, rowid DESC LIMIT ?`,
+			)
+			.all(limit);
+		const streak = rows.findIndex((row) => row.stage !== "failed_no_retry");
+		return streak < 0 ? rows.length : streak;
+	}
+
 	addRecall(originKey: string, originRefJson: string, text: string): void {
 		this.#database
 			.query("INSERT INTO recall_snippets (origin_key, origin_ref_json, text, at) VALUES (?, ?, ?, ?)")
@@ -2055,7 +2196,7 @@ export class GatewayDatabase {
 			.run(reason, new Date().toISOString(), id);
 	}
 
-	memoryIntentUpdate(id: string, state: "queued" | "written" | "committed" | "receipted"): void {
+	memoryIntentUpdate(id: string, state: "queued" | "written" | "committed" | "receipted" | "quarantined"): void {
 		this.#database
 			.query("UPDATE memory_intents SET state = ?, updated_at = ? WHERE id = ?")
 			.run(state, new Date().toISOString(), id);
@@ -2371,6 +2512,11 @@ export class GatewayDatabase {
 	clearFailedTurnResetCap(originKey: string): void {
 		this.requireTransaction();
 		this.metaSet(failedTurnResetCapKey(originKey), "0");
+	}
+
+	failedTurnResetCapped(originKey: string): boolean {
+		const cap = this.metaGet(failedTurnResetCapKey(originKey));
+		return cap !== undefined && cap !== "0";
 	}
 
 	freshTurnAttempt(originKey: string, epoch: number, triggerMessageId: string): number {
@@ -3223,10 +3369,12 @@ export class GatewayDatabase {
 		);
 	}
 
-	deliveryUpdate(id: string, state: string, attempts?: number): void {
+	deliveryUpdate(id: string, state: string, attempts?: number, lastError?: string): void {
 		this.#database
-			.query("UPDATE deliveries SET state = ?, attempts = COALESCE(?, attempts), updated_at = ? WHERE delivery_id = ?")
-			.run(state, attempts ?? null, new Date().toISOString(), id);
+			.query(
+				"UPDATE deliveries SET state = ?, attempts = COALESCE(?, attempts), last_error = COALESCE(?, last_error), updated_at = ? WHERE delivery_id = ?",
+			)
+			.run(state, attempts ?? null, lastError ?? null, new Date().toISOString(), id);
 	}
 
 	deliveryExpireBefore(
@@ -3237,10 +3385,11 @@ export class GatewayDatabase {
 		origin_key: string;
 		attempts: number;
 		updated_at: string;
+		last_error: string | null;
 	}> {
 		const rows = this.#database
-			.query<{ delivery_id: string; origin_key: string; attempts: number }, [string]>(
-				"SELECT delivery_id, origin_key, attempts FROM deliveries WHERE state NOT IN ('confirmed', 'expired') AND created_at < ?",
+			.query<{ delivery_id: string; origin_key: string; attempts: number; last_error: string | null }, [string]>(
+				"SELECT delivery_id, origin_key, attempts, last_error FROM deliveries WHERE state NOT IN ('confirmed', 'expired') AND created_at < ?",
 			)
 			.all(before);
 		if (rows.length === 0) return [];
@@ -3285,10 +3434,11 @@ export class GatewayDatabase {
 		attempts: number;
 		created_at: string;
 		updated_at: string;
+		last_error: string | null;
 	}> {
 		return this.#database
 			.query(
-				"SELECT delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at FROM deliveries ORDER BY created_at",
+				"SELECT delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at, last_error FROM deliveries ORDER BY created_at",
 			)
 			.all() as Array<{
 			delivery_id: string;
@@ -3299,6 +3449,7 @@ export class GatewayDatabase {
 			attempts: number;
 			created_at: string;
 			updated_at: string;
+			last_error: string | null;
 		}>;
 	}
 
@@ -3308,15 +3459,17 @@ export class GatewayDatabase {
 		triggerJson: string;
 		eventTypesJson: string;
 		burstPolicy: string;
+		overlap?: string;
 		channelTargetJson: string | null;
 		enabled: boolean;
 		instruction: string | null;
 		modelJson: string | null;
 		serviceTier: string | null;
+		procedureFilesJson?: string | null;
 	}): void {
 		this.#database
 			.query(
-				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction, model_json, service_tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				"INSERT INTO monitors (monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				row.id,
@@ -3324,12 +3477,14 @@ export class GatewayDatabase {
 				row.triggerJson,
 				row.eventTypesJson,
 				row.burstPolicy,
+				row.overlap ?? "queue",
 				row.channelTargetJson,
 				row.enabled ? 1 : 0,
 				new Date().toISOString(),
 				row.instruction,
 				row.modelJson,
 				row.serviceTier,
+				row.procedureFilesJson ?? null,
 			);
 	}
 	monitorRows(): Array<{
@@ -3338,16 +3493,18 @@ export class GatewayDatabase {
 		trigger_json: string;
 		event_types_json: string;
 		burst_policy: string;
+		overlap: string;
 		channel_target_json: string | null;
 		enabled: number;
 		created_at: string;
 		instruction: string | null;
 		model_json: string | null;
 		service_tier: string | null;
+		procedure_files_json: string | null;
 	}> {
 		return this.#database
 			.query(
-				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, channel_target_json, enabled, created_at, instruction, model_json, service_tier FROM monitors ORDER BY created_at",
+				"SELECT monitor_id, name, trigger_json, event_types_json, burst_policy, overlap, channel_target_json, enabled, created_at, instruction, model_json, service_tier, procedure_files_json FROM monitors ORDER BY created_at",
 			)
 			.all() as Array<{
 			monitor_id: string;
@@ -3355,12 +3512,14 @@ export class GatewayDatabase {
 			trigger_json: string;
 			event_types_json: string;
 			burst_policy: string;
+			overlap: string;
 			channel_target_json: string | null;
 			enabled: number;
 			created_at: string;
 			instruction: string | null;
 			model_json: string | null;
 			service_tier: string | null;
+			procedure_files_json: string | null;
 		}>;
 	}
 	monitorUpdate(row: {
@@ -3374,11 +3533,12 @@ export class GatewayDatabase {
 		instruction: string | null;
 		modelJson: string | null;
 		serviceTier: string | null;
+		procedureFilesJson: string | null;
 	}): boolean {
 		return (
 			this.#database
 				.query(
-					"UPDATE monitors SET name = ?, trigger_json = ?, event_types_json = ?, burst_policy = ?, channel_target_json = ?, enabled = ?, instruction = ?, model_json = ?, service_tier = ? WHERE monitor_id = ?",
+					"UPDATE monitors SET name = ?, trigger_json = ?, event_types_json = ?, burst_policy = ?, channel_target_json = ?, enabled = ?, instruction = ?, model_json = ?, service_tier = ?, procedure_files_json = ? WHERE monitor_id = ?",
 				)
 				.run(
 					row.name,
@@ -3390,25 +3550,49 @@ export class GatewayDatabase {
 					row.instruction,
 					row.modelJson,
 					row.serviceTier,
+					row.procedureFilesJson,
 					row.id,
 				).changes > 0
 		);
 	}
 	monitorDelete(id: string): boolean {
-		return this.#database.query("DELETE FROM monitors WHERE monitor_id = ?").run(id).changes > 0;
+		const deleted = this.#database.query("DELETE FROM monitors WHERE monitor_id = ?").run(id).changes > 0;
+		this.metaDelete(monitorCronMetaKey(id));
+		return deleted;
 	}
+	/**
+	 * Admits one monitor event. Under the `skip` overlap policy the predecessor
+	 * check and the insert share one statement, so two concurrent fires can never
+	 * both see "nothing in flight": the event lands as terminal `skipped` naming
+	 * the oldest same-monitor event still awaiting authoring (issue #83).
+	 * Returns the predecessor's id when skipped, undefined when admitted.
+	 */
 	monitorEventCreate(row: {
 		eventId: string;
 		monitorId: string;
 		eventType: string;
 		payloadJson: string;
 		firedAt: string;
-	}): void {
-		this.#database
-			.query(
-				"INSERT INTO monitor_events (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, updated_at) VALUES (?, ?, ?, ?, ?, 'admitted', NULL, ?)",
+		overlap?: "queue" | "skip";
+	}): string | undefined {
+		const predecessor =
+			row.overlap === "skip"
+				? `(SELECT event_id FROM monitor_events WHERE monitor_id = ? AND stage IN (${IN_FLIGHT_MONITOR_STAGES}) AND ${REPLAYABLE_MONITOR} ORDER BY fired_at, rowid LIMIT 1)`
+				: "NULL";
+		const inserted = this.#database
+			.query<{ skipped_by: string | null }, string[]>(
+				`INSERT INTO monitor_events (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, skipped_by, updated_at) SELECT ?, ?, ?, ?, ?, CASE WHEN p.id IS NULL THEN 'admitted' ELSE 'skipped' END, NULL, p.id, ? FROM (SELECT ${predecessor} AS id) AS p RETURNING skipped_by`,
 			)
-			.run(row.eventId, row.monitorId, row.eventType, row.payloadJson, row.firedAt, new Date().toISOString());
+			.get(
+				row.eventId,
+				row.monitorId,
+				row.eventType,
+				row.payloadJson,
+				row.firedAt,
+				new Date().toISOString(),
+				...(row.overlap === "skip" ? [row.monitorId] : []),
+			);
+		return inserted?.skipped_by ?? undefined;
 	}
 	/**
 	 * Durable dispatch lease (red-team blocker 1): a process claims an event
@@ -3637,6 +3821,7 @@ WHERE event_id = ? AND ${leasePredicate}`,
 		detail: string,
 		now = Date.now(),
 		terminal = false,
+		options?: MonitorFailureOptions,
 	): boolean {
 		return this.withTransaction(() => {
 			const changes = this.#database
@@ -3655,7 +3840,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 					new Date(now).toISOString(),
 				).changes;
 			if (changes === 0) return false;
-			this.monitorFailureRecord(eventId, code, detail);
+			this.monitorFailureRecord(eventId, code, detail, options);
 			return true;
 		});
 	}
@@ -3748,8 +3933,6 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		// delivered may ONLY be reached from authored: an omitted event still in
 		// dispatched/batched can never be promoted by a batch-wide settlement
 		// (terminal-critic blocker 3).
-		// An expired delivery fails its events terminally (#94); an operator redrive
-		// that the adapter then confirms proves the note did land.
 		if (
 			stage === "delivered" &&
 			(row.stage === "authored" || (row.stage === "failed_no_retry" && this.authoredOutput(eventId) !== undefined))
@@ -3772,11 +3955,9 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		return false;
 	}
 	/**
-	 * An expired delivery is terminal, so the monitor events it carried can never
-	 * reach `delivered` (#94). Moves the batch's still-`authored` events to
-	 * `failed_no_retry` with evidence naming the delivery, its attempt count and
-	 * the last transport error. Runs inside the caller's transaction; returns the
-	 * failed event ids.
+	 * Events left `authored` behind an expired delivery can never reach `delivered` (#94).
+	 * Move the batch's still-authored events to `failed_no_retry` with evidence.
+	 * Runs inside the caller's transaction and returns the failed event ids.
 	 */
 	monitorEventsFailExpiredDelivery(deliveryId: string, reason: string): string[] {
 		const delivery = this.#database
@@ -3840,7 +4021,9 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		stage: string;
 		batch_id: string | null;
 		dispatch_attempts: number;
+		skipped_by: string | null;
 		updated_at: string;
+		procedure_json: string | null;
 	}> {
 		const direction = order === "oldest" ? "ASC" : "DESC";
 		return this.#database
@@ -3858,7 +4041,9 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			stage: string;
 			batch_id: string | null;
 			dispatch_attempts: number;
+			skipped_by: string | null;
 			updated_at: string;
+			procedure_json: string | null;
 		}>;
 	}
 	authoredOutputCreate(eventId: string, outputText: string): void {
@@ -3868,6 +4053,24 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				"INSERT INTO authored_outputs (event_id, output_text, authored_at) VALUES (?, ?, ?) ON CONFLICT(event_id) DO UPDATE SET output_text = excluded.output_text, authored_at = excluded.authored_at",
 			)
 			.run(eventId, outputText, new Date().toISOString());
+	}
+	/**
+	 * Records the procedure versions one event's authoring turn is given (issue
+	 * #82). Lease-fenced like every dispatch write: a stale attempt cannot
+	 * overwrite the version a newer attempt authored with.
+	 */
+	monitorEventFencedSetProcedure(eventId: string, leaseId: string, procedureJson: string, now = Date.now()): boolean {
+		this.#assertNotQuarantined("monitor", eventId);
+		return (
+			this.#database
+				.query(
+					`UPDATE monitor_events SET procedure_json = ?
+WHERE event_id = ? AND EXISTS (
+SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l.lease_id = ? AND l.expires_at > ?
+)`,
+				)
+				.run(procedureJson, eventId, leaseId, new Date(now).toISOString()).changes > 0
+		);
 	}
 	authoredOutput(eventId: string): string | undefined {
 		return this.#database
@@ -3879,7 +4082,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		return (
 			this.#database
 				.query<MonitorFailureRow, [string]>(
-					"SELECT event_id, code, detail, failed_at FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
+					"SELECT event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 1",
 				)
 				.get(eventId) ?? undefined
 		);
@@ -3890,17 +4093,99 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	 * Keeps the newest 20 rows per event and deletes stale rows so the table
 	 * cannot grow without bound across retries.
 	 */
-	monitorFailureRecord(eventId: string, code: string, detail: string): void {
+	monitorFailureRecord(eventId: string, code: string, detail: string, options?: MonitorFailureOptions): void {
 		// Runs inside the caller's transaction when one is open (dispatch failure
 		// bookkeeping must be atomic with the stage transition); standalone otherwise.
+		const protocolFailure = options?.protocolFailure;
+		if (protocolFailure) {
+			if (!(PROTOCOL_FAILURE_REASONS as readonly string[]).includes(protocolFailure.reason))
+				throw new Error("invalid monitor protocol failure reason");
+			if (!Number.isSafeInteger(protocolFailure.responseByteLength) || protocolFailure.responseByteLength < 0)
+				throw new Error("invalid monitor protocol response byte length");
+			if (
+				protocolFailure.responseEntryCount !== null &&
+				(!Number.isSafeInteger(protocolFailure.responseEntryCount) ||
+					protocolFailure.responseEntryCount < 0 ||
+					protocolFailure.responseEntryCount > protocolFailure.responseByteLength)
+			)
+				throw new Error("invalid monitor protocol response entry count");
+		}
+		const failedAt = new Date().toISOString();
 		this.#database
-			.query("INSERT INTO monitor_failures (event_id, code, detail, failed_at) VALUES (?, ?, ?, ?)")
-			.run(eventId, code, detail.slice(0, 500), new Date().toISOString());
+			.query(
+				"INSERT INTO monitor_failures (event_id, code, detail, failed_at, protocol_reason, response_byte_length, response_entry_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			)
+			.run(
+				eventId,
+				code,
+				detail.slice(0, 500),
+				failedAt,
+				protocolFailure?.reason ?? null,
+				protocolFailure?.responseByteLength ?? null,
+				protocolFailure?.responseEntryCount ?? null,
+			);
 		this.#database
 			.query(
 				"DELETE FROM monitor_failures WHERE event_id = ? AND rowid NOT IN (SELECT rowid FROM monitor_failures WHERE event_id = ? ORDER BY rowid DESC LIMIT 20)",
 			)
 			.run(eventId, eventId);
+	}
+	/** Public-safe protocol failure history and delivery recovery timing for an event. */
+	monitorEventRecovery(eventId: string): MonitorEventRecovery | undefined {
+		const event = this.#database
+			.query<{ stage: string; updated_at: string; dispatch_attempts: number }, [string]>(
+				"SELECT stage, updated_at, dispatch_attempts FROM monitor_events WHERE event_id = ?",
+			)
+			.get(eventId);
+		if (!event) return undefined;
+		const rows = this.#database
+			.query<
+				{
+					protocol_reason: string | null;
+					failed_at: string;
+					response_byte_length: number | null;
+					response_entry_count: number | null;
+				},
+				[string]
+			>(
+				"SELECT protocol_reason, failed_at, response_byte_length, response_entry_count FROM monitor_failures WHERE event_id = ? AND protocol_reason IS NOT NULL ORDER BY rowid ASC",
+			)
+			.all(eventId);
+		const protocolFailures: MonitorProtocolFailureRecord[] = [];
+		for (const row of rows) {
+			if (
+				!(PROTOCOL_FAILURE_REASONS as readonly string[]).includes(row.protocol_reason ?? "") ||
+				!Number.isSafeInteger(row.response_byte_length) ||
+				(row.response_byte_length ?? -1) < 0 ||
+				(row.response_entry_count !== null &&
+					(!Number.isSafeInteger(row.response_entry_count) ||
+						row.response_entry_count < 0 ||
+						row.response_entry_count > (row.response_byte_length ?? -1)))
+			)
+				continue;
+			protocolFailures.push({
+				reason: row.protocol_reason as ProtocolFailureReason,
+				failedAt: row.failed_at,
+				responseByteLength: row.response_byte_length as number,
+				responseEntryCount: row.response_entry_count,
+			});
+		}
+		const first = protocolFailures[0];
+		if (!first) return undefined;
+		const deliveredAt = event.stage === "delivered" ? event.updated_at : null;
+		const failedAtMs = Date.parse(first.failedAt);
+		const deliveredAtMs = deliveredAt === null ? Number.NaN : Date.parse(deliveredAt);
+		const latency = deliveredAtMs - failedAtMs;
+		return {
+			protocolFailures,
+			firstFailedAt: first.failedAt,
+			deliveredAt,
+			recoveryLatencyMs:
+				Number.isFinite(failedAtMs) && Number.isFinite(deliveredAtMs) && Number.isSafeInteger(latency) && latency >= 0
+					? latency
+					: null,
+			dispatchAttempts: event.dispatch_attempts + 1,
+		};
 	}
 	monitorFailures(eventIds: readonly string[]): Map<string, MonitorFailureRow> {
 		const rows = new Map<string, MonitorFailureRow>();
@@ -3916,6 +4201,8 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	 * the slot but died before submitting the event — reconcile admits it. A
 	 * crash can therefore strand neither a claimed-but-unadmitted slot (this
 	 * row shape makes it visible) nor a duplicate event (unique slot key).
+	 * A slot skipped by the overlap policy is still claimed: it fired, and its
+	 * `skipped` event row is the record of what happened to it.
 	 */
 	monitorSlotClaimWithEvent(row: {
 		monitorId: string;
@@ -3923,7 +4210,8 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		eventId: string;
 		eventType: string;
 		payloadJson: string;
-	}): boolean {
+		overlap?: "queue" | "skip";
+	}): { admitted: false } | { admitted: true; skippedBy: string | undefined } {
 		const now = new Date().toISOString();
 		return this.withTransaction(() => {
 			const claim = this.#database
@@ -3931,16 +4219,17 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 					"INSERT INTO monitor_slots (monitor_id, slot_at, event_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(monitor_id, slot_at) DO NOTHING",
 				)
 				.run(row.monitorId, row.slotAt, row.eventId, now).changes;
-			if (claim === 0) return false;
-			this.monitorEventCreate({
+			if (claim === 0) return { admitted: false as const };
+			const skippedBy = this.monitorEventCreate({
 				eventId: row.eventId,
 				monitorId: row.monitorId,
 				eventType: row.eventType,
 				payloadJson: row.payloadJson,
 				firedAt: row.slotAt,
+				...(row.overlap ? { overlap: row.overlap } : {}),
 			});
-			return true;
-		}) as boolean;
+			return { admitted: true as const, skippedBy };
+		});
 	}
 	/** Test/recovery seam: move a monitor's creation instant (clamps catch-up). */
 	monitorSetCreatedAt(monitorId: string, createdAt: string): void {
@@ -3954,15 +4243,39 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 			.get(monitorId, slotAt);
 		return (row?.n ?? 0) > 0;
 	}
-	/** The monitor's persisted schedule boundary: its newest claimed slot. */
-	monitorLastSlotAt(monitorId: string): string | undefined {
-		return (
-			this.#database
-				.query<{ slot_at: string | null }, [string]>(
-					"SELECT MAX(slot_at) AS slot_at FROM monitor_slots WHERE monitor_id = ?",
-				)
-				.get(monitorId)?.slot_at ?? undefined
-		);
+	/** Durable boundary from the newest claimed slot or newest policy skip. */
+	monitorCronCursor(monitorId: string): string | undefined {
+		const claimed = this.#database
+			.query<{ slot_at: string | null }, [string]>(
+				"SELECT MAX(slot_at) AS slot_at FROM monitor_slots WHERE monitor_id = ?",
+			)
+			.get(monitorId)?.slot_at;
+		const skipped = this.monitorCronState(monitorId)?.cursor;
+		if (!claimed) return skipped;
+		if (!skipped) return claimed;
+		return Date.parse(skipped) > Date.parse(claimed) ? skipped : claimed;
+	}
+	/** Catch-up diagnostics; absent until this monitor has skipped at least one slot. */
+	monitorCronState(monitorId: string): MonitorCronState | undefined {
+		const raw = this.metaGet(monitorCronMetaKey(monitorId));
+		return raw === undefined ? undefined : (JSON.parse(raw) as MonitorCronState);
+	}
+	/** Records policy refusals durably and advances the cursor so they are counted once. */
+	monitorCronRecordSkip(
+		monitorId: string,
+		skip: { count: number; oldest: string; newest: string },
+		recordedAt: string,
+	): MonitorCronState {
+		return this.withTransaction(() => {
+			const previous = this.monitorCronState(monitorId);
+			const state: MonitorCronState = {
+				cursor: skip.newest,
+				skippedTotal: (previous?.skippedTotal ?? 0) + skip.count,
+				lastSkip: { ...skip, recordedAt },
+			};
+			this.metaSet(monitorCronMetaKey(monitorId), JSON.stringify(state));
+			return state;
+		});
 	}
 	/** Drops slot ledger entries older than the retention window (bounded table). */
 	monitorSlotPrune(olderThanMs: number, now = Date.now()): number {
@@ -4509,6 +4822,115 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 				this.#database
 					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(24, new Date().toISOString());
+			});
+		}
+		if (current < 25) {
+			this.withTransaction(() => {
+				// Track each epoch's AGENTS.md baseline. Only the digest is persisted;
+				// prompt content remains in the workspace and is re-read on each turn.
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(sessions)")
+						.all()
+						.map((row) => row.name),
+				);
+				if (!columns.has("agents_md_epoch"))
+					this.#database.exec("ALTER TABLE sessions ADD COLUMN agents_md_epoch INTEGER NOT NULL DEFAULT -1");
+				if (!columns.has("agents_md_digest"))
+					this.#database.exec("ALTER TABLE sessions ADD COLUMN agents_md_digest TEXT");
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(25, new Date().toISOString());
+			});
+		}
+		if (current < 26) {
+			this.withTransaction(() => {
+				// Issue #171: the allowlisted classification of the latest failed attempt.
+				const columns = this.#database
+					.query<{ name: string }, []>("PRAGMA table_info(deliveries)")
+					.all()
+					.map((row) => row.name);
+				if (!columns.includes("last_error")) this.#database.exec("ALTER TABLE deliveries ADD COLUMN last_error TEXT");
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(26, new Date().toISOString());
+			});
+		}
+		if (current < 27) {
+			this.withTransaction(() => {
+				// Issue #82: declared procedure files are re-read per firing and each
+				// authoring event records the procedure version it was given.
+				const columns = (table: string) =>
+					new Set(
+						this.#database
+							.query<{ name: string }, []>(`PRAGMA table_info(${table})`)
+							.all()
+							.map((row) => row.name),
+					);
+				if (!columns("monitors").has("procedure_files_json"))
+					this.#database.exec("ALTER TABLE monitors ADD COLUMN procedure_files_json TEXT");
+				if (!columns("monitor_events").has("procedure_json"))
+					this.#database.exec("ALTER TABLE monitor_events ADD COLUMN procedure_json TEXT");
+				this.#database
+					.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+					.run(27, new Date().toISOString());
+			});
+		}
+		if (current < 28) {
+			this.withTransaction(() => {
+				// Issue #83: per-monitor overlap policy and the terminal `skipped` stage.
+				// Rebuild monitor_events because its stage CHECK constraint must widen.
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(monitors)")
+						.all()
+						.map((row) => row.name),
+				);
+				if (!columns.has("overlap"))
+					this.#database.exec(
+						"ALTER TABLE monitors ADD COLUMN overlap TEXT NOT NULL DEFAULT 'queue' CHECK(overlap IN ('queue','skip'))",
+					);
+				this.#database.exec(`CREATE TABLE monitor_events_v28 (event_id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, fired_at TEXT NOT NULL, stage TEXT NOT NULL CHECK(stage IN ('admitted','batched','dispatched','authored','delivered','authored_no_delivery','failed','failed_no_retry','skipped')), batch_id TEXT, dispatch_attempts INTEGER NOT NULL DEFAULT 0, skipped_by TEXT, updated_at TEXT NOT NULL, procedure_json TEXT);
+INSERT INTO monitor_events_v28 (event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, updated_at, procedure_json) SELECT event_id, monitor_id, event_type, payload_json, fired_at, stage, batch_id, dispatch_attempts, updated_at, procedure_json FROM monitor_events ORDER BY rowid;
+DROP TABLE monitor_events;
+ALTER TABLE monitor_events_v28 RENAME TO monitor_events;
+CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);`);
+				for (const action of ["UPDATE", "DELETE"])
+					this.#database.exec(`CREATE TRIGGER monitor_events_quarantine_${action.toLowerCase()} BEFORE ${action} ON monitor_events
+					WHEN EXISTS (SELECT 1 FROM broker_quarantine WHERE kind = 'monitor' AND subject_id = OLD.event_id)
+					BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END`);
+				this.#database
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(28, new Date().toISOString());
+			});
+		}
+		if (current < 29) {
+			this.withTransaction(() => {
+				const columns = new Set(
+					this.#database
+						.query<{ name: string }, []>("PRAGMA table_info(monitor_failures)")
+						.all()
+						.map((row) => row.name),
+				);
+				const additions = [
+					[
+						"protocol_reason",
+						"TEXT CHECK(protocol_reason IS NULL OR protocol_reason IN ('protocol_response_not_array', 'protocol_entry_missing_field', 'protocol_unknown_event', 'protocol_duplicate_event', 'protocol_omitted_event', 'protocol_unparseable_json', 'protocol_off_contract'))",
+					],
+					[
+						"response_byte_length",
+						"INTEGER CHECK(response_byte_length IS NULL OR (typeof(response_byte_length) = 'integer' AND response_byte_length BETWEEN 0 AND 9007199254740991))",
+					],
+					[
+						"response_entry_count",
+						"INTEGER CHECK(response_entry_count IS NULL OR (typeof(response_entry_count) = 'integer' AND response_entry_count BETWEEN 0 AND 9007199254740991))",
+					],
+				] as const;
+				for (const [name, declaration] of additions)
+					if (!columns.has(name)) this.#database.exec(`ALTER TABLE monitor_failures ADD COLUMN ${name} ${declaration}`);
+				this.#database
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(29, new Date().toISOString());
 			});
 		}
 	}
