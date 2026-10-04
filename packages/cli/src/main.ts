@@ -16,8 +16,9 @@ import type {
 	WorkStatusResult,
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
-import { LOOPBACK_ORIGIN, originKey } from "@gajae-gateway/protocol";
+import { LOOPBACK_ORIGIN, originKey, renderVersion } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
+import pkg from "../package.json";
 import {
 	columnNames,
 	type ListOptions,
@@ -509,6 +510,10 @@ async function chat(socket: string): Promise<void> {
 }
 
 export async function main(args = process.argv.slice(2), options: MainOptions = {}): Promise<void> {
+	if (args.length === 1 && (args[0] === "--version" || args[0] === "-v")) {
+		console.log(renderVersion(pkg.version));
+		return;
+	}
 	const parsed = parseArgs(args);
 	const usage = usageFor(parsed.command);
 	if (usage !== undefined) {

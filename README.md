@@ -107,6 +107,7 @@ This repository is a Bun/TypeScript workspace.
 ```sh
 bun install
 bun run build     # compiles gateway, adapters, admin, and CLI into standalone binaries under dist/
+                  # every binary answers --version with its package version, git commit, and build time
 bun test packages # runs the full package test suite
 ```
 

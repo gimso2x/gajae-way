@@ -1,11 +1,12 @@
 import { basename, join } from "node:path";
 import { installStructuredLogging } from "@gajae-gateway/log";
-import type {
-	ChannelEngagementPolicy,
-	ChatMessagePayload,
-	ChatProgressPayload,
-	EngagementContext,
-	OriginRef,
+import {
+	type ChannelEngagementPolicy,
+	type ChatMessagePayload,
+	type ChatProgressPayload,
+	type EngagementContext,
+	type OriginRef,
+	renderVersion,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -1371,7 +1372,7 @@ export function parseSlackArgs(args: readonly string[]): SlackArgv {
 if (import.meta.main) {
 	const argv = parseSlackArgs(process.argv.slice(2));
 	if (argv.kind === "help") console.log(SLACK_USAGE);
-	else if (argv.kind === "version") console.log(pkg.version);
+	else if (argv.kind === "version") console.log(renderVersion(pkg.version));
 	else if (argv.kind === "usage") {
 		console.error(argv.message);
 		process.exit(USAGE_EXIT_CODE);

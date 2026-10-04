@@ -1,3 +1,4 @@
+export { BUILD_INFO, type BuildInfo, renderVersion } from "./build-info";
 export {
 	type AgentDiskView,
 	type BurstPolicyKind,

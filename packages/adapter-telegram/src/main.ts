@@ -1,5 +1,11 @@
-import type { ChatMessagePayload, EngagementContext, OriginRef } from "@gajae-gateway/protocol";
+import {
+	type ChatMessagePayload,
+	type EngagementContext,
+	type OriginRef,
+	renderVersion,
+} from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
+import pkg from "../package.json";
 import { type LoadedTelegramAdapterConfig, loadTelegramAdapterConfig } from "./config";
 import { type TelegramMessageOriginShape, telegramMessageOrigin } from "./origin";
 import { telegramReactionFor } from "./reactions";
@@ -428,10 +434,13 @@ function isTelegramResult(value: unknown): value is { readonly ok: true; readonl
 }
 
 if (import.meta.main) {
-	loadTelegramAdapterConfig()
-		.then(startTelegramAdapter)
-		.catch((error) => {
-			console.error(error instanceof Error ? error.message : String(error));
-			process.exitCode = 1;
-		});
+	const [flag] = process.argv.slice(2);
+	if (flag === "--version" || flag === "-v") console.log(renderVersion(pkg.version));
+	else
+		loadTelegramAdapterConfig()
+			.then(startTelegramAdapter)
+			.catch((error) => {
+				console.error(error instanceof Error ? error.message : String(error));
+				process.exitCode = 1;
+			});
 }

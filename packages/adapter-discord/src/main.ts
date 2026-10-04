@@ -12,6 +12,7 @@ import {
 	presenceMarkersFor,
 	presenceTransition,
 	type ReactionAction,
+	renderVersion,
 	type SessionModelChoicesResult,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
@@ -2157,7 +2158,7 @@ if (import.meta.main) {
 	if (argv.kind === "help") {
 		console.log(DISCORD_USAGE);
 	} else if (argv.kind === "version") {
-		console.log(pkg.version);
+		console.log(renderVersion(pkg.version));
 	} else if (argv.kind === "usage") {
 		console.error(argv.message);
 		process.exit(USAGE_EXIT_CODE);

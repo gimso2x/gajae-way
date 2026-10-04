@@ -7,9 +7,11 @@
  * its events out to browser clients, and binds loopback only.
  */
 
+import { renderVersion } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
+import pkg from "../package.json";
 import { jsonlAuditLog } from "./audit";
-import { ADMIN_USAGE, USAGE_EXIT_CODE, usageFor } from "./cli";
+import { ADMIN_USAGE, USAGE_EXIT_CODE, usageFor, wantsVersion } from "./cli";
 import { startAdminServer } from "./server";
 
 function gajaewayHome(): string {
@@ -32,6 +34,10 @@ function adminPort(): number {
 
 // Before the socket connect and the port bind: an argv the binary cannot serve
 // must fail here, not after it has taken a gateway connection or a port.
+if (wantsVersion(process.argv.slice(2))) {
+	console.log(renderVersion(pkg.version));
+	process.exit(0);
+}
 if (usageFor(process.argv.slice(2)) !== undefined) {
 	console.error(ADMIN_USAGE);
 	process.exit(USAGE_EXIT_CODE);

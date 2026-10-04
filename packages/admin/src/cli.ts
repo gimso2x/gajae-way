@@ -8,10 +8,15 @@
  * `gajaeway-gateway daemon`, and everything else is a usage error.
  */
 
-export const ADMIN_USAGE = "usage: gajaeway-admin serve";
+export const ADMIN_USAGE = "usage: gajaeway-admin serve | --version";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
+
+/** True when `args` only asks for the build version. */
+export function wantsVersion(args: readonly string[]): boolean {
+	return args.length === 1 && (args[0] === "--version" || args[0] === "-v");
+}
 
 /** The usage text when `args` does not ask for the server, undefined when it does. */
 export function usageFor(args: readonly string[]): string | undefined {
