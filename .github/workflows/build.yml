@@ -27,7 +27,7 @@ jobs:
         with:
           bun-version: 1.4.0
       - run: bun install --frozen-lockfile
-      - run: bunx biome ci packages/
+      - run: bunx biome ci .
       - run: bunx tsc --noEmit -p tsconfig.json
       - run: bun test packages/
       # Frozen-corpus retrieval benchmark gate (separate from unit tests).

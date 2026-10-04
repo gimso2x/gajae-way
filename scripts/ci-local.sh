@@ -33,7 +33,7 @@ if [ -n "${expected_bun:-}" ] && [ "$expected_bun" != "$actual_bun" ]; then
 fi
 
 run "bun install --frozen-lockfile" bun install --frozen-lockfile
-run "biome ci packages/" bunx biome ci packages/
+run "biome ci ." bunx biome ci .
 run "tsc --noEmit" bunx tsc --noEmit -p tsconfig.json
 run "bun test packages/" env GAJAEWAY_E2E_GJC=0 bun test packages/
 if [ "${GAJAEWAY_E2E_GJC:-}" = "1" ]; then
