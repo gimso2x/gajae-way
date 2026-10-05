@@ -586,7 +586,11 @@ class ManagedTailHandle implements TailHandle {
 		if (!trimmed) return;
 		let parsed: unknown;
 		try {
-			parsed = JSON.parse(trimmed);
+			// gjc >= 0.18 prints the serve refusal as a labelled text block
+			// (`COMMAND [...]`, `ERROR {"code":"endpoint_stale",...}`, `COMPLETE true`);
+			// the ERROR line carries the same error object as the JSON envelope.
+			const labelled = !this.#connectionId && /^ERROR\s+\{/.test(trimmed);
+			parsed = labelled ? { ok: false, error: JSON.parse(trimmed.slice("ERROR".length)) } : JSON.parse(trimmed);
 		} catch {
 			// gjc <= 0.16.x prints the serve refusal as an uncaught-exception text
 			// line (`[Uncaught Exception] Error: endpoint_stale: session … is not

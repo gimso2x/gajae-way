@@ -54,7 +54,14 @@ export function attachTestBrokerOwnership<T extends SessionPort>(
 	port.bind = async (input) => {
 		database.assertBrokerAuthority(authority);
 		const binding = await bind(input);
-		if (binding.originKey !== input.originKey || binding.repo !== input.repo || binding.epoch !== input.epoch)
+		// Like BrokerSessionPort.bind, a condemned binding may come back under the
+		// origin's bumped durable epoch instead of the requested one.
+		const rebound = binding.epoch > input.epoch && binding.epoch === database.getSessionRecord(input.originKey)?.epoch;
+		if (
+			binding.originKey !== input.originKey ||
+			binding.repo !== input.repo ||
+			(binding.epoch !== input.epoch && !rebound)
+		)
 			throw new Error("test session binding does not match its creation request");
 		if (!database.recordOwnedBinding({ ...binding, authority }))
 			throw new Error("test session binding lost to a durable epoch change");

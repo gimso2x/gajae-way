@@ -490,7 +490,7 @@ export class BrokerSessionPort implements SessionPort {
 
 	#createChain: Promise<unknown> = Promise.resolve();
 
-	/** Judged on the raw inspect envelope (gjc >= 0.16.0 omits locator.repo, which the subsession normalizer requires). */
+	/** Judged on the raw inspect envelope: readiness needs only `live`, not a normalized locator. */
 	async #awaitIndexed(sessionId: string, repo: string): Promise<void> {
 		this.#assertOwned({ sessionId, repo });
 		const deadline = Date.now() + SESSION_READY_TIMEOUT_MS;
@@ -578,9 +578,8 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	/**
-	 * Raw liveness judged on the broker envelope: gjc >= 0.16.0 omits
-	 * `locator.repo`, which makes the subsession normalizer return undefined for a
-	 * perfectly well-known session. `disowned` = the broker rejects the id.
+	 * Raw liveness judged on the broker envelope, independent of the subsession
+	 * normalizer's locator requirements. `disowned` = the broker rejects the id.
 	 */
 	async liveness(input: {
 		sessionId: string;

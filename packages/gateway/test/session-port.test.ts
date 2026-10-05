@@ -376,7 +376,10 @@ test("structured nonzero session failures survive normalization at the global li
 	expect(calls[0]).toEqual(expect.arrayContaining(["raw", "global", "--op", "session.close"]));
 });
 
-test("broker SessionPort resumes saved dead authority through the SDK control before returning the same binding", async () => {
+test.each([
+	["locator.repo", (repo: string) => ({ repo })],
+	["gjc 0.18 locator.cwd", (repo: string) => ({ cwd: repo, worktreeRoot: null, stateRoot: `${repo}/.gjc/state` })],
+])("broker SessionPort resumes saved dead authority (%s) through the SDK control before returning the same binding", async (_shape, locatorFor) => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
@@ -390,7 +393,7 @@ test("broker SessionPort resumes saved dead authority through the SDK control be
 				exitCode: 0,
 				stdout: JSON.stringify({
 					ok: true,
-					result: { session: { sessionId: "saved-1", locator: { repo }, live, deleted: false } },
+					result: { session: { sessionId: "saved-1", locator: locatorFor(repo), live, deleted: false } },
 				}),
 				stderr: "",
 			};

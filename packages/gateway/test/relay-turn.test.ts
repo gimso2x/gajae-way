@@ -586,3 +586,17 @@ test("a gjc 0.16 textual refusal ('[Uncaught Exception] Error: endpoint_stale: â
 	expect(error).toBeInstanceOf(RelayRefusedError);
 	expect((error as RelayRefusedError).code).toBe("session_unavailable");
 });
+
+test("a gjc 0.18 labelled refusal block (ERROR {json}) rejects attach as session_unavailable", async () => {
+	const relay = new FakeRelay("connection:1", { hello: false });
+	const attach = runner(() => relay).attach({ sessionId: "s1", brokerGeneration: 1, repo: "/tmp/repo" });
+	relay.hostLine('COMMAND ["sdk","serve"]');
+	relay.hostLine(
+		'ERROR {"code":"endpoint_stale","category":"unavailable","message":"The SDK endpoint is stale or unavailable."}',
+	);
+	relay.hostLine("COMPLETE true");
+	relay.end();
+	const error = await attach.catch((e: unknown) => e);
+	expect(error).toBeInstanceOf(RelayRefusedError);
+	expect((error as RelayRefusedError).code).toBe("session_unavailable");
+});

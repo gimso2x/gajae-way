@@ -25,7 +25,7 @@ export type CliRunner = (
 
 export type BrokerSession = {
 	readonly sessionId: string;
-	/** `locator.repo`: the workspace the session was launched in. */
+	/** The workspace the session was launched in: `locator.repo`, or `locator.cwd` on gjc >= 0.16 (which omits `repo`). */
 	readonly repo: string;
 	readonly stateRoot?: string;
 	readonly pid?: number;
@@ -84,7 +84,7 @@ export function parseEnvelope<T>(result: CliResult, command: string): T {
 
 type RawSession = {
 	sessionId?: unknown;
-	locator?: { repo?: unknown; stateRoot?: unknown };
+	locator?: { repo?: unknown; cwd?: unknown; stateRoot?: unknown };
 	pid?: unknown;
 	live?: unknown;
 	deleted?: unknown;
@@ -96,13 +96,14 @@ function normalizeSession(raw: RawSession): BrokerSession | undefined {
 	if (typeof raw.sessionId !== "string" || raw.sessionId.length === 0) {
 		return undefined;
 	}
-	if (typeof raw.locator?.repo !== "string") {
+	const repo = typeof raw.locator?.repo === "string" ? raw.locator.repo : raw.locator?.cwd;
+	if (typeof repo !== "string" || repo.length === 0) {
 		return undefined;
 	}
 	return {
 		sessionId: raw.sessionId,
-		repo: raw.locator.repo,
-		...(typeof raw.locator.stateRoot === "string" ? { stateRoot: raw.locator.stateRoot } : {}),
+		repo,
+		...(typeof raw.locator?.stateRoot === "string" ? { stateRoot: raw.locator.stateRoot } : {}),
 		...(typeof raw.pid === "number" ? { pid: raw.pid } : {}),
 		live: raw.live === true,
 		deleted: raw.deleted === true,

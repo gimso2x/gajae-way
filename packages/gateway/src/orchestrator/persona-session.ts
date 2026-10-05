@@ -824,9 +824,9 @@ class OriginActor {
 			!sameRecoveryAuthority(first.session, second.session);
 		const session = second.session;
 
-		// gjc >= 0.16.0 omits locator.repo, so the subsession normalizer yields
-		// undefined for a perfectly known session; the raw envelope is the
-		// liveness authority and the normalized record only adds repo/deleted.
+		// The normalized record can still be absent (inspect failed, or an envelope
+		// without a locator); the raw envelope is then the liveness authority and
+		// the normalized record only adds repo/deleted.
 		const rawLive = raw?.live;
 		const knownById = rawLive !== undefined && raw?.disowned !== true;
 		const recoveryInput = {
@@ -1161,17 +1161,20 @@ class OriginActor {
 		await this.#resolveStaleHolds();
 		const trigger = this.#manager.database.inboundPendingOldest(this.originKey);
 		if (!trigger) return;
-		const epoch = this.#epoch();
-		const retryAttempt = this.#manager.database.freshTurnAttempt(this.originKey, epoch, trigger.message_id);
-		const opRef = personaTurnOpRef(this.#manager.instanceId, this.originKey, epoch, trigger.message_id, retryAttempt);
+		const requestedEpoch = this.#epoch();
 		let binding: SessionBinding;
 		try {
-			binding = await this.#ensureSession(epoch);
+			binding = await this.#ensureSession(requestedEpoch);
 			this.#clearBindWedgeProbe();
 		} catch (error) {
-			await this.#noteBindFailure(trigger, epoch, error);
+			await this.#noteBindFailure(trigger, requestedEpoch, error);
 			return;
 		}
+		// A dead binding that cannot be resumed is replaced under a bumped epoch;
+		// the turn's op-ref and bind row must name the epoch actually bound.
+		const epoch = binding.epoch;
+		const retryAttempt = this.#manager.database.freshTurnAttempt(this.originKey, epoch, trigger.message_id);
+		const opRef = personaTurnOpRef(this.#manager.instanceId, this.originKey, epoch, trigger.message_id, retryAttempt);
 		const bound = this.#manager.database.inboundBindTurn({
 			messageId: trigger.message_id,
 			originKey: this.originKey,

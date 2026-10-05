@@ -114,6 +114,19 @@ describe("verifyReady", () => {
 		expect(result).toMatchObject({ ready: false, reason: "cwd-mismatch" });
 	});
 
+	test("accepts a gjc 0.18 session whose locator carries cwd instead of repo", async () => {
+		const locator = { cwd: WORKTREE, worktreeRoot: null, stateRoot: `${WORKTREE}/.gjc/state` };
+		const options = controller(() => ok({ session: rawSession({ locator }) }));
+		expect(await inspectSession(options, SESSION)).toMatchObject({ sessionId: SESSION, repo: WORKTREE, live: true });
+		expect(await verifyReady(options, { sessionId: SESSION, worktreePath: WORKTREE })).toMatchObject({ ready: true });
+	});
+
+	test("a gjc 0.18 cwd in a different worktree is still a cwd mismatch", async () => {
+		const options = controller(() => ok({ session: rawSession({ locator: { cwd: "/wt/other" } }) }));
+		const result = await verifyReady(options, { sessionId: SESSION, worktreePath: WORKTREE });
+		expect(result).toMatchObject({ ready: false, reason: "cwd-mismatch" });
+	});
+
 	test("reports not-found when the broker has no such session", async () => {
 		const options = controller(() => ok({}));
 		const result = await verifyReady(options, { sessionId: SESSION, worktreePath: WORKTREE });

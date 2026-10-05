@@ -7,7 +7,7 @@ import type { BrokerSession } from "@gajae-gateway/subsession";
 import { OpRefRejectedError } from "@gajae-gateway/subsession";
 import { parseConfigFile } from "../src/config";
 import { PersonaSessionManager, personaTurnOpRef } from "../src/orchestrator/persona-session";
-import type { SessionSendInput, SessionSteerInput } from "../src/orchestrator/session-port";
+import type { SessionBindInput, SessionSendInput, SessionSteerInput } from "../src/orchestrator/session-port";
 import { RelayRefusedError } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase, type InboundTurn } from "../src/store/db";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
@@ -960,6 +960,48 @@ test("red-team: an inspect outage on an idle binding never blocks the send and n
 		await target.manager.notifyInbound(ORIGIN_KEY);
 		await eventually(() => port.sends.length === 2, "second turn was blocked by the inspect outage");
 		expect(port.calls.filter((call) => call.startsWith("resume:"))).toEqual([]);
+	} finally {
+		await target.close();
+	}
+});
+
+test("red-team: an idle binding that cannot be resumed is replaced and the turn is keyed on the replacement epoch", async () => {
+	// Like BrokerSessionPort.bind: a dead persisted id at the requested epoch is
+	// condemned and replaced under a bumped epoch.
+	class RebindingPort extends IdleRecoveryPort {
+		database: GatewayDatabase | undefined;
+		async bind(input: SessionBindInput) {
+			const existing = this.database?.getSessionRecord(input.originKey);
+			const state = existing?.sessionId
+				? await this.inspect({ sessionId: existing.sessionId, repo: input.repo })
+				: undefined;
+			if (this.database && existing?.epoch === input.epoch && state?.live === false)
+				return await super.bind({ ...input, epoch: this.database.rebindEpoch(input.originKey) });
+			return await super.bind(input);
+		}
+	}
+	const port = new RebindingPort({
+		onBind: (input) => `${input.originKey}-session-${input.epoch}`,
+		onSend: (input, scripted) => scripted.complete(input.opRef, "reply"),
+	});
+	const target = await fixture({ port });
+	port.database = target.database;
+	try {
+		enqueue(target, "dead-1", "first turn");
+		await target.manager.notifyInbound(ORIGIN_KEY);
+		await eventually(() => port.sends.length === 1, "first turn did not send");
+		const sessionId = required(port.sends[0], "first send missing").sessionId;
+		await eventually(() => target.database.inboundPendingCount(ORIGIN_KEY) === 0, "first turn did not complete");
+		// The host idled out and its saved authority cannot be resumed.
+		port.setSessionState(sessionId, { live: false });
+		port.failResume(sessionId);
+		enqueue(target, "dead-2", "second turn");
+		await target.manager.notifyInbound(ORIGIN_KEY);
+		await eventually(() => port.sends.length === 2, "second turn did not send");
+		const second = required(port.sends[1], "second send missing");
+		expect(second.sessionId).toBe(`${ORIGIN_KEY}-session-1`);
+		expect(second.opRef).toBe(personaTurnOpRef("issue92-redteam", ORIGIN_KEY, 1, "dead-2"));
+		expect(port.calls.filter((call) => call === `send:${sessionId}`)).toHaveLength(1);
 	} finally {
 		await target.close();
 	}
