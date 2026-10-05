@@ -117,6 +117,25 @@ test("stallTimeoutMs reloads as live actor policy", async () => {
 	expect(result.config.stallTimeoutMs).toBe(240_000);
 });
 
+test("reconcileIntervalMs defaults to the 60s sweep and is restart-required on edit", async () => {
+	const path = await home();
+	const defaults = await loadConfig({ home: path });
+	expect(defaults.reconcileIntervalMs).toBe(60_000);
+	expect(parseConfigFile({ schemaVersion: 1, reconcileIntervalMs: 5_000 }).reconcileIntervalMs).toBe(5_000);
+	expect(() => parseConfigFile({ schemaVersion: 1, reconcileIntervalMs: 500 })).toThrow(
+		"reconcileIntervalMs must be an integer between 1000 and 3600000",
+	);
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, reconcileIntervalMs: 60_000 }));
+	const current = await loadConfig({ home: path });
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, reconcileIntervalMs: 5_000 }));
+	const result = await reloadConfig(current);
+	expect(result.ok).toBe(true);
+	if (!result.ok) return;
+	expect(result.changed).toEqual([]);
+	expect(result.restartRequired).toEqual(["reconcileIntervalMs"]);
+	expect(result.config.reconcileIntervalMs).toBe(60_000);
+});
+
 test("work lane limits parse without materializing omitted configuration", () => {
 	const work = { maxLanes: 4, idleRetireMs: 3_600_000 };
 	expect(parseConfigFile({ schemaVersion: 1, work }).work).toEqual(work);

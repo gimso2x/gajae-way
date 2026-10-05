@@ -712,6 +712,7 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 	return {
 		phase: "idle",
 		gates: [],
+		diagnostics: [],
 		generatedAt: "2026-08-26T00:00:00.000Z",
 		instanceId: "inst-1",
 		memoryClosing: false,
@@ -737,6 +738,25 @@ function cycleResult(overrides: Partial<OpsCycleResult> = {}): OpsCycleResult {
 }
 
 describe("cycle rendering", () => {
+	test("diagnostics render every actionable identity without truncation and preserve gated exit status", () => {
+		const diagnostic = {
+			reason: "worker_send_uncertain" as const,
+			originKey: "work/task/a",
+			jobId: "lanejob-61",
+			laneKey: "work-a",
+			sessionId: "ad2f2494-2584-4d13-b7b6-c6ac24a1087f",
+			opRef: "gw-cycle-worker",
+			detail: null,
+		};
+		const cycle = cycleResult({ phase: "degraded", gates: [diagnostic.reason], diagnostics: [diagnostic] });
+		const text = renderCycle(cycle).join("\n");
+		expect(text).toContain("diagnostic: worker_send_uncertain actionableIds:");
+		for (const [key, value] of Object.entries(diagnostic))
+			if (key !== "reason" && value !== null) expect(text).toContain(`${key}=${value}`);
+		expect(text).toContain("detail=-");
+		expect(cycleExitCode(cycle)).toBe(1);
+	});
+
 	test("healthy cycle renders phase and explicit none-gate, no sessions block", () => {
 		const lines = renderCycle(cycleResult());
 		expect(lines[0]).toBe("phase: idle");

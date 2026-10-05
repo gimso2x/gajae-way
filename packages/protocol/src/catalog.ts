@@ -837,7 +837,12 @@ export type CycleGateReason =
 	| "agent_disk_headroom"
 	| "gjc_unverified_version"
 	| "monitor_dispatch_failing"
-	| "broker_respawn_churn";
+	| "broker_respawn_churn"
+	| "persona_recovery_hold"
+	| "worker_awaiting_operator"
+	| "worker_stalled"
+	| "worker_send_uncertain"
+	| "worker_evidence_invalid";
 
 /**
  * Free space on the filesystem holding the broker-bound GJC agent directory.
@@ -884,6 +889,15 @@ export interface OpsCycleResult {
 	 * settlement states surface as gates, never as healthy silence.
 	 */
 	readonly gates: readonly CycleGateReason[];
+	readonly diagnostics: readonly {
+		readonly reason: CycleGateReason;
+		readonly originKey: string | null;
+		readonly jobId: string | null;
+		readonly laneKey: string | null;
+		readonly sessionId: string | null;
+		readonly opRef: string | null;
+		readonly detail: string | null;
+	}[];
 	readonly generatedAt: string;
 	/** Gateway instance id that produced this snapshot (provenance). */
 	readonly instanceId: string;

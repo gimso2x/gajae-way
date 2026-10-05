@@ -39,7 +39,10 @@ test("a poisoned session-create key advances one epoch and retries with a fresh 
 		if (args.includes("inspect"))
 			return {
 				exitCode: 0,
-				stdout: JSON.stringify({ ok: true, result: { session: { sessionId: "fresh-session", live: true } } }),
+				stdout: JSON.stringify({
+					ok: true,
+					result: { session: { sessionId: "fresh-session", locator: { cwd: join(home, "workspace") }, live: true } },
+				}),
 				stderr: "",
 			};
 		throw new Error(`unexpected command ${args.join(" ")}`);

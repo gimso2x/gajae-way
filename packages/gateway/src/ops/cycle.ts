@@ -8,6 +8,7 @@ import {
 	type OpsCycleResult,
 	validateOriginRef,
 } from "@gajae-gateway/protocol";
+import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { DEFAULT_WORK_MAX_LANES } from "../config";
 import { isVerifiedGjcVersion } from "../orchestrator/gjc-contract";
 import { WORK_LANE_PREFIX } from "../orchestrator/lane-governor";
@@ -132,6 +133,7 @@ export interface RuntimeCycleSources {
 	 * `awaiting_operator`, or `stalled` job is a crash-left or held worker.
 	 */
 	readonly settledWorkOrigins: ReadonlySet<string>;
+	readonly diagnostics: OpsCycleResult["diagnostics"];
 	/** Headroom of the broker-bound GJC agent directory; null when none is bound. */
 	readonly agentDisk: AgentDiskView | null;
 	/** gjc version the broker client last observed; undefined before preflight or without a broker. */
@@ -198,7 +200,122 @@ export class RuntimeCycleProjector {
 		const inboundMap = new Map(inbound.map((r) => [r.state, r.n]));
 		const unknownInbound = inbound.map((r) => r.state).filter((state) => !KNOWN_INBOUND_STATES.has(state));
 		const unknownDeliveries = deliveries.map((r) => r.state).filter((state) => !KNOWN_DELIVERY_STATES.has(state));
+		const diagnostics: Array<OpsCycleResult["diagnostics"][number]> = [];
+		// Read hold metadata only for actual nonterminal turns, never stale completed ops.
+		for (const originKey of this.#database.inboundNonterminalOrigins()) {
+			for (const turn of this.#database.inboundNonterminalTurns(originKey)) {
+				const raw = this.#database.metaGet(`persona-recovery-hold:${turn.opRef}`);
+				if (raw === undefined) continue;
+				let valid = false;
+				try {
+					const hold = JSON.parse(raw);
+					const isoTime = (value: unknown): value is string =>
+						typeof value === "string" && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
+					valid =
+						hold !== null &&
+						typeof hold === "object" &&
+						hold.originKey === turn.originKey &&
+						hold.epoch === turn.epoch &&
+						hold.sessionId === turn.sessionId &&
+						hold.opRef === turn.opRef &&
+						Number.isSafeInteger(hold.epoch) &&
+						hold.epoch >= 0 &&
+						typeof hold.reason === "string" &&
+						hold.reason.length > 0 &&
+						isoTime(hold.firstObservedAt) &&
+						isoTime(hold.observedAt) &&
+						hold.observedAt >= hold.firstObservedAt;
+				} catch {
+					/* Fail closed without exposing metadata or parser errors. */
+				}
+				diagnostics.push({
+					reason: "persona_recovery_hold",
+					originKey: turn.originKey,
+					jobId: null,
+					laneKey: null,
+					sessionId: turn.sessionId,
+					opRef: turn.opRef,
+					detail: valid ? null : "invalid",
+				});
+			}
+		}
+		const runtimes = this.#database.workAttemptDiagnosticRows();
+		const settledWorkOrigins = new Set<string>();
+		const jobs = new Map<string, ReturnType<typeof parseLaneJobRecord> | null>();
+		for (const row of this.#database.laneJobRows()) {
+			const originKey = `${WORK_LANE_PREFIX}${row.lane_key.slice("work-".length)}`;
+			let record: ReturnType<typeof parseLaneJobRecord> | null = null;
+			try {
+				const parsed = parseLaneJobRecord(this.#database.laneJobJson(row.job_id) ?? "");
+				if (
+					parsed.jobId === row.job_id &&
+					parsed.state === row.state &&
+					parsed.lane.branch === row.branch &&
+					parsed.lane.worktreePath === row.worktree_path &&
+					/^work-[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(row.lane_key) &&
+					row.job_id === `lanejob-${Buffer.from(row.lane_key.slice("work-".length), "utf8").toString("hex")}`
+				)
+					record = parsed;
+			} catch {
+				/* Untrusted durable evidence is a diagnostic, never a thrown projection. */
+			}
+			jobs.set(row.job_id, record);
+			const open = runtimes.filter((runtime) => runtime.job_id === row.job_id || runtime.lane_key === row.lane_key);
+			const attempt = record?.attempts.at(-1);
+			const invalid =
+				record === null ||
+				(SETTLED_JOB_STATES.has(record.state) &&
+					(open.length > 0 || record.attempts.some((attempt) => attempt.endedAt === undefined)));
+			const reason: CycleGateReason | null = invalid
+				? "worker_evidence_invalid"
+				: record?.state === "awaiting_operator"
+					? "worker_awaiting_operator"
+					: record?.state === "stalled"
+						? "worker_stalled"
+						: null;
+			if (reason)
+				diagnostics.push({
+					reason,
+					originKey,
+					jobId: row.job_id,
+					laneKey: row.lane_key,
+					sessionId: attempt?.sessionId ?? null,
+					opRef: attempt?.opRef ?? null,
+					detail: invalid ? "invalid" : null,
+				});
+			if (
+				record &&
+				SETTLED_JOB_STATES.has(record.state) &&
+				open.length === 0 &&
+				!record.attempts.some((attempt) => attempt.endedAt === undefined)
+			)
+				settledWorkOrigins.add(originKey);
+		}
+		for (const row of runtimes) {
+			const job = jobs.get(row.job_id);
+			const matchingAttempt = job?.attempts.some(
+				(attempt) =>
+					attempt.opRef === row.op_ref && attempt.sessionId === row.session_id && attempt.endedAt === undefined,
+			);
+			const invalid = row.runtime === null || !job || SETTLED_JOB_STATES.has(job.state) || !matchingAttempt;
+			const reason: CycleGateReason | null = invalid
+				? "worker_evidence_invalid"
+				: row.runtime?.sendPhase === "uncertain"
+					? "worker_send_uncertain"
+					: null;
+			if (reason)
+				diagnostics.push({
+					reason,
+					originKey: row.runtime?.sessionKey ?? `${WORK_LANE_PREFIX}${row.lane_key.slice("work-".length)}`,
+					jobId: row.job_id,
+					laneKey: row.lane_key,
+					sessionId: row.session_id,
+					opRef: row.op_ref,
+					detail: invalid ? "invalid" : null,
+				});
+		}
 		return {
+			diagnostics,
 			sessionRows: sessions,
 			inboundCounts: inboundMap,
 			inFlightInbound,
@@ -220,12 +337,7 @@ export class RuntimeCycleProjector {
 			instanceId: this.#database.instanceId,
 			activeLanes: this.#database.workLaneRows().length,
 			maxLanes: this.#maxLanes,
-			settledWorkOrigins: new Set(
-				this.#database
-					.laneJobRows()
-					.filter((row) => SETTLED_JOB_STATES.has(row.state))
-					.map((row) => `${WORK_LANE_PREFIX}${row.lane_key.slice("work-".length)}`),
-			),
+			settledWorkOrigins,
 			agentDisk: this.#agentDir === undefined ? null : observeAgentDisk(this.#agentDir),
 			gjcVersion: this.#gjcVersion(),
 			monitorTerminalStreak: this.#database.monitorConsecutiveTerminalFailures(),
@@ -236,7 +348,7 @@ export class RuntimeCycleProjector {
 
 /** Pure projection over already-snapshotted sources — independently unit-testable. */
 export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: string): OpsCycleResult {
-	const gates = new Set<CycleGateReason>();
+	const gates = new Set<CycleGateReason>(sources.diagnostics.map((diagnostic) => diagnostic.reason));
 
 	const sessions: CycleSessionView[] = sources.sessionRows.map((row) => {
 		const origin = parseOriginRef(row.origin_ref_json);
@@ -336,6 +448,7 @@ export function projectRuntimeCycle(sources: RuntimeCycleSources, generatedAt: s
 	return {
 		phase,
 		gates: [...gates],
+		diagnostics: sources.diagnostics,
 		generatedAt,
 		instanceId: sources.instanceId,
 		memoryClosing,

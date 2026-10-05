@@ -378,6 +378,12 @@ export class BrokerSessionPort implements SessionPort {
 		const existing = this.#database.getSessionRecord(input.originKey);
 		if (existing?.epoch === input.epoch && existing.sessionId) {
 			this.#assertOwned({ sessionId: existing.sessionId, repo: input.repo });
+			if (this.#database.metaGet(`session_readiness_pending:${existing.sessionId}`) !== undefined) {
+				await this.#awaitIndexed(existing.sessionId, input.repo);
+				this.#database.metaDelete(`session_readiness_pending:${existing.sessionId}`);
+				this.#resetCreateRotations(input.originKey);
+				return { sessionId: existing.sessionId, originKey: input.originKey, epoch: input.epoch, repo: input.repo };
+			}
 			// Only owned bindings may be inspected, resumed, or replaced.
 			let indexed = true;
 			try {
@@ -467,7 +473,9 @@ export class BrokerSessionPort implements SessionPort {
 		// session.create returns once the host is admitted; the Router indexes it
 		// a moment later. A tail/send before that answers session_unavailable, so
 		// wait until the broker reports the id live before handing the binding out.
+		this.#database.metaSet(`session_readiness_pending:${created.sessionId}`, "1");
 		await this.#awaitIndexed(created.sessionId, input.repo);
+		this.#database.metaDelete(`session_readiness_pending:${created.sessionId}`);
 		this.#resetCreateRotations(input.originKey);
 		return {
 			sessionId: created.sessionId,
@@ -490,37 +498,53 @@ export class BrokerSessionPort implements SessionPort {
 
 	#createChain: Promise<unknown> = Promise.resolve();
 
-	/** Judged on the raw inspect envelope: readiness needs only `live`, not a normalized locator. */
+	/** Readiness is proven only by the exact id, locator.cwd, live and not-deleted on the raw inspect envelope. */
 	async #awaitIndexed(sessionId: string, repo: string): Promise<void> {
 		this.#assertOwned({ sessionId, repo });
-		const deadline = Date.now() + SESSION_READY_TIMEOUT_MS;
-		let lastCode: string | undefined;
+		const deadline = this.#now() + SESSION_READY_TIMEOUT_MS;
+		let lastCode = "inspect_incomplete";
 		for (;;) {
 			try {
-				const result = await this.#cli(["sdk", "session", "inspect", sessionId], { timeoutMs: 10_000 });
+				const remainingMs = deadline - this.#now();
+				if (remainingMs <= 0) break;
+				const result = await this.#cli(["sdk", "session", "inspect", sessionId], {
+					timeoutMs: Math.min(10_000, remainingMs),
+				});
 				const envelope = JSON.parse(result.stdout) as {
 					ok?: unknown;
-					result?: { session?: { live?: unknown } };
+					result?: {
+						session?: { sessionId?: unknown; locator?: { cwd?: unknown }; live?: unknown; deleted?: unknown };
+					};
 					error?: { code?: unknown };
 				};
-				// Only a broker that explicitly reports the id as not indexed / not
-				// live keeps us waiting; anything else is treated as ready (the send
-				// path still has its own recovery if that turns out to be wrong).
-				const disowned = envelope.ok === false && isSessionGoneCode(envelope.error?.code);
-				const notLive =
-					envelope.ok === true && envelope.result?.session !== undefined && envelope.result.session.live === false;
-				if (!disowned && !notLive) return;
-				lastCode = disowned ? "session_unavailable" : "not_live";
+				const session = envelope?.result?.session;
+				if (
+					result.exitCode === 0 &&
+					envelope?.ok === true &&
+					session?.sessionId === sessionId &&
+					session.locator?.cwd === repo &&
+					session.live === true &&
+					session.deleted !== true &&
+					this.#now() < deadline
+				) {
+					this.#assertOwned({ sessionId, repo });
+					return;
+				}
+				lastCode = stableErrorCode(envelope?.error?.code) ?? "inspect_incomplete";
 			} catch (error) {
 				if (error instanceof BrokerAuthorityError) throw error;
-				const code = sdkErrorCode(error);
-				if (!isSessionGoneCode(code)) return;
-				lastCode = code;
+				lastCode = sdkErrorCode(error) ?? "inspect_failed";
 			}
-			if (Date.now() >= deadline)
-				throw new Error(`session ${sessionId} was created but never became live (${lastCode})`);
-			await this.#sleep(SESSION_READY_POLL_MS);
+			const remainingMs = deadline - this.#now();
+			if (remainingMs <= 0) break;
+			await this.#sleep(Math.min(SESSION_READY_POLL_MS, remainingMs));
 		}
+		console.error(`session_readiness_uncertain session=${sessionId} reason=${lastCode}`);
+		throw new GjcCliError(`session ${sessionId} readiness could not be proven`, 0, "", {
+			code: "readiness_timeout",
+			reason: "session_readiness_uncertain",
+			sessionId,
+		});
 	}
 
 	/** Cold creates are serialized per agent dir: parallel launches starve gjc's lifecycle launcher. */

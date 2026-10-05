@@ -670,7 +670,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				await lanes.retireAllDead();
 			})
 			.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`));
-	}, 60_000);
+	}, options.config.reconcileIntervalMs ?? 60_000);
 	const deliverySweepTimer = setInterval(() => {
 		try {
 			// The age TTL runs with or without an adapter: an unsettled row must reach
