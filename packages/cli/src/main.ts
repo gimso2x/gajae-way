@@ -282,6 +282,11 @@ export function renderCycle(cycle: OpsCycleResult): string[] {
 	lines.push(`phase: ${cycle.phase}`);
 	if (cycle.gates.length > 0) lines.push(`gates: ${cycle.gates.join(", ")}`);
 	else lines.push("gates: none");
+	for (const diagnostic of cycle.diagnostics) {
+		lines.push(
+			`diagnostic: ${diagnostic.reason} actionableIds: originKey=${diagnostic.originKey ?? "-"} jobId=${diagnostic.jobId ?? "-"} laneKey=${diagnostic.laneKey ?? "-"} sessionId=${diagnostic.sessionId ?? "-"} opRef=${diagnostic.opRef ?? "-"} detail=${diagnostic.detail ?? "-"}`,
+		);
+	}
 	lines.push(`generatedAt: ${cycle.generatedAt}`);
 	lines.push(`instance: ${cycle.instanceId}`);
 	lines.push(`inbound: pending=${cycle.pendingInbound} inflight=${cycle.inFlightInbound}`);

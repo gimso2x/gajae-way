@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtemp, rm } from "node:fs/promises";
+import { appendAttempt, createLaneJobRecord } from "@gajae-gateway/subsession";
+import { GatewayDatabase, type WorkAttemptRuntime, workAttemptDeliveryId, workAttemptReportId } from "../src/store/db";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -7,6 +11,7 @@ import {
 	INBOUND_STARVATION_MS,
 	observeAgentDisk,
 	projectRuntimeCycle,
+	RuntimeCycleProjector,
 	type RuntimeCycleSources,
 } from "../src/ops/cycle";
 
@@ -41,6 +46,7 @@ function sources(overrides: Partial<RuntimeCycleSources> = {}): RuntimeCycleSour
 		activeLanes: 0,
 		maxLanes: 8,
 		settledWorkOrigins: new Set(),
+		diagnostics: [],
 		agentDisk: null,
 	};
 	const merged = { ...defaults, ...overrides };
@@ -382,5 +388,272 @@ describe("runtime cycle projection", () => {
 		);
 		expect(result.sessions).toHaveLength(1);
 		expect(result.sessions[0].originKey).toBe(boundSession.origin_key);
+	});
+});
+
+const diagnosticSession = "ad2f2494-2584-4d13-b7b6-c6ac24a1087f";
+
+async function diagnosticFixture() {
+	const home = await mkdtemp(join(tmpdir(), "cycle-diagnostics-"));
+	const path = join(home, "gateway.db");
+	const database = await GatewayDatabase.open(path);
+	const raw = new Database(path);
+	const project = () => {
+		const tables = raw
+			.query<{ name: string }, []>(
+				"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+			)
+			.all();
+		const snapshot = () => tables.map(({ name }) => raw.query(`SELECT * FROM "${name}"`).all());
+		const before = snapshot();
+		// A projection attempting any durable write must fail, even an idempotent one.
+		for (const { name } of tables)
+			for (const action of ["INSERT", "UPDATE", "DELETE"]) {
+				raw.exec(
+					`CREATE TRIGGER "cycle_guard_${name}_${action}" BEFORE ${action} ON "${name}" BEGIN SELECT RAISE(ABORT, 'projection_write'); END`,
+				);
+			}
+		try {
+			const cycle = new RuntimeCycleProjector(database, { queueDepth: 0 }).project(new Date(generatedAt));
+			expect(snapshot()).toEqual(before);
+			return cycle;
+		} finally {
+			for (const { name } of tables)
+				for (const action of ["INSERT", "UPDATE", "DELETE"]) raw.exec(`DROP TRIGGER "cycle_guard_${name}_${action}"`);
+		}
+	};
+	return {
+		database,
+		raw,
+		project,
+		close: async () => {
+			raw.close();
+			database.close();
+			await rm(home, { recursive: true, force: true });
+		},
+	};
+}
+
+function diagnosticJob(
+	f: Awaited<ReturnType<typeof diagnosticFixture>>,
+	state: "running" | "done" | "awaiting_operator" | "stalled",
+	open = false,
+) {
+	const initial = createLaneJobRecord({
+		jobId: "lanejob-61",
+		branch: "main",
+		worktreePath: "/work",
+		sessionId: diagnosticSession,
+		now: () => new Date(generatedAt),
+	});
+	const record = {
+		...(open
+			? appendAttempt(initial, { opRef: "gw-cycle-worker", sessionId: diagnosticSession, startedAt: generatedAt })
+			: initial),
+		state,
+	};
+	f.database.putLaneJob({ ...record, laneKey: "work-a", json: JSON.stringify(record) });
+	return record;
+}
+
+function diagnosticRuntime(f: Awaited<ReturnType<typeof diagnosticFixture>>) {
+	const record = diagnosticJob(f, "running", true);
+	const runtime: WorkAttemptRuntime = {
+		opRef: "gw-cycle-worker",
+		jobId: record.jobId,
+		laneKey: "work-a",
+		sessionKey: "work/task/a",
+		sessionId: diagnosticSession,
+		epoch: 0,
+		cwd: "/work",
+		startedAt: generatedAt,
+		mode: "run",
+		sendPhase: "uncertain",
+		sendEvidence: null,
+		terminal: null,
+		output: { disposition: "pending", reads: 0, nextReadAt: null, excerpt: null, proof: null, knownSilence: null },
+		parent: null,
+		reportId: workAttemptReportId(f.database.instanceId, record.jobId, "gw-cycle-worker"),
+		wakeReportId: null,
+		noticeHash: null,
+		deliveryId: workAttemptDeliveryId(f.database.instanceId, record.jobId, "gw-cycle-worker"),
+		decision: "undecided",
+		settledAt: null,
+		version: 0,
+	};
+	f.raw
+		.query(
+			"INSERT INTO work_attempt_runtime(op_ref, job_id, lane_key, session_id, version, settled_at, delivery_id, record_json) VALUES (?, ?, ?, ?, 0, NULL, ?, ?)",
+		)
+		.run(runtime.opRef, runtime.jobId, runtime.laneKey, runtime.sessionId, runtime.deliveryId, JSON.stringify(runtime));
+	return runtime;
+}
+
+describe("durable cycle diagnostics", () => {
+	test("exact active persona hold gates with all IDs; invalid evidence fails closed and completed stale holds are ignored", async () => {
+		const f = await diagnosticFixture();
+		try {
+			const originKey = boundSession.origin_key;
+			f.database.putSession(originKey, diagnosticSession);
+			f.database.inboundEnqueue({
+				messageId: "held",
+				originKey,
+				originRefJson: boundSession.origin_ref_json,
+				body: "SECRET_PROMPT",
+				receivedAt: generatedAt,
+			});
+			f.database.inboundBindTurn({
+				messageId: "held",
+				originKey,
+				epoch: 0,
+				opRef: "gw-p-held",
+				sessionId: diagnosticSession,
+			});
+			const key = "persona-recovery-hold:gw-p-held";
+			const hold = {
+				originKey,
+				epoch: 0,
+				sessionId: diagnosticSession,
+				opRef: "gw-p-held",
+				firstObservedAt: generatedAt,
+				observedAt: generatedAt,
+				reason: "SECRET_REASON",
+			};
+			const valid = JSON.stringify(hold);
+			const invalids = [
+				"{SECRET_JSON",
+				"null",
+				JSON.stringify({ ...hold, firstObservedAt: "bad" }),
+				JSON.stringify({ ...hold, observedAt: "bad" }),
+				JSON.stringify({ ...hold, observedAt: "2026-08-25T23:59:59.999Z" }),
+				JSON.stringify({ ...hold, firstObservedAt: "2026-10-03" }),
+				JSON.stringify({ ...hold, originKey: "foreign" }),
+				JSON.stringify({ ...hold, epoch: 1 }),
+				JSON.stringify({ ...hold, sessionId: "foreign" }),
+				JSON.stringify({ ...hold, opRef: "foreign" }),
+			];
+			for (const raw of [valid, ...invalids]) {
+				f.database.metaSet(key, raw);
+				const cycle = f.project();
+				expect(cycle.phase).toBe("degraded");
+				expect(cycle.gates).toEqual(["persona_recovery_hold"]);
+				expect(cycle.diagnostics).toEqual([
+					{
+						reason: "persona_recovery_hold",
+						originKey,
+						jobId: null,
+						laneKey: null,
+						sessionId: diagnosticSession,
+						opRef: "gw-p-held",
+						detail: raw === valid ? null : "invalid",
+					},
+				]);
+				expect(JSON.stringify(cycle)).not.toContain("SECRET");
+				expect(f.database.metaGet(key)).toBe(raw);
+			}
+			f.database.inboundTurnComplete("gw-p-held");
+			expect(f.project().diagnostics).toEqual([]);
+			expect(f.project().phase).toBe("idle");
+		} finally {
+			await f.close();
+		}
+	});
+
+	test("settled retirement requires valid JSON, matching SQL identity/state/branch/worktree and no open attempt", async () => {
+		const f = await diagnosticFixture();
+		try {
+			f.database.putSession("work/task/a", "");
+			const valid = diagnosticJob(f, "done");
+			expect(f.project().gates).toEqual([]);
+			for (const patch of [
+				"{SECRET_JOB",
+				JSON.stringify({ ...valid, jobId: "lanejob-foreign" }),
+				JSON.stringify({ ...valid, state: "running" }),
+				JSON.stringify({ ...valid, lane: { ...valid.lane, branch: "foreign" } }),
+				JSON.stringify({ ...valid, lane: { ...valid.lane, worktreePath: "/foreign" } }),
+			]) {
+				f.raw.query("UPDATE lane_jobs SET record_json = ? WHERE job_id = ?").run(patch, valid.jobId);
+				const cycle = f.project();
+				expect(cycle.gates).toContain("worker_evidence_invalid");
+				expect(cycle.gates).toContain("stale_session_identity");
+				expect(cycle.diagnostics).toEqual([
+					{
+						reason: "worker_evidence_invalid",
+						originKey: "work/task/a",
+						jobId: valid.jobId,
+						laneKey: "work-a",
+						sessionId: null,
+						opRef: null,
+						detail: "invalid",
+					},
+				]);
+				expect(JSON.stringify(cycle)).not.toContain("SECRET");
+			}
+			diagnosticJob(f, "done", true);
+			expect(f.project().gates).toContain("stale_session_identity");
+			expect(f.project().gates).toContain("worker_evidence_invalid");
+		} finally {
+			await f.close();
+		}
+	});
+
+	test("awaiting operator and stalled jobs have distinct actionable gates even without open runtimes", async () => {
+		const f = await diagnosticFixture();
+		try {
+			for (const state of ["awaiting_operator", "stalled"] as const) {
+				diagnosticJob(f, state, true);
+				const reason = state === "stalled" ? "worker_stalled" : "worker_awaiting_operator";
+				const cycle = f.project();
+				expect(cycle.gates).toEqual([reason]);
+				expect(cycle.diagnostics).toEqual([
+					{
+						reason,
+						originKey: "work/task/a",
+						jobId: "lanejob-61",
+						laneKey: "work-a",
+						sessionId: diagnosticSession,
+						opRef: "gw-cycle-worker",
+						detail: null,
+					},
+				]);
+			}
+		} finally {
+			await f.close();
+		}
+	});
+
+	test("uncertain sends retain exact validated IDs; corrupt open runtime retains SQL IDs and cannot prove retirement", async () => {
+		const f = await diagnosticFixture();
+		try {
+			const runtime = diagnosticRuntime(f);
+			const ids = {
+				originKey: runtime.sessionKey,
+				jobId: runtime.jobId,
+				laneKey: runtime.laneKey,
+				sessionId: runtime.sessionId,
+				opRef: runtime.opRef,
+			};
+			expect(f.project().diagnostics).toEqual([{ reason: "worker_send_uncertain", ...ids, detail: null }]);
+			f.raw.query("DELETE FROM lane_jobs WHERE job_id = ?").run(runtime.jobId);
+			expect(f.project().diagnostics).toEqual([{ reason: "worker_evidence_invalid", ...ids, detail: "invalid" }]);
+			diagnosticJob(f, "running", true);
+			for (const raw of [
+				"{SECRET_RUNTIME",
+				JSON.stringify({ ...runtime, opRef: "gw-forged-runtime" }),
+				JSON.stringify({ ...runtime, sessionId: "foreign" }),
+				JSON.stringify({ ...runtime, sendPhase: "unknown" }),
+			]) {
+				f.raw.query("UPDATE work_attempt_runtime SET record_json = ? WHERE op_ref = ?").run(raw, runtime.opRef);
+				const cycle = f.project();
+				expect(cycle.gates).toContain("worker_evidence_invalid");
+				expect(cycle.diagnostics).toEqual([{ reason: "worker_evidence_invalid", ...ids, detail: "invalid" }]);
+				expect(JSON.stringify(cycle)).not.toContain("SECRET");
+			}
+			f.database.putSession("work/task/a", "");
+			diagnosticJob(f, "done");
+			expect(f.project().gates).toContain("stale_session_identity");
+		} finally {
+			await f.close();
+		}
 	});
 });

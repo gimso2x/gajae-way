@@ -69,6 +69,14 @@ export interface GatewayConfigFile {
 	readonly channels?: Readonly<Record<string, ChannelPolicy>>;
 	/** Tail liveness alarm threshold in milliseconds. It never kills a running turn. */
 	readonly stallTimeoutMs?: number;
+	/**
+	 * Recovery/reconcile sweep cadence in milliseconds. This periodic pass
+	 * requeues a turn held by a dead session host (the "first message after
+	 * idle" recovery path), reconciles monitors, and sweeps worker lanes.
+	 * Lower it to cut the fixed wait between a failed attach and the requeue.
+	 * Default 60000.
+	 */
+	readonly reconcileIntervalMs?: number;
 	/** Author ids allowed to trigger mention-gated group turns; absent/empty = anyone. */
 	readonly mentionAllowlist?: readonly string[];
 	/**
@@ -337,6 +345,12 @@ function parseStallTimeout(value: unknown): number {
 	return value as number;
 }
 
+function parseReconcileInterval(value: unknown): number {
+	if (!Number.isInteger(value) || (value as number) < 1_000 || (value as number) > 3_600_000)
+		throw new ConfigError("config_invalid", "reconcileIntervalMs must be an integer between 1000 and 3600000");
+	return value as number;
+}
+
 function parseOwnerTarget(value: unknown): { readonly origin: OriginRef } {
 	const input = requireObject(value, "ownerTarget");
 	if (Object.keys(input).some((key) => key !== "origin"))
@@ -462,6 +476,9 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 			? {}
 			: { mentionAllowlist: parseStringArray(input.mentionAllowlist, "mentionAllowlist") }),
 		...(input.stallTimeoutMs === undefined ? {} : { stallTimeoutMs: parseStallTimeout(input.stallTimeoutMs) }),
+		...(input.reconcileIntervalMs === undefined
+			? {}
+			: { reconcileIntervalMs: parseReconcileInterval(input.reconcileIntervalMs) }),
 		...(model ? { model } : {}),
 		...(serviceTier ? { serviceTier } : {}),
 		...(input.dmPolicy === undefined ? {} : { dmPolicy: parseDmPolicy(input.dmPolicy) }),
@@ -538,6 +555,7 @@ export async function loadConfig(
 		dbPath: overrides.dbPath ?? fileConfig.dbPath ?? join(home, "gateway.db"),
 		logVerbosity: overrides.logVerbosity ?? fileConfig.logVerbosity ?? "info",
 		stallTimeoutMs: fileConfig.stallTimeoutMs ?? 120_000,
+		reconcileIntervalMs: fileConfig.reconcileIntervalMs ?? 60_000,
 	};
 }
 
@@ -591,6 +609,7 @@ export const RESTART_REQUIRED_FIELDS = [
 	"ownerTarget",
 	"monitorContextFailureRollThreshold",
 	"work",
+	"reconcileIntervalMs",
 ] as const;
 
 /**

@@ -69,11 +69,12 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
   "watcherRoots": ["/Users/me/automations"],
   "scriptRoot": "/Users/me/automations",
-  "stallTimeoutMs": 120000
+  "stallTimeoutMs": 120000,
+  "reconcileIntervalMs": 60000
 }
 ```
 
-`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, and `stallTimeoutMs` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
+`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, `stallTimeoutMs`, and `reconcileIntervalMs` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, `reconcileIntervalMs` (the persona-recovery/monitor/worker-lane sweep cadence; the pass that requeues a turn held by a dead session host) defaults to 60000 ms, and log verbosity defaults to `info`. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
 
 ## Slack adapter
 
@@ -114,7 +115,7 @@ A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on t
 The reload is fail-safe and reports exactly what it did:
 
 - `changed` — fields applied live: `mentionAllowlist`, `channels`, `stallTimeoutMs`, and `dmPolicy`. Verify the next event through the path consuming the changed policy.
-- `restartRequired` — fields bound to startup resources: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, and `work`. They are reported and deliberately NOT applied; restart to pick them up.
+- `restartRequired` — fields bound to startup resources: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, `work`, and `reconcileIntervalMs`. They are reported and deliberately NOT applied; restart to pick them up.
 - `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
 - On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.
 
@@ -261,3 +262,45 @@ If the gate model is unreachable, both steps fail open: the turn runs and the re
 - **Recovery or restore:** use the [operator runbook](runbooks/gajaeway-v1.md), especially its backup, restore, crash-recovery, and schema guidance.
 
 Read [architecture](architecture.md) for delivery semantics and [memory](memory.md) for the private Markdown repository.
+
+
+## OCI2 SE 운영 보완 (2026-10-03)
+
+SE 전용 복구 자료는 `~/backups/gajaeway-se/se-*.tar.gz`에 14개 보관한다.
+`gajaeway-se-backup.timer`가 매일 03:55 로컬 시간에 SQLite 온라인 backup을 수행한다.
+봇 config/Slack 설정·secrets·persona·memory·saved SDK transcripts와 user units 및 유지보수 scripts를 포함하며,
+실행 endpoint를 복원 가능한 authority로 보관하지 않는다. archive/root 권한은 0600/0700이다.
+성공 반환 전에 모든 파일 checksum, SQLite integrity 및 원장 건수의 복원 검증을 수행한다.
+기존 `backup-configs.service`는 다른 서비스의 기존 설정 백업으로 유지하며 SE DB 복구 증거로 사용하지 않는다.
+
+`gajaeway-se-health.timer`는 5분마다 service 상태, 실행/설치 binary hash, 보호 옵션,
+cycle gates, active persona hold, 장기 미정산 op status 및 worker record identity/uncertainty,
+백업 freshness(36h)와 checksum/restore를 읽기 전용으로 점검한다.
+결과는 `~/.gajaeway/se-health.json`과 user journal에 기록된다.
+`gajaeway-se-alert.service`는 같은 장애 종류를 반복 DM하지 않으며 장애/복구 전이를
+config의 단일 mentionAllowlist 소유자에게 알린다. 경보는 취소·replay·SDK marker 삭제 권한이 아니다.
+
+신규 session.create 이후 준비 완료는 exact sessionId, locator.cwd, live=true,
+deleted!=true와 소유권으로 검증한다. `session_readiness_pending:<sid>`는 준비 미확정
+binding을 보존하며 다음 bind도 같은 ID를 read-only inspect한다. 성공 후 marker만 제거한다.
+기존 유휴 세션의 resume/rebind 정책은 이번 작업에서 변경하지 않았다.
+PM/PA/DEV의 추가 resume 변경은 SDK EEXIST 검증 문제로 SE에 복제하지 않았다.
+
+SE 후속 진단은 실제 nonterminal trigger에 한해 `persona-recovery-hold:<opRef>`를 읽는다.
+actor가 `{originKey,epoch,sessionId,opRef,firstObservedAt,observedAt,reason}`을 저장하며
+동일 op를 재관측하거나 재시작해도 최초 시각을 유지한다. 정상 조회의 `unknown`은 정산 근거가 아니다.
+정확한 terminal 정산 후 marker를 제거하며, 완료 op에 남은 metadata는 cycle 경보에서 제외한다.
+손상·신원 불일치·시간 오류는 fail-closed로 진단한다. `ops cycle --json`의 `diagnostics`에는
+정확한 origin/job/lane/session/opRef와 제한된 사유만 담고 작업 원문·비밀은 넣지 않는다.
+worker JSON과 SQL 신원 불일치 또는 열린 attempt는 정상 retirement 증거로 사용할 수 없다.
+
+실행 중 `mentionAllowlist` 등 reloadable 설정을 편집한 뒤에는 `gateway.reloadConfig`를 호출하거나
+gateway 프로세스에 `SIGHUP`을 보내고 `ok` 및 `changed`를 확인해야 한다. 파일 편집만으로
+실행 중 정책이 바뀌었다고 판정하지 않는다. 통합 검증용 발신 권한은 한 계정·한 요청으로 제한하고,
+접수 직후 소유자 전용 정책으로 원복한 뒤 다시 reload한다. Slack 입력→정확한 SDK terminal 및
+receipt→delivery confirmed→해당 스레드 실제 nonce를 함께 확인한다.
+
+복구 drill은 `/usr/bin/python3 ~/services/se-maintenance-test.py`로 실행한다.
+service 재시작은 pending bound/accepted trigger가 없고 DB integrity=ok일 때만 수행하며,
+공유 GJC broker·profile을 변경하지 않는다. gateway는 KillMode=process/30s,
+Slack adapter는 KillMode=process/15s를 유지한다.

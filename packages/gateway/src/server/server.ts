@@ -623,7 +623,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 				await lanes.retireAllDead();
 			})
 			.catch((error: unknown) => console.error(`lane recovery/sweep failed: ${diagnostic(error)}`));
-	}, 60_000);
+	}, options.config.reconcileIntervalMs ?? 60_000);
 	const deliverySweepTimer = setInterval(() => {
 		if (![...connections].some((connection) => connection.negotiated)) return;
 		try {

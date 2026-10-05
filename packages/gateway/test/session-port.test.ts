@@ -126,6 +126,15 @@ test("AC-K rendered SDK prompt is notice + blank line + task; broker SessionPort
 	const calls: string[][] = [];
 	const run: CliRunner = async (args) => {
 		calls.push([...args]);
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: { session: { sessionId: "sdk-1", locator: { cwd: "/tmp/repo" }, live: true } },
+				}),
+				stderr: "",
+			};
 		if (args.includes("session.create"))
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-1" } }), stderr: "" };
 		if (args.includes("model.profile.set"))
@@ -284,7 +293,10 @@ test("broker SessionPort rebinds a saved binding on an explicit session_unavaila
 		if (args.includes("inspect") && args.includes("fresh-1"))
 			return {
 				exitCode: 0,
-				stdout: JSON.stringify({ ok: true, result: { session: { sessionId: "fresh-1", live: true } } }),
+				stdout: JSON.stringify({
+					ok: true,
+					result: { session: { sessionId: "fresh-1", locator: { cwd: repo }, live: true } },
+				}),
 				stderr: "",
 			};
 		throw new Error(`unexpected command ${args.join(" ")}`);
@@ -470,6 +482,15 @@ test("broker SessionPort retries a terminal-uncertain lifecycle create with the 
 	const createKeys: string[] = [];
 	const sleeps: number[] = [];
 	const run: CliRunner = async (args) => {
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: { session: { sessionId: "sdk-after-retry", locator: { cwd: join(home, "workspace") }, live: true } },
+				}),
+				stderr: "",
+			};
 		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
 		createKeys.push(args[args.indexOf("--idempotency-key") + 1]!);
 		if (createCalls++ === 0)
@@ -536,6 +557,15 @@ test("bind rebinds a persisted live-false session instead of handing a dead moni
 				return {
 					exitCode: 0,
 					stdout: JSON.stringify({ ok: true, result: { sessionId: "fresh-session" } }),
+					stderr: "",
+				};
+			if (args.includes("inspect") && args.includes("fresh-session"))
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify({
+						ok: true,
+						result: { session: { sessionId: "fresh-session", locator: { cwd: repo }, live: true } },
+					}),
 					stderr: "",
 				};
 			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: {} }), stderr: "" };
@@ -1281,3 +1311,115 @@ for (const progressing of [true, false]) {
 		}
 	});
 }
+
+test("cold create requires exact live cwd proof after incomplete, nonzero, and failed inspections", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-cold-proof-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	const ready = { sessionId: "cold-1", locator: { cwd: repo }, live: true, deleted: false };
+	const proofs = [
+		{},
+		{ session: {} },
+		{ session: { ...ready, sessionId: "wrong" } },
+		{ session: { ...ready, locator: { cwd: "wrong" } } },
+		{ session: { ...ready, locator: { repo } } },
+		{ session: { ...ready, live: false } },
+		{ session: { ...ready, live: "true" } },
+		{ session: { ...ready, deleted: true } },
+	];
+	let clock = 0;
+	let inspections = 0;
+	const calls: string[][] = [];
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		instanceId: "cold-proof",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+		},
+		cli: async (args) => {
+			calls.push([...args]);
+			if (args.includes("session.create"))
+				return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "cold-1" } }), stderr: "" };
+			expect(args).toEqual(["sdk", "session", "inspect", "cold-1"]);
+			const index = inspections++;
+			if (index === 0) throw new Error("transport unavailable");
+			if (index === 1) return { exitCode: 0, stdout: "{broken", stderr: "" };
+			if (index === 2)
+				return { exitCode: 0, stdout: JSON.stringify({ ok: false, error: { code: "operation_failed" } }), stderr: "" };
+			if (index === 3)
+				return { exitCode: 1, stdout: JSON.stringify({ ok: true, result: { session: ready } }), stderr: "" };
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: proofs[index - 4] ?? { session: ready } }),
+				stderr: "",
+			};
+		},
+	});
+	await expect(port.bind({ originKey: "cold", epoch: 4, repo })).resolves.toMatchObject({
+		sessionId: "cold-1",
+		epoch: 4,
+	});
+	expect(inspections).toBe(proofs.length + 5);
+	expect(clock).toBe((inspections - 1) * 250);
+	expect(calls.filter((args) => args.includes("session.create"))).toHaveLength(1);
+});
+
+test("cold readiness timeout preserves created identity and epoch without duplicate creation", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-cold-timeout-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	let clock = 0;
+	let ready = false;
+	let readinessDeadline = 60_000;
+	const calls: string[][] = [];
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		instanceId: "cold-timeout",
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+		},
+		cli: async (args, options) => {
+			calls.push([...args]);
+			if (args.includes("session.create"))
+				return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "uncertain-1" } }), stderr: "" };
+			expect(args).toEqual(["sdk", "session", "inspect", "uncertain-1"]);
+			expect(options?.timeoutMs).toBeLessThanOrEqual(readinessDeadline - clock);
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					result: ready ? { session: { sessionId: "uncertain-1", live: true, locator: { cwd: repo } } } : {},
+				}),
+				stderr: "",
+			};
+		},
+	});
+	await expect(port.bind({ originKey: "cold-timeout", epoch: 7, repo })).rejects.toMatchObject({
+		name: "GjcCliError",
+		details: { code: "readiness_timeout", reason: "session_readiness_uncertain", sessionId: "uncertain-1" },
+	});
+	expect(clock).toBe(60_000);
+	expect(database.getSessionRecord("cold-timeout")).toMatchObject({ sessionId: "uncertain-1", epoch: 7 });
+	expect(database.metaGet("create_rotation:cold-timeout")).toBeUndefined();
+	expect(database.metaGet("session_readiness_pending:uncertain-1")).toBe("1");
+	readinessDeadline = 120_000;
+	await expect(port.bind({ originKey: "cold-timeout", epoch: 7, repo })).rejects.toMatchObject({ name: "GjcCliError" });
+	expect(clock).toBe(120_000);
+	expect(calls.filter((args) => args.includes("session.create"))).toHaveLength(1);
+	ready = true;
+	readinessDeadline = 180_000;
+	await expect(port.bind({ originKey: "cold-timeout", epoch: 7, repo })).resolves.toMatchObject({
+		sessionId: "uncertain-1",
+		epoch: 7,
+	});
+	expect(calls.filter((args) => args.includes("session.create"))).toHaveLength(1);
+	expect(database.metaGet("session_readiness_pending:uncertain-1")).toBeUndefined();
+});

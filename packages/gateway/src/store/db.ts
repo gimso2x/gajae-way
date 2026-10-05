@@ -1019,6 +1019,28 @@ export class GatewayDatabase {
 		}
 	}
 
+	/** Read-only census retaining SQL identities even when runtime evidence is corrupt. */
+	workAttemptDiagnosticRows(): readonly {
+		op_ref: string;
+		job_id: string;
+		lane_key: string;
+		session_id: string;
+		runtime: WorkAttemptRuntime | null;
+	}[] {
+		return this.#database
+			.query<{ op_ref: string; job_id: string; lane_key: string; session_id: string }, []>(
+				"SELECT op_ref, job_id, lane_key, session_id FROM work_attempt_runtime WHERE settled_at IS NULL AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = work_attempt_runtime.job_id) ORDER BY op_ref",
+			)
+			.all()
+			.map((row) => {
+				try {
+					return { ...row, runtime: this.workAttemptGet(row.op_ref) ?? null };
+				} catch {
+					return { ...row, runtime: null };
+				}
+			});
+	}
+
 	/** Keyset pagination: callers can recover arbitrarily many lanes in bounded reads. */
 	workAttemptOpen(limit = 100, afterOpRef = ""): readonly WorkAttemptRuntime[] {
 		workAssert(Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000);

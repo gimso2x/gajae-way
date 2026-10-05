@@ -550,6 +550,16 @@ type BoundTurn = PersonaTurnIdentity & {
 	dispatchedAtMs?: number;
 };
 
+type RecoveryHold = {
+	originKey: string;
+	epoch: number;
+	sessionId: string;
+	opRef: string;
+	firstObservedAt: string;
+	observedAt: string;
+	reason: string;
+};
+
 class OriginActor {
 	readonly #manager: PersonaSessionManager;
 	readonly originKey: string;
@@ -568,17 +578,89 @@ class OriginActor {
 	#stopped = false;
 	readonly #deliveredEvents = new Set<string>();
 	#recoveryScanned = false;
+	/** Undefined values retain malformed markers until the operation is settled. */
+	readonly #recoveryHolds = new Map<string, RecoveryHold | undefined>();
 
 	constructor(manager: PersonaSessionManager, originKey: string) {
 		this.#manager = manager;
 		this.originKey = originKey;
+		for (const turn of manager.database.inboundNonterminalTurns(originKey)) this.#restoreRecoveryHold(turn);
 	}
 
 	admissionHold(): string | undefined {
 		if (this.#bindWedged) return "broker_wedged";
 		if (this.#lastBindHoldReason) return this.#lastBindHoldReason;
 		if (this.#manager.database.inboundHasQuarantinedNonterminalTurn(this.originKey)) return "quarantined_turn";
+		if ([...this.#recoveryHolds.values()].some((hold) => hold === undefined)) return "recovery_hold";
 		return undefined;
+	}
+
+	#restoreRecoveryHold(turn: Pick<InboundTurn, "opRef" | "epoch" | "sessionId">): void {
+		const raw = this.#manager.database.metaGet(`persona-recovery-hold:${turn.opRef}`);
+		if (raw === undefined) return;
+		let hold: RecoveryHold | undefined;
+		try {
+			const value = JSON.parse(raw);
+			const isoTime = (at: unknown): at is string =>
+				typeof at === "string" && Number.isFinite(Date.parse(at)) && new Date(at).toISOString() === at;
+			if (
+				value !== null &&
+				value.originKey === this.originKey &&
+				value.opRef === turn.opRef &&
+				value.epoch === turn.epoch &&
+				Number.isSafeInteger(value.epoch) &&
+				value.epoch >= 0 &&
+				value.sessionId === turn.sessionId &&
+				typeof value.sessionId === "string" &&
+				value.sessionId.length > 0 &&
+				isoTime(value.firstObservedAt) &&
+				isoTime(value.observedAt) &&
+				value.observedAt >= value.firstObservedAt &&
+				typeof value.reason === "string" &&
+				value.reason.length > 0
+			)
+				hold = value;
+		} catch {
+			// Corrupt evidence never becomes permission to clear or replace an op.
+		}
+		this.#recoveryHolds.set(turn.opRef, hold);
+		if (!hold)
+			this.#manager.log(`recovery_hold origin=${this.originKey} opRef=${turn.opRef} reason=malformed_hold_marker`);
+	}
+
+	#recordRecoveryHold(turn: Pick<InboundTurn, "opRef" | "epoch" | "sessionId">, reason: string): void {
+		if (!this.#recoveryHolds.has(turn.opRef)) this.#restoreRecoveryHold(turn);
+		const previous = this.#recoveryHolds.get(turn.opRef);
+		if (this.#recoveryHolds.has(turn.opRef) && !previous) return;
+		if (!turn.sessionId) return;
+		const observedAt = new Date(
+			Math.max(this.#manager.now(), Date.parse(previous?.observedAt ?? "") || 0),
+		).toISOString();
+		const hold: RecoveryHold = {
+			originKey: this.originKey,
+			epoch: turn.epoch,
+			sessionId: turn.sessionId,
+			opRef: turn.opRef,
+			firstObservedAt: previous?.firstObservedAt ?? observedAt,
+			observedAt,
+			reason,
+		};
+		this.#manager.database.metaSet(`persona-recovery-hold:${turn.opRef}`, JSON.stringify(hold));
+		this.#recoveryHolds.set(turn.opRef, hold);
+	}
+
+	#clearRecoveryHold(opRef: string): void {
+		this.#manager.database.metaDelete(`persona-recovery-hold:${opRef}`);
+		this.#recoveryHolds.delete(opRef);
+		this.#holdSweeps.delete(opRef);
+		this.#holdEscalated.delete(opRef);
+	}
+
+	#requeueTurn(opRef: string): number {
+		// inboundTurnRequeue owns its transaction; nesting is forbidden by the DB.
+		const attempt = this.#manager.database.inboundTurnRequeue(opRef);
+		this.#clearRecoveryHold(opRef);
+		return attempt;
 	}
 
 	get state(): PersonaActorState {
@@ -699,7 +781,7 @@ class OriginActor {
 				// main cutover from a schema-16 home hit this (three boxes, 2026-09-05)
 				// and each needed the row hand-edited before the origin worked again.
 				if (turn.state === "bound" && sdkStatusErrorCode(error) === "session_unavailable") {
-					const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
+					const attempt = this.#requeueTurn(turn.opRef);
 					const retired = turn.epoch < this.#epoch();
 					const nextEpoch = retired ? this.#epoch() : this.#manager.database.rebindEpoch(this.originKey);
 					this.#manager.log(
@@ -708,6 +790,7 @@ class OriginActor {
 					continue;
 				}
 				// One unrecoverable turn must not abort recovery of the others.
+				this.#recordRecoveryHold(turn, "recovery_unavailable");
 				this.#manager.log(
 					`recovery_turn_failed origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} detail=${safeDiagnostic(error)}`,
 				);
@@ -765,7 +848,7 @@ class OriginActor {
 		// the turn is closed (the owner told it was cut off). A merely
 		// unreachable but possibly-live session holds.
 		if (turn.state === "bound" && status.status.status === "unknown" && disownedByBroker) {
-			const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
+			const attempt = this.#requeueTurn(turn.opRef);
 			// The binding itself is unusable: recreate through the existing rebind
 			// primitive (epoch bump) so the next dispatch binds a fresh live session.
 			// A retired turn's epoch was already rotated away from; it simply
@@ -875,10 +958,12 @@ class OriginActor {
 						lane: { ...recoveryInput.lane, resumeImpossible: true },
 					});
 					if (afterResumeFailure.action === "recreate") await this.#recreateAfterResumeFailure(turn, retired);
-					else
+					else {
+						this.#recordRecoveryHold(turn, "session_resume_failed");
 						this.#manager.log(
 							`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=session_resume_failed detail=${safeDiagnostic(error)}`,
 						);
+					}
 				}
 				return;
 			}
@@ -908,7 +993,7 @@ class OriginActor {
 				const deadUnlanded = status.status.status === "unknown" && turn.state === "bound" && sessionDead;
 				if (deadUnlanded && count >= HOLD_RELEASE_SWEEPS) {
 					this.#holdSweeps.delete(turn.opRef);
-					const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
+					const attempt = this.#requeueTurn(turn.opRef);
 					const nextEpoch = retired ? currentEpoch : this.#manager.database.rebindEpoch(this.originKey);
 					this.#manager.log(
 						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} attempt=${attempt} reason=${retired ? "retired_unknown_op_on_dead_session" : "unknown_op_on_dead_session"} sweeps=${count}`,
@@ -918,7 +1003,7 @@ class OriginActor {
 				}
 				if (liveIdle && count >= HOLD_RELEASE_SWEEPS && (await this.#queueIsEmpty(sessionId))) {
 					this.#holdSweeps.delete(turn.opRef);
-					const attempt = this.#manager.database.inboundTurnRequeue(turn.opRef);
+					const attempt = this.#requeueTurn(turn.opRef);
 					const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
 					this.#manager.log(
 						`recovery_requeue_unaccepted origin=${this.originKey} epoch=${turn.epoch} nextEpoch=${nextEpoch} opRef=${turn.opRef} session=${sessionId} attempt=${attempt} reason=unknown_op_on_live_idle_session sweeps=${count}`,
@@ -926,6 +1011,7 @@ class OriginActor {
 					await this.#dispatchNext();
 					return;
 				}
+				this.#recordRecoveryHold(turn, status.unreachable ? "status_unavailable" : decision.reason);
 				this.#manager.log(
 					`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${decision.reason} sweeps=${count}`,
 				);
@@ -999,6 +1085,7 @@ class OriginActor {
 
 	async #recreateAfterResumeFailure(turn: InboundTurn, retired: boolean): Promise<void> {
 		const reason = retired ? "resume_impossible" : "tail_terminal_evidence_unavailable";
+		this.#recordRecoveryHold(turn, reason);
 		this.#manager.log(
 			`recovery_hold origin=${this.originKey} epoch=${turn.epoch} opRef=${turn.opRef} reason=${reason}`,
 		);
@@ -1025,6 +1112,8 @@ class OriginActor {
 	 * sweeps is deduplicated by the delivery ledger rather than re-posting.
 	 */
 	async #escalateHold(opRef: string, epoch: number, reason: string, sweeps: number): Promise<void> {
+		const row = this.#manager.database.inboundTurnRow(opRef);
+		if (row) this.#recordRecoveryHold({ opRef, epoch, sessionId: row.bound_session_id }, reason);
 		if (sweeps < HOLD_ESCALATE_SWEEPS || this.#holdEscalated.has(opRef)) return;
 		this.#holdEscalated.add(opRef);
 		await this.#manager.emitRecoveryHold({
@@ -1184,7 +1273,7 @@ class OriginActor {
 			// session (`endpoint_stale`) is the same proof as a disowning send: the
 			// prompt never landed. Release the bound row and rebind, never hold.
 			if (sdkStatusErrorCode(error) !== "session_unavailable") throw error;
-			this.#manager.database.inboundTurnRequeue(opRef);
+			this.#requeueTurn(opRef);
 			const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
 			this.#bindFailures += 1;
 			const attempts = this.#bindFailures;
@@ -1260,7 +1349,7 @@ class OriginActor {
 				);
 		} catch (error) {
 			await tail.close();
-			const attempt = this.#manager.database.inboundTurnRequeue(opRef);
+			const attempt = this.#requeueTurn(opRef);
 			this.#current = undefined;
 			this.#state = "idle";
 			await this.#notifyReleased(current);
@@ -1303,7 +1392,7 @@ class OriginActor {
 			// daemon (live: epoch 41, session_unavailable, 2026-09-03).
 			if (sdkStatusErrorCode(error) === "session_unavailable") {
 				await tail.close();
-				this.#manager.database.inboundTurnRequeue(opRef);
+				this.#requeueTurn(opRef);
 				const nextEpoch = this.#manager.database.rebindEpoch(this.originKey);
 				this.#current = undefined;
 				this.#state = "idle";
@@ -1893,6 +1982,7 @@ class OriginActor {
 		}
 		if (!bound.tailEvidenceUnavailable) {
 			bound.tailEvidenceUnavailable = true;
+			this.#recordRecoveryHold(bound.turn, dead ? "relay_dead" : "relay_lost_mid_turn");
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${epoch} opRef=${bound.turn.opRef} reason=${dead ? "relay_dead" : "relay_lost_mid_turn"}`,
 			);
@@ -2070,6 +2160,7 @@ class OriginActor {
 					return;
 				}
 			}
+			this.#recordRecoveryHold(bound.turn, "status_unavailable");
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=status_unavailable detail=${safeDiagnostic(error)}`,
 			);
@@ -2149,6 +2240,7 @@ class OriginActor {
 			// reconcile authority — completes the turn below, corroborated by an
 			// explicit log line instead of a silent shortcut.
 			bound.statusTerminalHolds += 1;
+			this.#recordRecoveryHold(bound.turn, "tail_terminal_evidence_unavailable");
 			this.#manager.log(
 				`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=tail_terminal_evidence_unavailable`,
 			);
@@ -2220,6 +2312,10 @@ class OriginActor {
 					}
 				}
 				if (text === undefined) {
+					this.#recordRecoveryHold(
+						bound.turn,
+						notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal",
+					);
 					this.#manager.log(
 						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=${notBeforeMs === undefined ? "no_turn_floor" : "no_assistant_text_for_terminal"}`,
 					);
@@ -2260,6 +2356,7 @@ class OriginActor {
 						bound.turn.opRef,
 						bound.retired && !bound.answerWanted ? "retired" : "no_delivery",
 					);
+					if (changed === 1) this.#clearRecoveryHold(bound.turn.opRef);
 					if (
 						changed === 1 &&
 						!bound.retired &&
@@ -2325,6 +2422,7 @@ class OriginActor {
 	async #notifySettled(bound: BoundTurn): Promise<void> {
 		const settledTrigger = this.#manager.database.inboundTurnRow(bound.turn.opRef);
 		if (settledTrigger?.turn_state !== "done") return;
+		this.#clearRecoveryHold(bound.turn.opRef);
 		try {
 			await bound.lifecycle.onSettled?.({
 				...bound,
@@ -2376,7 +2474,7 @@ class OriginActor {
 		bound.tail?.setTurnRunning(false);
 		this.#flushStaleOutput(bound, "unlanded");
 		await bound.tail?.close();
-		const attempt = this.#manager.database.inboundTurnRequeue(bound.turn.opRef);
+		const attempt = this.#requeueTurn(bound.turn.opRef);
 		const nextEpoch = bound.retired ? this.#epoch() : this.#manager.database.rebindEpoch(this.originKey);
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
@@ -2439,6 +2537,7 @@ class OriginActor {
 			!bound.retired && this.#current === bound && database.getSessionRecord(this.originKey)?.epoch === bound.epoch;
 		const completed = database.withTransaction(() => {
 			const changed = database.inboundTurnComplete(bound.turn.opRef, discarded ? "retired" : "turn_failed");
+			if (changed === 1) this.#clearRecoveryHold(bound.turn.opRef);
 			if (changed === 1 && rotate) database.rebindEpoch(this.originKey);
 			return changed;
 		});
@@ -2458,6 +2557,8 @@ class OriginActor {
 	/** Drops actor tracking for a turn that is already closed durably, then serves anything queued behind it. */
 	async #forgetClosed(bound: BoundTurn): Promise<void> {
 		this.#holdSweeps.delete(bound.turn.opRef);
+		if (this.#manager.database.inboundTurnRow(bound.turn.opRef)?.turn_state === "done")
+			this.#clearRecoveryHold(bound.turn.opRef);
 		if (bound.retired) {
 			this.#retired.delete(retiredKey(bound));
 			this.#clearRetiredReattach(bound);
@@ -2525,6 +2626,7 @@ class OriginActor {
 						this.#scheduleRetiredReattach(bound, attempt + 1);
 						return;
 					}
+					this.#recordRecoveryHold(bound.turn, "retired_tail_reattach_failed");
 					this.#manager.log(
 						`recovery_hold origin=${this.originKey} epoch=${bound.epoch} opRef=${bound.turn.opRef} reason=retired_tail_reattach_failed detail=${safeDiagnostic(error)}`,
 					);

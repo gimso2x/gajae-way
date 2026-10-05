@@ -8,6 +8,7 @@ import {
 	HOLD_ESCALATE_SWEEPS,
 	type PersonaRecoveryHoldInput,
 	PersonaSessionManager,
+	type PersonaSessionManagerOptions,
 	personaTurnOpRef,
 } from "../src/orchestrator/persona-session";
 import { formatFailureNotice } from "../src/orchestrator/rebind";
@@ -74,7 +75,7 @@ async function harness(
 		contextMessageIds?: readonly string[];
 	} = {},
 	log?: (line: string) => void,
-	extra: { brokerGeneration?: () => number } = {},
+	extra: Pick<PersonaSessionManagerOptions, "brokerGeneration" | "now"> = {},
 ) {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-persona-session-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
@@ -102,6 +103,137 @@ async function harness(
 		},
 	});
 }
+
+test("recovery hold restores first observation before restart recovery and refreshes observation", async () => {
+	let now = Date.parse("2026-10-03T12:00:00.000Z");
+	const port = new ScriptedSessionPort();
+	await harness(port, {}, () => {}, { now: () => now });
+	enqueue("restart-hold", "only once");
+	await manager!.notifyInbound(KEY);
+	const send = port.sends[0]!;
+	const key = `persona-recovery-hold:${send.opRef}`;
+	port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: { status: "unknown" },
+		summaryCompleted: false,
+	});
+	await manager!.reconcile(KEY);
+	const first = JSON.parse(database!.metaGet(key)!);
+	expect(first).toEqual({
+		originKey: KEY,
+		epoch: 0,
+		sessionId: send.sessionId,
+		opRef: send.opRef,
+		firstObservedAt: new Date(now).toISOString(),
+		observedAt: new Date(now).toISOString(),
+		reason: "operation_state_unknown",
+	});
+	await manager!.stop();
+	database!.close();
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	now += 60_000;
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		now: () => now,
+		log: () => {},
+	});
+	expect(manager.admissionHold(KEY)).toBeUndefined();
+	expect(JSON.parse(database.metaGet(key)!)).toEqual(first);
+	await manager.recover();
+	expect(JSON.parse(database.metaGet(key)!)).toMatchObject({
+		firstObservedAt: first.firstObservedAt,
+		observedAt: new Date(now).toISOString(),
+	});
+	const observed = JSON.parse(database.metaGet(key)!).observedAt;
+	now -= 120_000;
+	await manager.recover();
+	expect(JSON.parse(database.metaGet(key)!)).toMatchObject({
+		firstObservedAt: first.firstObservedAt,
+		observedAt: observed,
+	});
+	expect(port.sends).toHaveLength(1);
+	expect(port.resumes).toHaveLength(0);
+});
+
+test("successful unknown status retains unavailable recovery hold until authoritative completion", async () => {
+	let now = Date.parse("2026-10-03T12:00:00.000Z");
+	const port = new ScriptedSessionPort();
+	await harness(port, {}, () => {}, { now: () => now });
+	enqueue("transport-hold", "only once");
+	await manager!.notifyInbound(KEY);
+	const send = port.sends[0]!;
+	const key = `persona-recovery-hold:${send.opRef}`;
+	const status = port.status.bind(port);
+	port.status = async () => {
+		throw new Error("transport unavailable");
+	};
+	await manager!.reconcile(KEY);
+	const first = JSON.parse(database!.metaGet(key)!);
+	expect(first.reason).toBe("status_unavailable");
+	now += 60_000;
+	port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: { status: "unknown" },
+		summaryCompleted: false,
+	});
+	await manager!.reconcile(KEY);
+	expect(JSON.parse(database!.metaGet(key)!)).toMatchObject({
+		firstObservedAt: first.firstObservedAt,
+		observedAt: new Date(now).toISOString(),
+		reason: "operation_state_unknown",
+	});
+	port.status = status;
+	await manager!.reconcile(KEY);
+	expect(database!.metaGet(key)).toBeDefined();
+	await port.complete(send.opRef, "finished");
+	await eventually(() => database!.inboundTurnRow(send.opRef)?.turn_state === "done", "completion missing");
+	expect(database!.metaGet(key)).toBeUndefined();
+	expect(manager!.admissionHold(KEY)).toBeUndefined();
+	expect(port.sends).toHaveLength(1);
+	expect(port.resumes).toHaveLength(0);
+});
+
+test("malformed recovery marker fails closed through unknown status and clears only on completion", async () => {
+	const port = new ScriptedSessionPort();
+	await harness(port, {}, () => {});
+	enqueue("malformed-hold", "only once");
+	await manager!.notifyInbound(KEY);
+	const send = port.sends[0]!;
+	const key = `persona-recovery-hold:${send.opRef}`;
+	const malformed = '{"originKey":"wrong","firstObservedAt":"invalid"}';
+	database!.metaSet(key, malformed);
+	await manager!.stop();
+	database!.close();
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	registerFixtureBindings(port);
+	const status = port.status.bind(port);
+	port.status = async (input) => ({
+		operationRef: input.opRef,
+		status: { status: "unknown" },
+		summaryCompleted: false,
+	});
+	manager = new PersonaSessionManager({
+		database,
+		port,
+		instanceId: "instance-test",
+		repo: join(home, "workspace"),
+		log: () => {},
+	});
+	expect(manager.admissionHold(KEY)).toBe("recovery_hold");
+	await manager.recover();
+	expect(database.metaGet(key)).toBe(malformed);
+	expect(port.sends).toHaveLength(1);
+	port.status = status;
+	await port.complete(send.opRef, "finished");
+	await manager.recover();
+	await manager.reconcile(KEY);
+	expect(database.inboundTurnRow(send.opRef)?.turn_state).toBe("done");
+	expect(database.metaGet(key)).toBeUndefined();
+});
 
 test("actor immediately dispatches durable inbound with one deterministic caller op-ref, then completes on tail terminal", async () => {
 	const port = new ScriptedSessionPort({
