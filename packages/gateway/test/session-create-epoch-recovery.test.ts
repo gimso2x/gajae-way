@@ -294,7 +294,10 @@ test("gjc 0.18 operation_failed naming the sent create key as undecidable rotate
 		if (args.includes("inspect"))
 			return {
 				exitCode: 0,
-				stdout: JSON.stringify({ ok: true, result: { session: { sessionId: "fresh-session", live: true } } }),
+				stdout: JSON.stringify({
+					ok: true,
+					result: { session: { sessionId: "fresh-session", locator: { cwd: repo }, live: true, deleted: false } },
+				}),
 				stderr: "",
 			};
 		throw new Error(`unexpected command ${args.join(" ")}`);

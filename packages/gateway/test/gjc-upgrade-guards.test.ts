@@ -220,7 +220,10 @@ test("gjc 0.18 endpoint_stale on inspect retires the saved session instead of re
 			if (dropped && sessionId === "old-session") return { exitCode: 1, stdout: INSPECT_ENDPOINT_STALE, stderr: "" };
 			return {
 				exitCode: 0,
-				stdout: JSON.stringify({ ok: true, result: { session: { sessionId, live: true } } }),
+				stdout: JSON.stringify({
+					ok: true,
+					result: { session: { sessionId, locator: { cwd: repo }, live: true, deleted: false } },
+				}),
 				stderr: "",
 			};
 		}
