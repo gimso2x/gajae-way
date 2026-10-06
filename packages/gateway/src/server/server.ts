@@ -136,6 +136,19 @@ function reactionTargetMessageId(origin: OriginRef, id: string): string | undefi
 	return match?.[1] === channel && isPlatformMessageId(target) ? target : undefined;
 }
 
+/**
+ * A Slack `[REPLY:channel:ts]` naming another channel is a persona typo: the
+ * delivery can only post into its origin channel and the adapter refuses the
+ * foreign target definitively, so honouring it would expire the whole answer.
+ * Such a target is dropped; other ids pass through for the adapter to resolve.
+ */
+function replyTargetMessageId(origin: OriginRef, id: string): string | undefined {
+	if (origin.platform !== "slack") return id;
+	const channel = origin.kind === "thread" ? origin.parentId : origin.conversationId;
+	const match = /^([^:]+):\d+\.\d+$/.exec(id);
+	return match && match[1] !== channel ? undefined : id;
+}
+
 const AGENTS_MD_MISSING_DIGEST = "missing";
 const UPDATED_AGENTS_MD_HEADING =
 	"## AGENTS.md (updated since this session started; supersedes the project-context copy loaded at session start)";
@@ -2400,7 +2413,10 @@ async function createInboundTurnLifecycle(
 				.replace(/\s*\[BREAK\]\s*/g, " ")
 				.trim();
 			if (!body) continue;
-			const replyTo = replyMatch?.[1] || inboundThreadRoot;
+			const explicitReplyTo = replyMatch?.[1] ? replyTargetMessageId(origin, replyMatch[1]) : undefined;
+			if (replyMatch?.[1] && !explicitReplyTo)
+				console.error(`gateway reply target dropped (foreign_channel) for ${key}: ${replyMatch[1]}`);
+			const replyTo = explicitReplyTo || inboundThreadRoot;
 			planned.push({ body, ...(replyTo ? { replyTo } : {}) });
 		}
 		const spoken = spokenReply(

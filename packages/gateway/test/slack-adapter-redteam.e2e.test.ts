@@ -193,6 +193,16 @@ test("RT-SLACK-34 plain channel reply threads under the triggering message; an e
 	expect(explicit.posts).toEqual([["C1", "elsewhere", "9.0"]]);
 });
 
+test("RT-SLACK-34 a [REPLY:] target in a foreign channel falls back to the triggering thread", async () => {
+	// A persona that mistypes the channel half of a header id must still be heard
+	// in the conversation it answered, not expire against Slack's channel check.
+	const f = await fixture({ "slack:C1": { engagement: "mention-open" } }, "[REPLY:C9:3.0] answer");
+	await f.adapter.requestInbound("C1:3.0", origin, "plain", engagement);
+	await settle();
+	expect(f.posts).toEqual([["C1", "answer", "3.0"]]);
+	expect(f.database.deliveryRows().map((row) => row.state)).toEqual(["confirmed"]);
+});
+
 test("RT-SLACK-33 discord stale lock has exactly one winner under 20 concurrent reclaims", async () => {
 	const lockHome = await mkdtemp(join(tmpdir(), "slack-discord-lock-redteam-"));
 	try {
